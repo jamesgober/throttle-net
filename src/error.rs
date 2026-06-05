@@ -45,6 +45,16 @@ pub enum ThrottleError {
         /// The limiter's maximum capacity, which `cost` exceeded.
         capacity: u32,
     },
+    /// A circuit breaker is open and shed this request without touching the
+    /// wrapped limiter. The breaker is failing fast to give the downstream time
+    /// to recover; retry once it has had a chance to close again. This **is**
+    /// retryable, after the suggested wait.
+    CircuitOpen {
+        /// How long until the breaker is expected to allow a trial request
+        /// (move to half-open). [`Duration::ZERO`](core::time::Duration::ZERO)
+        /// means it may already be admitting a trial.
+        retry_after: core::time::Duration,
+    },
 }
 
 impl fmt::Display for ThrottleError {
@@ -53,6 +63,10 @@ impl fmt::Display for ThrottleError {
             Self::CostExceedsCapacity { cost, capacity } => write!(
                 f,
                 "requested cost {cost} exceeds limiter capacity {capacity}; it can never be granted"
+            ),
+            Self::CircuitOpen { retry_after } => write!(
+                f,
+                "circuit breaker is open; request shed, retry in {retry_after:?}"
             ),
         }
     }
@@ -64,11 +78,21 @@ impl ForgeError for ThrottleError {
     fn kind(&self) -> &'static str {
         match self {
             Self::CostExceedsCapacity { .. } => "CostExceedsCapacity",
+            Self::CircuitOpen { .. } => "CircuitOpen",
         }
     }
 
     fn caption(&self) -> &'static str {
         "Throttle acquisition error"
+    }
+
+    fn is_retryable(&self) -> bool {
+        match self {
+            // A configuration mismatch will not fix itself.
+            Self::CostExceedsCapacity { .. } => false,
+            // The downstream may recover; retry after the breaker cools down.
+            Self::CircuitOpen { .. } => true,
+        }
     }
 }
 

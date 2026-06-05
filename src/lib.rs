@@ -99,6 +99,8 @@
 // exposes only `VERSION`.
 #[cfg(feature = "std")]
 mod backoff;
+#[cfg(feature = "circuit-breaker")]
+mod circuit;
 #[cfg(feature = "std")]
 mod decision;
 #[cfg(feature = "std")]
@@ -124,6 +126,8 @@ mod throttle;
 
 #[cfg(feature = "std")]
 pub use crate::backoff::{Backoff, BackoffIter, Jitter};
+#[cfg(feature = "circuit-breaker")]
+pub use crate::circuit::{BreakerState, CircuitBreaker, CircuitBreakerBuilder, Permit, Trip};
 #[cfg(feature = "std")]
 pub use crate::decision::Decision;
 #[cfg(feature = "std")]

@@ -92,8 +92,8 @@ std = [
 tokio = ["std", "dep:tokio"]
 # AIMD + latency-based adaptive limiters.
 adaptive = []
-# Circuit breaker state machine.
-circuit-breaker = []
+# Circuit breaker state machine. Requires the limiter surface (std).
+circuit-breaker = ["std"]
 # HTTP rate-limit header parsing.
 provider-headers = []
 # LLM provider presets (Anthropic, OpenAI, ...).
