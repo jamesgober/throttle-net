@@ -1,0 +1,122 @@
+# ██████╗ ███████╗██████╗ ███████╗
+# ██╔══██╗██╔════╝██╔══██╗██╔════╝
+# ██████╔╝█████╗  ██████╔╝███████╗
+# ██╔══██╗██╔══╝  ██╔═══╝ ╚════██║
+# ██║  ██║███████╗██║     ███████║
+# ╚═╝  ╚═╝╚══════╝╚═╝     ╚══════╝
+#╔═══════════════════════════════╗
+#║ Rust Efficiency & Performance ║
+#╚═══════════════════════════════╝
+[package]
+name    = "throttle-net"
+version = "0.1.0"
+
+# Minimum Supported Rust Version (MSRV)
+rust-version = "1.85"
+edition = "2024"
+
+# License
+license = "Apache-2.0 OR MIT"
+
+# Readme
+readme = "README.md"
+
+# Description
+description = "General-purpose outbound throttling and resilience for Rust: multi-algorithm rate limiting, multi-dimensional and cost-aware limits, adaptive throttling, circuit breakers, and jittered backoff/retry. The outbound companion to rate-net."
+
+# Keywords (5 max)
+keywords = [
+    "rate-limiting",
+    "throttling",
+    "circuit-breaker",
+    "retry",
+    "backoff"
+]
+
+# Categories
+categories = [
+    "asynchronous",
+    "network-programming",
+    "concurrency"
+]
+
+# Links
+homepage      = "https://github.com/jamesgober/throttle-net"
+repository    = "https://github.com/jamesgober/throttle-net"
+documentation = "https://docs.rs/throttle-net"
+
+# Authors
+authors = [
+    "James Gober <me@jamesgober.com>"
+]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lib]
+name = "throttle_net"
+path = "src/lib.rs"
+
+
+# FEATURE FLAGS
+# #################################
+[features]
+default = ["std", "tokio"]
+# Standard library.
+std = []
+# Tokio async runtime integration (default).
+tokio = ["dep:tokio"]
+# AIMD + latency-based adaptive limiters.
+adaptive = []
+# Circuit breaker state machine.
+circuit-breaker = []
+# HTTP rate-limit header parsing.
+provider-headers = []
+# LLM provider presets (Anthropic, OpenAI, ...).
+provider-llm = ["provider-headers"]
+# Metrics counters/histograms.
+metrics = ["dep:metrics"]
+# Tracing spans around acquire().
+tracing = ["dep:tracing"]
+# Serializable limiter configs.
+serde = ["dep:serde"]
+
+
+# DEPENDENCIES
+# #################################
+# Runtime adapters beyond tokio (async-std, smol) land with v0.8.0 runtime
+# flexibility; they are not wired here until there is code that uses them.
+[dependencies]
+tokio   = { version = "1", optional = true, default-features = false, features = ["sync", "time"] }
+metrics = { version = "0.23", optional = true }
+tracing = { version = "0.1", optional = true }
+serde   = { version = "1", optional = true, default-features = false, features = ["derive"] }
+
+
+# DEV DEPENDENCIES
+# #################################
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+proptest  = "1"
+tokio     = { version = "1", features = ["full", "test-util"] }
+
+[target.'cfg(loom)'.dev-dependencies]
+loom = "0.7"
+
+
+# BENCHMARKS
+# #################################
+[[bench]]
+name    = "throttle_bench"
+harness = false
+
+
+# RELEASE PROFILE
+# #################################
+[profile.release]
+opt-level     = 3
+lto           = "fat"
+codegen-units = 1
+panic         = "abort"
+strip         = "symbols"
