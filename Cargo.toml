@@ -9,7 +9,7 @@
 #╚═══════════════════════════════╝
 [package]
 name    = "throttle-net"
-version = "0.1.0"
+version = "0.2.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -59,14 +59,37 @@ name = "throttle_net"
 path = "src/lib.rs"
 
 
+# LINTS
+# #################################
+# `loom` is a build-time cfg toggled via `RUSTFLAGS="--cfg loom"` for the
+# concurrency model check; `docsrs` is set by docs.rs. Registering them keeps
+# `unexpected_cfgs` quiet under `-D warnings`.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(loom)',
+    'cfg(docsrs)',
+] }
+
+
 # FEATURE FLAGS
 # #################################
 [features]
 default = ["std", "tokio"]
-# Standard library.
-std = []
-# Tokio async runtime integration (default).
-tokio = ["dep:tokio"]
+# Standard library. Gates the limiter surface: the token-bucket accounting
+# (`better-bucket`), the injectable clock (`clock-lib`), and the domain error
+# type (`error-forge`). With std off the crate is `no_std` and exposes only
+# `VERSION`.
+std = [
+    "dep:better-bucket",
+    "better-bucket/clock",
+    "dep:clock-lib",
+    "clock-lib/std",
+    "dep:error-forge",
+    "dep:ahash",
+]
+# Tokio async runtime integration (default). Provides the waiting `acquire`
+# surface; implies `std`, since the limiter sits underneath it.
+tokio = ["std", "dep:tokio"]
 # AIMD + latency-based adaptive limiters.
 adaptive = []
 # Circuit breaker state machine.
@@ -88,7 +111,22 @@ serde = ["dep:serde"]
 # Runtime adapters beyond tokio (async-std, smol) land with v0.8.0 runtime
 # flexibility; they are not wired here until there is code that uses them.
 [dependencies]
-tokio   = { version = "1", optional = true, default-features = false, features = ["sync", "time"] }
+# Token-bucket accounting (the single source of truth; never re-implemented).
+# Its `clock` feature exposes the `Bucket` surface and the `acquire(n)` path
+# that backs cost-aware acquisition.
+better-bucket = { version = "1", default-features = false, optional = true }
+# Monotonic, mockable time: the clock the bucket reads on the acquire path,
+# injected so tests can substitute a `ManualClock`.
+clock-lib     = { version = "1", default-features = false, optional = true }
+# Domain error type metadata (kind/retryability), shared across the portfolio
+# stack instead of thiserror/anyhow in a library crate.
+error-forge   = { version = "1", optional = true }
+# Fast, DoS-resistant hashing for the per-key shard map and shard selection. Its
+# runtime-rng default seeds each store randomly, keeping it collision-attack
+# resistant against hostile keys.
+ahash         = { version = "0.8", optional = true }
+# Async runtime for the waiting `acquire` surface. Only the timer is used.
+tokio   = { version = "1", optional = true, default-features = false, features = ["time"] }
 metrics = { version = "0.23", optional = true }
 tracing = { version = "0.1", optional = true }
 serde   = { version = "1", optional = true, default-features = false, features = ["derive"] }
@@ -103,6 +141,14 @@ tokio     = { version = "1", features = ["full", "test-util"] }
 
 [target.'cfg(loom)'.dev-dependencies]
 loom = "0.7"
+
+
+# EXAMPLES
+# #################################
+# The waiting acquire surface needs the tokio timer.
+[[example]]
+name              = "llm_budget"
+required-features = ["tokio"]
 
 
 # BENCHMARKS
