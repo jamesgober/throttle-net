@@ -9,7 +9,7 @@
 #╚═══════════════════════════════╝
 [package]
 name    = "throttle-net"
-version = "0.3.0"
+version = "0.4.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -125,8 +125,10 @@ error-forge   = { version = "1", optional = true }
 # runtime-rng default seeds each store randomly, keeping it collision-attack
 # resistant against hostile keys.
 ahash         = { version = "0.8", optional = true }
-# Async runtime for the waiting `acquire` surface. Only the timer is used.
-tokio   = { version = "1", optional = true, default-features = false, features = ["time"] }
+# Async runtime for the waiting `acquire` surface: the timer for backoff/refill
+# waits, `sync::Notify` for the queue's waiter coordination, and `macros` for
+# `select!` (waiting on a wake-up or a deadline, whichever comes first).
+tokio   = { version = "1", optional = true, default-features = false, features = ["time", "sync", "macros"] }
 metrics = { version = "0.23", optional = true }
 tracing = { version = "0.1", optional = true }
 serde   = { version = "1", optional = true, default-features = false, features = ["derive"] }
@@ -153,6 +155,10 @@ required-features = ["tokio"]
 [[example]]
 name              = "retry_backoff"
 required-features = ["tokio"]
+
+[[example]]
+name              = "circuit_breaker"
+required-features = ["circuit-breaker", "tokio"]
 
 
 # BENCHMARKS

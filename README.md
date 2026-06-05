@@ -41,19 +41,21 @@
 
 <h2>What it does</h2>
 
-**Available now (v0.3):**
+**Available now (v0.4):**
 
 - **Token-bucket throttling** &mdash; smooth refill with burst headroom; lock-free accounting (one atomic compare-and-swap per acquire)
+- **Exact sliding-window-log** &mdash; when you need no boundary burst at all, an exact alternative that composes everywhere the bucket does
 - **Wait, don't reject** &mdash; the outbound default is `acquire().await`, which paces the caller; `try_acquire()` is there when you need the non-blocking answer
 - **Cost-aware acquisition** &mdash; `acquire_with_cost(n)` &mdash; not every request weighs one unit
 - **Multi-dimensional limits** &mdash; enforce req/min AND input-tokens/min AND output-tokens/min at once; the killer feature for LLM APIs
 - **Composition** &mdash; hybrid (must pass all), per-key (independent state per tenant), and layered (global / per-key / per-endpoint) limiters, combined without the call site changing
 - **Bounded memory** &mdash; per-key state is sharded and evicted (idle TTL + hard cap), so a flood of unique keys hits a ceiling instead of growing without limit
 - **Retry + backoff** &mdash; constant / linear / exponential backoff with full, equal, or decorrelated jitter; a retry policy with per-error classification; `Retry-After` parsed and honored
+- **Circuit breaker** &mdash; closed / open / half-open recovery; wraps any limiter and fails fast when open, without consuming it
+- **Queueing** &mdash; a bounded, deadline-aware, priority queue with fair-across-keys scheduling and reject / drop-oldest / drop-lowest-priority overflow
 
 **On the roadmap:**
 
-- **Circuit breakers** (v0.4) &mdash; closed / open / half-open recovery, wrapping any limiter
 - **Adaptive throttling** (v0.5) &mdash; AIMD and latency-based controllers that slow down when a downstream struggles, with no explicit signal
 - **Provider-aware** (v0.6) &mdash; parse `x-ratelimit-*` / `retry-after` headers and sync internal state
 - **Runtime-agnostic** (v0.8) &mdash; tokio today, with async-std and smol planned
@@ -64,7 +66,10 @@
 
 ```toml
 [dependencies]
-throttle-net = "0.3"
+throttle-net = "0.4"
+
+# Optional features:
+throttle-net = { version = "0.4", features = ["circuit-breaker"] }
 ```
 
 <br>
@@ -170,11 +175,36 @@ async fn main() {
 }
 ```
 
+Wrap a flaky downstream in a circuit breaker (needs the `circuit-breaker` feature):
+
+```rust
+use std::time::Duration;
+use throttle_net::{CircuitBreaker, Throttle, Trip};
+
+#[tokio::main]
+async fn main() {
+    let breaker = CircuitBreaker::builder()
+        .trip(Trip::Consecutive(5))           // open after 5 failures in a row
+        .cooldown(Duration::from_secs(10))
+        .build(Throttle::per_second(100));
+
+    match breaker.acquire().await {
+        Ok(permit) => {
+            // ... call the downstream ...
+            let ok = true;
+            if ok { permit.success() } else { permit.failure() }
+        }
+        Err(_shed) => { /* breaker open: fail fast */ }
+    }
+}
+```
+
 Full runnable examples live in [`examples/`](./examples/):
 
 ```bash
-cargo run --example llm_budget     # multi-dimensional LLM budgets
-cargo run --example retry_backoff  # retry with backoff + Retry-After
+cargo run --example llm_budget                              # multi-dimensional LLM budgets
+cargo run --example retry_backoff                           # retry with backoff + Retry-After
+cargo run --example circuit_breaker --features circuit-breaker  # trip, shed, recover
 ```
 
 <br>

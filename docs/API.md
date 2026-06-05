@@ -17,9 +17,12 @@
 - [`PerKey`](#perkey) &mdash; independent state per key
 - [`Eviction`](#eviction) &mdash; per-key memory policy
 - [`Layered`](#layered) &mdash; ordered scopes
+- [`SlidingWindowLog`](#slidingwindowlog) &mdash; exact window limiter
 - [`Backoff`](#backoff) &mdash; retry delays with jitter
 - [`Retry`](#retry) &mdash; the retry policy
 - [`parse_retry_after`](#parse_retry_after) &mdash; `Retry-After` parsing
+- [`CircuitBreaker`](#circuitbreaker) &mdash; fail fast on failures
+- [`Queue`](#queue) &mdash; bounded, deadline-aware waiting
 - [Clock seam](#clock-seam) &mdash; deterministic time
 - [Feature flags](#feature-flags)
 
@@ -506,6 +509,43 @@ assert!(layered.try_acquire(&42, &"/v1/chat".to_string()));
 
 ---
 
+## `SlidingWindowLog`
+
+```rust
+pub struct SlidingWindowLog<C = SystemClock> { /* ... */ }
+```
+
+An exact sliding-window-log limiter: at most `limit` units in any trailing
+`window`. Where [`Throttle`](#throttle) is a token bucket (smooth, cheap, but
+permits a full burst at any instant), `SlidingWindowLog` records each grant and
+admits a request only if fewer than `limit` units were granted in the trailing
+window — no boundary burst, at the cost of remembering recent grants. It
+implements [`Limiter`](#limiter), so it composes everywhere the bucket does.
+
+| Method | Description |
+|---|---|
+| `SlidingWindowLog::new(limit, window)` | At most `limit` units per trailing `window`. |
+| `SlidingWindowLog::per_second(rate)` | At most `rate` units per one-second window. |
+| `.with_clock(clock)` | Inject a clock for tests. |
+| `try_acquire` / `try_acquire_with_cost(n)` | Non-blocking; returns `bool`. |
+| `peek(cost)` | Non-consuming [`Decision`](#decision). |
+| `acquire().await` / `acquire_with_cost(n).await` _(tokio)_ | Waiting. |
+| `available()` / `capacity()` | Units left in the window / the limit. |
+
+```rust
+use std::time::Duration;
+use throttle_net::SlidingWindowLog;
+
+// At most 5 requests in any 1-second window — no boundary burst.
+let limiter = SlidingWindowLog::new(5, Duration::from_secs(1));
+for _ in 0..5 {
+    assert!(limiter.try_acquire());
+}
+assert!(!limiter.try_acquire()); // the 6th in this window is refused
+```
+
+---
+
 ## `Backoff`
 
 ```rust
@@ -648,6 +688,122 @@ assert_eq!(parse_retry_after_at(when, 1_767_225_540), Some(Duration::from_secs(6
 
 ---
 
+## `CircuitBreaker`
+
+```rust
+pub struct CircuitBreaker<L, C = SystemClock> { /* ... */ } // feature = "circuit-breaker"
+
+#[non_exhaustive]
+pub enum Trip {
+    Consecutive(u32),
+    Ratio { window: u32, ratio: f64, min_calls: u32 },
+    Windowed { failures: u32, period: Duration },
+}
+
+#[non_exhaustive]
+pub enum BreakerState { Closed, Open, HalfOpen }
+```
+
+Wraps any [`Limiter`](#limiter) and **fails fast when a downstream is unhealthy**.
+A limiter paces requests; a breaker *stops* them. After enough failures it trips
+**open** and sheds requests immediately — without consuming the wrapped limiter's
+tokens — then after a cooldown goes **half-open** to test recovery, and **closes**
+on success. Behind the `circuit-breaker` feature.
+
+Build with `CircuitBreaker::builder()`:
+
+| Builder method | Description |
+|---|---|
+| `.trip(Trip)` | The condition that opens the breaker. |
+| `.cooldown(Duration)` | How long to stay open before a trial. |
+| `.half_open(trials, required)` | Concurrent trials and successes needed to close. |
+| `.build(limiter)` | Wrap `limiter`. |
+
+| Method | Description |
+|---|---|
+| `try_acquire()` | Non-blocking. `Ok(Some(permit))` granted, `Ok(None)` rate-limited, `Err(CircuitOpen)` shed. |
+| `acquire().await` _(tokio)_ | Fail fast if open; otherwise pace on the limiter. Returns a [`Permit`]. |
+| `record_success()` / `record_failure()` | Report an outcome directly. |
+| `state()` | Current [`BreakerState`]. |
+
+Outcomes are reported through a `Permit`: settle it with `.success()` or
+`.failure()`. **Dropping a permit unsettled counts as a failure**, so an early
+return or panic is treated conservatively.
+
+```rust
+# async fn run() {
+use std::time::Duration;
+use throttle_net::{CircuitBreaker, Throttle, Trip};
+
+let breaker = CircuitBreaker::builder()
+    .trip(Trip::Consecutive(5))
+    .cooldown(Duration::from_secs(10))
+    .build(Throttle::per_second(100));
+
+match breaker.acquire().await {
+    Ok(permit) => {
+        // ... call the downstream ...
+        let ok = true;
+        if ok { permit.success() } else { permit.failure() }
+    }
+    Err(_shed) => { /* fail fast: the breaker is open */ }
+}
+# }
+```
+
+---
+
+## `Queue`
+
+```rust
+pub struct Queue<L, K = (), C = SystemClock> { /* ... */ } // feature = "tokio"
+
+#[non_exhaustive]
+pub enum Overflow { Reject, DropOldest, DropLowestPriority }
+```
+
+A bounded, deadline-aware, priority queue in front of a limiter. When a limiter
+is saturated, callers wait here in an orderly way: the queue admits up to a fixed
+number of waiters, serves them by priority (and fairly across keys at equal
+priority), and **drops a waiter whose deadline has passed rather than serving
+it**. When full, an `Overflow` policy decides who is turned away. `K = ()` gives a
+plain priority queue with no cross-key fairness.
+
+Build with `Queue::builder()`:
+
+| Builder method | Description |
+|---|---|
+| `.capacity(n)` | Maximum simultaneous waiters. |
+| `.overflow(Overflow)` | Policy when full: reject, drop-oldest, drop-lowest-priority. |
+| `.build(limiter)` | Wrap `limiter`. |
+
+| Method | Description |
+|---|---|
+| `acquire(key, priority, deadline).await` | Wait for a token; higher `priority` first, `deadline` bounds the wait. |
+| `len()` / `is_empty()` / `capacity()` | Waiter-count snapshot / capacity. |
+
+The acquire returns [`ThrottleError::QueueFull`](#throttleerror) when the policy
+turns the request away and [`ThrottleError::DeadlineExceeded`](#throttleerror)
+when the wait budget runs out.
+
+```rust
+# async fn run() -> Result<(), throttle_net::ThrottleError> {
+use std::time::Duration;
+use throttle_net::{Overflow, Queue, Throttle};
+
+let queue: Queue<Throttle, &str> = Queue::builder()
+    .capacity(100)
+    .overflow(Overflow::DropOldest)
+    .build(Throttle::per_second(50));
+
+// Wait for a slot at normal priority, giving up after 2 seconds.
+queue.acquire("tenant:1", 0, Some(Duration::from_secs(2))).await?;
+# Ok(())
+# }
+```
+
+---
+
 ## Clock seam
 
 throttle-net re-exports the time abstraction so the `with_clock` methods are usable without depending on `clock-lib` directly:
@@ -679,9 +835,9 @@ assert!(throttle.try_acquire());
 | Feature | Default | Description |
 |---------|---------|-------------|
 | `std` | yes | Standard library. Gates the entire limiter surface. With it off the crate is `no_std` and exposes only `VERSION`. |
-| `tokio` | yes | The waiting `acquire` surface, driven by tokio's timer. Implies `std`. |
+| `tokio` | yes | The waiting `acquire` surface and the [`Queue`](#queue), driven by tokio's timer/sync. Implies `std`. |
 | `adaptive` | no | AIMD + latency-based adaptive limiters. _(planned: 0.5)_ |
-| `circuit-breaker` | no | Circuit breaker state machine. _(planned: 0.4)_ |
+| `circuit-breaker` | no | The [`CircuitBreaker`](#circuitbreaker) state machine. Implies `std`. |
 | `provider-headers` | no | HTTP rate-limit header parsing. _(planned: 0.6)_ |
 | `provider-llm` | no | LLM provider presets. _(planned: 0.6)_ |
 | `metrics` | no | Metrics counters/histograms. _(planned: 0.7)_ |

@@ -55,6 +55,12 @@ pub enum ThrottleError {
         /// means it may already be admitting a trial.
         retry_after: core::time::Duration,
     },
+    /// A bounded queue was full and its overflow policy rejected this request.
+    /// Transient — capacity may free up — so it is retryable.
+    QueueFull,
+    /// A queued request's deadline passed before it could be served. Not
+    /// retryable as-is: the deadline is in the past.
+    DeadlineExceeded,
 }
 
 impl fmt::Display for ThrottleError {
@@ -68,6 +74,12 @@ impl fmt::Display for ThrottleError {
                 f,
                 "circuit breaker is open; request shed, retry in {retry_after:?}"
             ),
+            Self::QueueFull => {
+                f.write_str("queue is full; request rejected by the overflow policy")
+            }
+            Self::DeadlineExceeded => {
+                f.write_str("request deadline passed before it could be served")
+            }
         }
     }
 }
@@ -79,6 +91,8 @@ impl ForgeError for ThrottleError {
         match self {
             Self::CostExceedsCapacity { .. } => "CostExceedsCapacity",
             Self::CircuitOpen { .. } => "CircuitOpen",
+            Self::QueueFull => "QueueFull",
+            Self::DeadlineExceeded => "DeadlineExceeded",
         }
     }
 
@@ -92,6 +106,10 @@ impl ForgeError for ThrottleError {
             Self::CostExceedsCapacity { .. } => false,
             // The downstream may recover; retry after the breaker cools down.
             Self::CircuitOpen { .. } => true,
+            // Capacity may free up.
+            Self::QueueFull => true,
+            // The deadline is already in the past.
+            Self::DeadlineExceeded => false,
         }
     }
 }

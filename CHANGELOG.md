@@ -21,6 +21,25 @@
 
 ---
 
+## [0.4.0] - 2026-06-05
+
+Resilience. The pieces that decide *whether* to call at all and how callers wait: a circuit breaker, a bounded deadline-aware queue, and an exact sliding-window-log limiter.
+
+### Added
+
+- `CircuitBreaker` + `CircuitBreakerBuilder` + `Trip` + `BreakerState` + `Permit` (behind the `circuit-breaker` feature) — wraps any `Limiter` and fails fast when open *without consuming the wrapped limiter*. Closed → open → half-open recovery with three trip conditions: consecutive failures, failure ratio over a rolling window, and failures within a rolling time window. Outcomes are reported through a `Permit` whose drop counts as a failure. State transitions are covered by a proptest; half-open recovery by integration tests.
+- `Queue` + `QueueBuilder` + `Overflow` (behind the `tokio` feature) — a bounded, deadline-aware, priority queue in front of a limiter. Serves by priority, fairly across keys at equal priority, and **drops waiters whose deadline has passed rather than serving them**. Overflow policies: reject, drop-oldest, drop-lowest-priority.
+- `SlidingWindowLog` — an exact sliding-window-log limiter implementing `Limiter`, so it composes everywhere the token bucket does. No boundary burst, at the cost of remembering recent grants; offers the same waiting `acquire` surface.
+- `ThrottleError::CircuitOpen { retry_after }` (retryable), `ThrottleError::QueueFull` (retryable), and `ThrottleError::DeadlineExceeded` — added to the existing `#[non_exhaustive]` error.
+- `examples/circuit_breaker.rs` — a flaky downstream tripping the breaker and recovering through half-open.
+- `tests/circuit.rs` — the state-transition proptest and async fail-fast test.
+
+### Changed
+
+- The `circuit-breaker` feature now implies `std`. The `tokio` feature additionally enables `sync` and `macros` (for the queue's waiter coordination).
+
+---
+
 ## [0.3.0] - 2026-06-05
 
 Retry and backoff. Standalone resilience that composes with the limiters but stands on its own: a full backoff taxonomy with jitter, a retry policy with per-error classification, and `Retry-After` parsing.
@@ -78,7 +97,8 @@ Initial scaffold and repository bootstrap. No throttle-net logic yet &mdash; thi
 - `deny.toml`, `clippy.toml`, `rustfmt.toml`, `.gitattributes`, `.gitignore`.
 - `.dev/` AI-editor briefing (`PROMPT.md`, `ROADMAP.md`) &mdash; gitignored.
 
-[Unreleased]: https://github.com/jamesgober/throttle-net/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/jamesgober/throttle-net/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/jamesgober/throttle-net/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/jamesgober/throttle-net/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jamesgober/throttle-net/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jamesgober/throttle-net/releases/tag/v0.1.0
