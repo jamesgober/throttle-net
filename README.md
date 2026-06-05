@@ -41,7 +41,7 @@
 
 <h2>What it does</h2>
 
-**Available now (v0.2):**
+**Available now (v0.3):**
 
 - **Token-bucket throttling** &mdash; smooth refill with burst headroom; lock-free accounting (one atomic compare-and-swap per acquire)
 - **Wait, don't reject** &mdash; the outbound default is `acquire().await`, which paces the caller; `try_acquire()` is there when you need the non-blocking answer
@@ -49,10 +49,10 @@
 - **Multi-dimensional limits** &mdash; enforce req/min AND input-tokens/min AND output-tokens/min at once; the killer feature for LLM APIs
 - **Composition** &mdash; hybrid (must pass all), per-key (independent state per tenant), and layered (global / per-key / per-endpoint) limiters, combined without the call site changing
 - **Bounded memory** &mdash; per-key state is sharded and evicted (idle TTL + hard cap), so a flood of unique keys hits a ceiling instead of growing without limit
+- **Retry + backoff** &mdash; constant / linear / exponential backoff with full, equal, or decorrelated jitter; a retry policy with per-error classification; `Retry-After` parsed and honored
 
 **On the roadmap:**
 
-- **Retry + backoff** (v0.3) &mdash; exponential with decorrelated jitter; `Retry-After` honored
 - **Circuit breakers** (v0.4) &mdash; closed / open / half-open recovery, wrapping any limiter
 - **Adaptive throttling** (v0.5) &mdash; AIMD and latency-based controllers that slow down when a downstream struggles, with no explicit signal
 - **Provider-aware** (v0.6) &mdash; parse `x-ratelimit-*` / `retry-after` headers and sync internal state
@@ -64,7 +64,7 @@
 
 ```toml
 [dependencies]
-throttle-net = "0.2"
+throttle-net = "0.3"
 ```
 
 <br>
@@ -144,10 +144,37 @@ async fn main() -> Result<(), throttle_net::ThrottleError> {
 }
 ```
 
-A full multi-dimensional example lives in [`examples/llm_budget.rs`](./examples/llm_budget.rs):
+Retry a flaky call with jittered backoff, honoring a server `Retry-After`:
+
+```rust
+use std::time::Duration;
+use throttle_net::{Backoff, Retry, RetryAction, parse_retry_after};
+
+struct Rejected { retry_after: Option<String> }
+
+#[tokio::main]
+async fn main() {
+    // Exponential from 100ms, doubling, capped at 5s, decorrelated jitter (the default).
+    let retry = Retry::new(Backoff::default().with_max(Duration::from_secs(5))).max_attempts(5);
+
+    let result: Result<&str, Rejected> = retry
+        .run(
+            || async { Err(Rejected { retry_after: None }) }, // your fallible call
+            |err: &Rejected| match err.retry_after.as_deref().and_then(parse_retry_after) {
+                Some(after) => RetryAction::RetryAfter(after), // honor the server's hint
+                None => RetryAction::Retry,                    // else use the backoff
+            },
+        )
+        .await;
+    let _ = result;
+}
+```
+
+Full runnable examples live in [`examples/`](./examples/):
 
 ```bash
-cargo run --example llm_budget
+cargo run --example llm_budget     # multi-dimensional LLM budgets
+cargo run --example retry_backoff  # retry with backoff + Retry-After
 ```
 
 <br>

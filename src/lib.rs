@@ -14,13 +14,14 @@
 //!
 //! ## Status
 //!
-//! **Pre-1.0 (v0.2).** The composition surface is in place: the [`Limiter`]
-//! trait, the [`Throttle`] token bucket with its waiting cost-aware
-//! [`acquire`](Throttle::acquire), and the composites — [`Hybrid`] (must pass
-//! all), [`MultiLimiter`] (multi-dimensional budgets), [`PerKey`] (independent
-//! per-key state, bounded memory), and [`Layered`] (global / per-key /
-//! per-endpoint scopes). Retry/backoff, circuit breakers, and adaptive limiting
-//! land across the rest of the 0.x series. The public API is frozen at 1.0.
+//! **Pre-1.0 (v0.3).** The limiter and resilience surface so far: the
+//! [`Limiter`] trait, the [`Throttle`] token bucket with its waiting cost-aware
+//! [`acquire`](Throttle::acquire), the composites — [`Hybrid`] (must pass all),
+//! [`MultiLimiter`] (multi-dimensional budgets), [`PerKey`] (independent per-key
+//! state, bounded memory), and [`Layered`] (global / per-key / per-endpoint
+//! scopes) — and standalone [`Retry`]/[`Backoff`] with jittered backoff and
+//! `Retry-After` parsing. Circuit breakers and adaptive limiting land across the
+//! rest of the 0.x series. The public API is frozen at 1.0.
 //!
 //! ```
 //! # #[cfg(feature = "tokio")]
@@ -97,6 +98,8 @@
 // bucket and the domain error type). With `std` off the crate is `no_std` and
 // exposes only `VERSION`.
 #[cfg(feature = "std")]
+mod backoff;
+#[cfg(feature = "std")]
 mod decision;
 #[cfg(feature = "std")]
 mod error;
@@ -113,8 +116,14 @@ mod multi;
 #[cfg(feature = "std")]
 mod perkey;
 #[cfg(feature = "std")]
+mod retry;
+#[cfg(feature = "std")]
+mod retry_after;
+#[cfg(feature = "std")]
 mod throttle;
 
+#[cfg(feature = "std")]
+pub use crate::backoff::{Backoff, BackoffIter, Jitter};
 #[cfg(feature = "std")]
 pub use crate::decision::Decision;
 #[cfg(feature = "std")]
@@ -131,6 +140,10 @@ pub use crate::limiter::Limiter;
 pub use crate::multi::{MultiLimiter, MultiLimiterBuilder};
 #[cfg(feature = "std")]
 pub use crate::perkey::PerKey;
+#[cfg(feature = "std")]
+pub use crate::retry::{Retry, RetryAction, retry_if_retryable};
+#[cfg(feature = "std")]
+pub use crate::retry_after::{parse_retry_after, parse_retry_after_at};
 #[cfg(feature = "std")]
 pub use crate::throttle::Throttle;
 

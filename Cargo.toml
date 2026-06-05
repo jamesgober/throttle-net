@@ -9,7 +9,7 @@
 #╚═══════════════════════════════╝
 [package]
 name    = "throttle-net"
-version = "0.2.0"
+version = "0.3.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -148,6 +148,10 @@ loom = "0.7"
 # The waiting acquire surface needs the tokio timer.
 [[example]]
 name              = "llm_budget"
+required-features = ["tokio"]
+
+[[example]]
+name              = "retry_backoff"
 required-features = ["tokio"]
 
 

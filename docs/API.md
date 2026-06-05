@@ -17,6 +17,9 @@
 - [`PerKey`](#perkey) &mdash; independent state per key
 - [`Eviction`](#eviction) &mdash; per-key memory policy
 - [`Layered`](#layered) &mdash; ordered scopes
+- [`Backoff`](#backoff) &mdash; retry delays with jitter
+- [`Retry`](#retry) &mdash; the retry policy
+- [`parse_retry_after`](#parse_retry_after) &mdash; `Retry-After` parsing
 - [Clock seam](#clock-seam) &mdash; deterministic time
 - [Feature flags](#feature-flags)
 
@@ -499,6 +502,148 @@ let layered = Layered::<u64, String>::builder()
     .build();
 
 assert!(layered.try_acquire(&42, &"/v1/chat".to_string()));
+```
+
+---
+
+## `Backoff`
+
+```rust
+pub struct Backoff { /* ... */ }
+pub struct BackoffIter { /* ... */ }
+
+#[non_exhaustive]
+pub enum Jitter { None, Full, Equal, Decorrelated }
+```
+
+A backoff *policy*: a base delay curve (constant, linear, or exponential) plus a [`Jitter`](#backoff) mode and a delay ceiling. It is independent of the limiters — pair it with [`Retry`](#retry), or call [`iter`](#backoff) and drive your own loop. Jitter spreads retries so a fleet that failed together does not retry in lockstep; `Decorrelated` is the default and the strongest at breaking up a thundering herd.
+
+### Constructors and tuning
+
+| Method | Description |
+|---|---|
+| `Backoff::constant(delay)` | The same delay every attempt. |
+| `Backoff::linear(initial, increment)` | Grows by `increment` each attempt. |
+| `Backoff::exponential(initial, factor)` | Multiplies by `factor` each attempt. |
+| `Backoff::default()` | Exponential 100ms × 2, capped at 30s, decorrelated jitter. |
+| `.with_max(Duration)` | Set the delay ceiling. |
+| `.with_jitter(Jitter)` | Set the jitter mode. |
+| `.iter()` / `.iter_seeded(u64)` | Start a delay sequence (random / reproducible seed). |
+
+### `Jitter` modes
+
+| Mode | Delay |
+|---|---|
+| `None` | exactly the capped curve |
+| `Full` | uniform in `[0, delay]` |
+| `Equal` | `delay/2 + rand(0, delay/2)` |
+| `Decorrelated` | `min(max, rand(base, previous*3))` — the default |
+
+[`BackoffIter`](#backoff) yields one delay per attempt via `next_delay()` (and implements [`Iterator`], always `Some`). The sequence is infinite; bounding attempts is [`Retry`](#retry)'s job.
+
+```rust
+use std::time::Duration;
+use throttle_net::{Backoff, Jitter};
+
+// Exponential, capped, with full jitter.
+let backoff = Backoff::exponential(Duration::from_millis(100), 2.0)
+    .with_max(Duration::from_secs(5))
+    .with_jitter(Jitter::Full);
+
+let mut delays = backoff.iter();
+let first = delays.next_delay();
+assert!(first <= Duration::from_millis(100)); // full jitter: in [0, 100ms]
+```
+
+```rust
+use std::time::Duration;
+use throttle_net::Backoff;
+
+// Plain exponential doubling, no jitter, is exact.
+let mut delays = Backoff::exponential(Duration::from_millis(100), 2.0).iter();
+assert_eq!(delays.next_delay(), Duration::from_millis(100));
+assert_eq!(delays.next_delay(), Duration::from_millis(200));
+assert_eq!(delays.next_delay(), Duration::from_millis(400));
+```
+
+---
+
+## `Retry`
+
+```rust
+pub struct Retry { /* ... */ }
+
+#[non_exhaustive]
+pub enum RetryAction { Retry, RetryAfter(Duration), GiveUp }
+```
+
+A retry policy: a [`Backoff`](#backoff), an attempt ceiling, and whether to honor a server `Retry-After`. It retries any fallible async operation, classifying each error with a closure you supply, so it works with any error type.
+
+| Method | Description |
+|---|---|
+| `Retry::new(Backoff)` | Default 5 attempts, `Retry-After` honored. |
+| `.max_attempts(u32)` | Total attempts including the first (`0` ⇒ `1`). |
+| `.respect_retry_after(bool)` | Whether [`RetryAction::RetryAfter`] overrides the backoff. |
+| `async fn run(op, classify)` _(tokio)_ | Run `op`, retrying per `classify` until it succeeds, the classifier gives up, or attempts run out. |
+
+`classify: Fn(&E) -> RetryAction` decides per error: retry with the backoff delay, retry honoring a `Retry-After`, or give up. For `error-forge` errors, [`retry_if_retryable`](#retry) classifies by the error's own `is_retryable()`.
+
+```rust
+# async fn run() {
+use throttle_net::{Backoff, Retry, RetryAction};
+
+let retry = Retry::new(Backoff::default()).max_attempts(4);
+
+let result: Result<u32, &str> = retry
+    .run(|| async { Err("transient") }, |_err| RetryAction::Retry)
+    .await;
+assert_eq!(result, Err("transient")); // gave up after 4 attempts
+# }
+```
+
+Honor a parsed `Retry-After` over the computed backoff:
+
+```rust
+# async fn run() {
+use std::time::Duration;
+use throttle_net::{Backoff, Retry, RetryAction, parse_retry_after};
+
+struct Rejected { retry_after: Option<&'static str> }
+
+let retry = Retry::new(Backoff::default()).respect_retry_after(true);
+let _: Result<(), Rejected> = retry
+    .run(
+        || async { Err(Rejected { retry_after: Some("2") }) },
+        |err: &Rejected| match err.retry_after.and_then(parse_retry_after) {
+            Some(after) => RetryAction::RetryAfter(after),
+            None => RetryAction::Retry,
+        },
+    )
+    .await;
+# }
+```
+
+---
+
+## `parse_retry_after`
+
+```rust
+pub fn parse_retry_after(value: &str) -> Option<Duration>;
+pub fn parse_retry_after_at(value: &str, now_unix_secs: i64) -> Option<Duration>;
+```
+
+Parses an HTTP `Retry-After` header into a delay from now. Accepts the delay-seconds form (`120`) and all three HTTP-date forms (IMF-fixdate, RFC 850, asctime). Malformed input returns `None` — never a panic. A date in the past yields [`Duration::ZERO`]. `parse_retry_after_at` takes an explicit "now" (Unix seconds) for deterministic use and testing; `parse_retry_after` reads the system clock.
+
+```rust
+use std::time::Duration;
+use throttle_net::{parse_retry_after, parse_retry_after_at};
+
+assert_eq!(parse_retry_after("120"), Some(Duration::from_secs(120)));
+assert_eq!(parse_retry_after("not a header"), None);
+
+// Date form, evaluated against a fixed "now":
+let when = "Thu, 01 Jan 2026 00:00:00 GMT"; // 1_767_225_600 Unix seconds
+assert_eq!(parse_retry_after_at(when, 1_767_225_540), Some(Duration::from_secs(60)));
 ```
 
 ---
