@@ -2,7 +2,7 @@
 
 > Complete reference for every public item in `throttle-net`, with examples.
 >
-> **Status: pre-1.0, public API frozen (v0.8).** The surface documented here is complete and frozen; the remaining 0.x work is hardening, not API change. Sections marked _(planned)_ describe an intended surface that is not yet shipped. Everything else is available as of the version in [`CHANGELOG.md`](../CHANGELOG.md).
+> **Status: stable (v1.0).** The surface documented here is complete and frozen until 2.0 per Semantic Versioning. Everything described is available as of the version in [`CHANGELOG.md`](../CHANGELOG.md).
 >
 > **Runtime backends.** The waiting `acquire` surface (every method marked _(runtime)_ below, plus the [`Queue`](#queue)) needs an async runtime backend: enable **either** `tokio` (the default) **or** `smol`. The async code is identical on both — you only pick the timer. async-std is not supported (it is discontinued, RUSTSEC-2025-0052). See [Runtime backends](#runtime-backends).
 >
@@ -1166,7 +1166,6 @@ instead of system entropy; `iter_seeded(seed)` is fully deterministic on both.
 | `provider-llm` | no | The [`presets`](#provider-integration) module: LLM tier presets. Implies `provider-headers`. |
 | `metrics` | no | [Metrics](#observability) via the `metrics` facade. Zero-cost when off. |
 | `tracing` | no | [Tracing events](#observability) via the `tracing` facade. Zero-cost when off. |
-| `serde` | no | Serializable limiter configs. _(planned)_ |
 
 ---
 

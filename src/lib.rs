@@ -14,7 +14,7 @@
 //!
 //! ## Status
 //!
-//! **Pre-1.0 (v0.9 — public API frozen, hardening).** The limiter and resilience surface:
+//! **Stable (v1.0).** The public API is frozen until 2.0. The limiter and resilience surface:
 //! the [`Limiter`] trait, the [`Throttle`] token bucket and the exact
 //! [`SlidingWindowLog`], each with a waiting cost-aware
 //! [`acquire`](Throttle::acquire); the composites — [`Hybrid`] (must pass all),
@@ -33,10 +33,9 @@
 //! The waiting surface runs on either [`tokio`](crate#feature-flags) or
 //! [`smol`](crate#feature-flags) — the async code is runtime-agnostic, and you
 //! choose the timer backend by feature. With `std` off, the pure algorithm core
-//! ([`Backoff`], [`Jitter`], [`Decision`]) compiles `no_std`. The public API is
-//! frozen and will not change incompatibly before 1.0; the remaining work is
-//! hardening — fuzzing, `loom` model checks, expanded property tests, and
-//! comparative benchmarks.
+//! ([`Backoff`], [`Jitter`], [`Decision`]) compiles `no_std`. Correctness is held
+//! by property tests for every limiter invariant, a `loom` model check of the
+//! lock-free slot accounting, and fuzzed parsers.
 //!
 //! ```
 //! # #[cfg(feature = "runtime")]

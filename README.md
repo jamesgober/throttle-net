@@ -32,7 +32,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). Async-first. Runtime-agnostic. Multi-dimensional, cost-aware, adaptive.
     </p>
     <blockquote>
-        <strong>Status: pre-1.0, public API frozen, hardening.</strong> The algorithm and composition surface is complete and the public API is frozen as of <code>v0.8</code>. <code>v0.9</code> adds the hardening layer &mdash; fuzzing, a <code>loom</code> model check, expanded property tests, and comparative benchmarks &mdash; on the way to <code>1.0.0</code>. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> for detail.
+        <strong>Status: stable (1.0).</strong> The public API is frozen until <code>2.0</code> per Semantic Versioning. Built and hardened across the 0.x series &mdash; property tests for every invariant, a <code>loom</code> model check, fuzzed parsers, and comparative benchmarks. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> for detail.
     </blockquote>
 </div>
 
@@ -41,7 +41,7 @@
 
 <h2>What it does</h2>
 
-**Available now (v0.9):**
+**What's included (v1.0):**
 
 - **Token-bucket throttling** &mdash; smooth refill with burst headroom; lock-free accounting (one atomic compare-and-swap per acquire)
 - **Exact sliding-window-log** &mdash; when you need no boundary burst at all, an exact alternative that composes everywhere the bucket does
@@ -60,9 +60,11 @@
 - **`no_std` core** &mdash; with `std` off, the pure algorithm types (`Backoff`, `Jitter`, `Decision`) compile without the standard library
 - **Hardened** &mdash; fuzzed parsers, a `loom` model check of the lock-free slot accounting, property tests for every limiter invariant, and comparative benchmarks against `governor`
 
-**On the roadmap:**
+**After 1.0** (backward-compatible additions, not yet shipped):
 
-- **1.0** &mdash; first-consumer integration and final benchmarks, then the stable release. The public API is frozen as of v0.8.
+- Serializable limiter configs (`serde`), as an additive feature with a designed on-disk representation
+- Companion middleware crates (`throttle-net-tower`, `throttle-net-reqwest`)
+- Distributed limiter state (shared backend) is a 2.0 design topic; 1.x is in-process
 
 <br>
 
@@ -70,16 +72,16 @@
 
 ```toml
 [dependencies]
-throttle-net = "0.9"
+throttle-net = "1"
 
 # Optional features:
-throttle-net = { version = "0.9", features = ["circuit-breaker", "adaptive", "provider-llm", "metrics", "tracing"] }
+throttle-net = { version = "1", features = ["circuit-breaker", "adaptive", "provider-llm", "metrics", "tracing"] }
 
 # Run the waiting surface on smol instead of tokio:
-throttle-net = { version = "0.9", default-features = false, features = ["smol"] }
+throttle-net = { version = "1", default-features = false, features = ["smol"] }
 
 # no_std algorithm core only (Backoff, Jitter, Decision):
-throttle-net = { version = "0.9", default-features = false }
+throttle-net = { version = "1", default-features = false }
 ```
 
 <br>

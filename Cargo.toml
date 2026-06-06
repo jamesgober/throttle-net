@@ -9,7 +9,7 @@
 #╚═══════════════════════════════╝
 [package]
 name    = "throttle-net"
-version = "0.9.0"
+version = "1.0.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -113,8 +113,6 @@ provider-llm = ["provider-headers"]
 metrics = ["dep:metrics"]
 # Tracing spans around acquire().
 tracing = ["dep:tracing"]
-# Serializable limiter configs.
-serde = ["dep:serde"]
 
 
 # DEPENDENCIES
@@ -147,7 +145,6 @@ tokio   = { version = "1", optional = true, default-features = false, features =
 smol    = { version = "2", optional = true }
 metrics = { version = "0.23", optional = true }
 tracing = { version = "0.1", optional = true }
-serde   = { version = "1", optional = true, default-features = false, features = ["derive"] }
 
 
 # DEV DEPENDENCIES

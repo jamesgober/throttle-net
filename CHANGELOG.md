@@ -21,6 +21,20 @@
 
 ---
 
+## [1.0.0] - 2026-06-06
+
+First stable release. The public API is frozen and will not change incompatibly before 2.0. No functional change from 0.9.0 — this release declares the surface stable after the 0.x series built and hardened it.
+
+### Changed
+
+- **Stable.** Per Semantic Versioning, the public API is now frozen; future 1.x releases are backward-compatible additions and fixes only.
+
+### Removed
+
+- The unimplemented `serde` feature flag, which pulled the dependency but wired up no `Serialize`/`Deserialize`. Removing a no-op flag keeps the 1.0 surface honest; serializable limiter configs may return as an additive feature in a future 1.x release, with a designed and documented on-disk representation.
+
+---
+
 ## [0.9.0] - 2026-06-06
 
 Polish and hardening. Adversarial testing, a concurrency model check, expanded property tests, and comparative benchmarks. No API change (the surface was frozen at 0.8).
@@ -195,7 +209,8 @@ Initial scaffold and repository bootstrap. No throttle-net logic yet &mdash; thi
 - `deny.toml`, `clippy.toml`, `rustfmt.toml`, `.gitattributes`, `.gitignore`.
 - `.dev/` AI-editor briefing (`PROMPT.md`, `ROADMAP.md`) &mdash; gitignored.
 
-[Unreleased]: https://github.com/jamesgober/throttle-net/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/jamesgober/throttle-net/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/jamesgober/throttle-net/compare/v0.9.0...v1.0.0
 [0.9.0]: https://github.com/jamesgober/throttle-net/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/jamesgober/throttle-net/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/jamesgober/throttle-net/compare/v0.6.0...v0.7.0
