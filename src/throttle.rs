@@ -292,18 +292,25 @@ impl<C: Clock> Throttle<C> {
     /// # }
     /// ```
     pub async fn acquire_with_cost(&self, cost: u32) -> Result<(), ThrottleError> {
-        loop {
+        let timer = crate::obs::Timer::start();
+        let result = loop {
             match self.decide(cost) {
-                Decision::Acquired => return Ok(()),
+                Decision::Acquired => break Ok(()),
                 Decision::Impossible => {
-                    return Err(ThrottleError::CostExceedsCapacity {
+                    break Err(ThrottleError::CostExceedsCapacity {
                         cost,
                         capacity: self.capacity(),
                     });
                 }
                 Decision::Retry { after } => tokio::time::sleep(after).await,
             }
+        };
+        if result.is_ok() {
+            crate::obs::acquired("throttle");
         }
+        crate::obs::wait("throttle", &timer);
+        crate::obs::trace_acquire("throttle", cost, result.is_ok(), &timer);
+        result
     }
 }
 

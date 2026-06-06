@@ -25,6 +25,7 @@
 - [`Queue`](#queue) &mdash; bounded, deadline-aware waiting
 - [`AdaptiveLimiter`](#adaptivelimiter) &mdash; learn the limit from feedback
 - [Provider integration](#provider-integration) &mdash; header parsing, sync, presets
+- [Observability](#observability) &mdash; metrics and tracing
 - [Clock seam](#clock-seam) &mdash; deterministic time
 - [Feature flags](#feature-flags)
 
@@ -970,6 +971,44 @@ assert!(limiter.try_acquire_costs(&[
 
 ---
 
+## Observability
+
+There is no public API surface here — observability is emitted automatically by
+the limiters when the `metrics` and/or `tracing` features are enabled, and
+compiles to nothing (inputs not even evaluated) when they are off. Wire up any
+`metrics` recorder / `tracing` subscriber in your application to collect it.
+
+### Metrics (feature `metrics`)
+
+Emitted through the [`metrics`](https://crates.io/crates/metrics) facade:
+
+| Metric | Type | Emitted when |
+|---|---|---|
+| `throttle_acquired_total` | counter (label `limiter`) | a waiting `acquire` is granted |
+| `throttle_wait_duration` | histogram, seconds (label `limiter`) | a waiting `acquire` completes |
+| `throttle_queue_depth` | gauge | the queue's waiter count changes |
+| `throttle_circuit_state` | gauge (0 closed, 1 half-open, 2 open) | a circuit-breaker transition |
+| `throttle_rate_current` | gauge | an adaptive limit changes |
+
+### Tracing events (feature `tracing`)
+
+Emitted through the [`tracing`](https://crates.io/crates/tracing) facade under the
+`throttle_net` target:
+
+| Event | Fields | When |
+|---|---|---|
+| `acquire` (debug) | `limiter`, `cost`, `granted`, `wait_secs` | a waiting acquire completes |
+| `circuit breaker transition` (info) | `from`, `to` | the breaker changes state |
+| `adaptive limit changed` (debug) | `old`, `new` | the adaptive limit moves |
+| `queue overflow` (warn) | `policy` | a waiter is rejected or evicted |
+| `queue waiter deadline exceeded` (warn) | — | a waiter's deadline passes |
+
+Both are feature-gated and **zero-cost when disabled**: the instrumentation hooks
+compile to empty inlined functions, and the wait timer is zero-sized when neither
+feature is on.
+
+---
+
 ## Clock seam
 
 throttle-net re-exports the time abstraction so the `with_clock` methods are usable without depending on `clock-lib` directly:
@@ -1006,8 +1045,8 @@ assert!(throttle.try_acquire());
 | `circuit-breaker` | no | The [`CircuitBreaker`](#circuitbreaker) state machine. Implies `std`. |
 | `provider-headers` | no | The [`provider`](#provider-integration) module: rate-limit header parsing + sync. Implies `std`. |
 | `provider-llm` | no | The [`presets`](#provider-integration) module: LLM tier presets. Implies `provider-headers`. |
-| `metrics` | no | Metrics counters/histograms. _(planned: 0.7)_ |
-| `tracing` | no | Tracing spans around `acquire()`. _(planned: 0.7)_ |
+| `metrics` | no | [Metrics](#observability) via the `metrics` facade. Zero-cost when off. |
+| `tracing` | no | [Tracing events](#observability) via the `tracing` facade. Zero-cost when off. |
 | `serde` | no | Serializable limiter configs. _(planned)_ |
 
 ---

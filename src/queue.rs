@@ -315,8 +315,18 @@ where
             }
         };
 
+        if did_evict {
+            crate::obs::queue_overflow(match self.overflow {
+                Overflow::Reject => "reject",
+                Overflow::DropOldest => "drop_oldest",
+                Overflow::DropLowestPriority => "drop_lowest_priority",
+            });
+        } else if outcome.is_err() {
+            crate::obs::queue_overflow("reject");
+        }
         if did_evict || outcome.is_ok() {
             self.notify.notify_waiters();
+            crate::obs::queue_depth(self.len());
         }
         outcome
     }
@@ -345,6 +355,7 @@ where
         let deadline_ms = deadline
             .map(|d| start_ms.saturating_add(u64::try_from(d.as_millis()).unwrap_or(u64::MAX)));
 
+        let timer = crate::obs::Timer::start();
         let (id, evicted) = self.register(start_ms, priority, deadline_ms, &key)?;
         // Ensure the waiter is removed and peers are woken on any exit path.
         let _guard = LeaveGuard { queue: self, id };
@@ -364,6 +375,7 @@ where
 
             let now_ms = self.now_ms();
             if deadline_ms.is_some_and(|d| now_ms >= d) {
+                crate::obs::deadline_exceeded();
                 return Err(ThrottleError::DeadlineExceeded);
             }
 
@@ -375,6 +387,9 @@ where
                             state.serve(id);
                             drop(state);
                             self.notify.notify_waiters();
+                            crate::obs::acquired("queue");
+                            crate::obs::wait("queue", &timer);
+                            crate::obs::trace_acquire("queue", 1, true, &timer);
                             return Ok(());
                         }
                         Decision::Impossible => {
@@ -434,12 +449,14 @@ where
     C: Clock + Clone,
 {
     fn drop(&mut self) {
-        {
+        let depth = {
             let mut state = self.queue.lock();
             let _ = state.waiters.remove(&self.id);
-        }
+            state.waiters.len()
+        };
         // Wake peers so the next-in-line re-evaluates its turn.
         self.queue.notify.notify_waiters();
+        crate::obs::queue_depth(depth);
     }
 }
 

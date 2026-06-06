@@ -21,6 +21,22 @@
 
 ---
 
+## [0.7.0] - 2026-06-05
+
+Observability. See what the limiters are doing in production — metrics and tracing, feature-gated and zero-cost when off.
+
+### Added
+
+- Metrics (behind the `metrics` feature) emitted through the `metrics` facade: `throttle_acquired_total` and `throttle_wait_duration` (labelled by limiter) on the waiting acquire, `throttle_queue_depth` on the queue, `throttle_circuit_state` on circuit transitions, and `throttle_rate_current` on adaptive-limit changes.
+- Tracing (behind the `tracing` feature): an `acquire` event with limiter/cost/granted/wait attributes, and structured events for circuit-breaker transitions, adaptive limit changes, queue overflow, and queue deadline exhaustion — covering every documented state transition.
+- `tests/observability.rs` — verifies, with a local capturing recorder, that the circuit-state gauge fires on a transition.
+
+### Changed
+
+- Internal: a small `obs` layer routes all instrumentation through `#[inline]` hooks that compile to nothing — and do not evaluate their inputs — when the features are off, so disabled observability is genuinely zero-cost (the wait timer is zero-sized in that case, asserted by a test). Each hook is gated to the feature of the limiter that calls it, so no hook is dead code in any build.
+
+---
+
 ## [0.6.0] - 2026-06-05
 
 Provider integration. Read a downstream's own rate-limit headers, reconcile the limiter with them, and start from a provider tier preset.
@@ -138,7 +154,8 @@ Initial scaffold and repository bootstrap. No throttle-net logic yet &mdash; thi
 - `deny.toml`, `clippy.toml`, `rustfmt.toml`, `.gitattributes`, `.gitignore`.
 - `.dev/` AI-editor briefing (`PROMPT.md`, `ROADMAP.md`) &mdash; gitignored.
 
-[Unreleased]: https://github.com/jamesgober/throttle-net/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/jamesgober/throttle-net/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/jamesgober/throttle-net/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/jamesgober/throttle-net/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/jamesgober/throttle-net/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/jamesgober/throttle-net/compare/v0.3.0...v0.4.0

@@ -319,8 +319,11 @@ where
         let in_flight = self.in_flight.load(Ordering::Acquire);
         let current = self.limit.load(Ordering::Acquire);
         let proposed = self.strategy.adjust(current, in_flight, outcome);
-        self.limit
-            .store(proposed.clamp(self.floor, self.ceiling), Ordering::Release);
+        let new = proposed.clamp(self.floor, self.ceiling);
+        self.limit.store(new, Ordering::Release);
+        if new != current {
+            crate::obs::rate_change(current, new);
+        }
         let _ = self.in_flight.fetch_sub(1, Ordering::AcqRel);
         // A slot freed (and the limit may have grown): wake a waiter.
         self.notify.notify_waiters();

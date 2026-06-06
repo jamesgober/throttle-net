@@ -14,7 +14,7 @@
 //!
 //! ## Status
 //!
-//! **Pre-1.0 (v0.6).** The limiter and resilience surface so far: the [`Limiter`]
+//! **Pre-1.0 (v0.7).** The limiter and resilience surface so far: the [`Limiter`]
 //! trait, the [`Throttle`] token bucket and the exact [`SlidingWindowLog`], each
 //! with a waiting cost-aware [`acquire`](Throttle::acquire); the composites —
 //! [`Hybrid`] (must pass all), [`MultiLimiter`] (multi-dimensional budgets),
@@ -24,10 +24,12 @@
 //! a `CircuitBreaker` that wraps any limiter and fails fast (`circuit-breaker`
 //! feature), and a deadline-aware, priority [`Queue`]; adaptive concurrency —
 //! an `AdaptiveLimiter` that discovers the right in-flight limit from outcome
-//! feedback (`adaptive` feature); and provider integration — response-header
-//! parsers with limiter sync (`provider`, `provider-headers` feature) and LLM
-//! tier `presets` (`provider-llm` feature). Observability and runtime flexibility
-//! land across the rest of the 0.x series. The public API is frozen at 1.0.
+//! feedback (`adaptive` feature); provider integration — response-header parsers
+//! with limiter sync (`provider`, `provider-headers` feature) and LLM tier
+//! `presets` (`provider-llm` feature); and observability — metrics and tracing
+//! events, feature-gated and zero-cost when off (`metrics`, `tracing` features).
+//! Runtime flexibility lands across the rest of the 0.x series. The public API is
+//! frozen at 1.0.
 //!
 //! ```
 //! # #[cfg(feature = "tokio")]
@@ -123,6 +125,8 @@ mod layered;
 mod limiter;
 #[cfg(feature = "std")]
 mod multi;
+#[cfg(any(feature = "tokio", feature = "circuit-breaker", feature = "adaptive"))]
+mod obs;
 #[cfg(feature = "std")]
 mod perkey;
 #[cfg(feature = "provider-llm")]

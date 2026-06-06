@@ -232,6 +232,7 @@ where
                     shared.state = BreakerState::HalfOpen;
                     shared.half_open_inflight = 1;
                     shared.half_open_successes = 0;
+                    crate::obs::circuit_transition("Open", "HalfOpen", 1);
                     Admit::Allow
                 } else {
                     Admit::Reject(Duration::from_millis(shared.open_until_ms - now_ms))
@@ -270,6 +271,7 @@ where
                     if shared.half_open_successes >= self.config.half_open_required {
                         shared.state = BreakerState::Closed;
                         shared.reset_counters();
+                        crate::obs::circuit_transition("HalfOpen", "Closed", 0);
                     }
                 } else {
                     self.open(&mut shared, now_ms);
@@ -294,11 +296,17 @@ where
 
     /// Moves the breaker to open and arms the cooldown.
     fn open(&self, shared: &mut Shared, now_ms: u64) {
+        let from = if shared.state == BreakerState::HalfOpen {
+            "HalfOpen"
+        } else {
+            "Closed"
+        };
         shared.state = BreakerState::Open;
         shared.open_until_ms = now_ms
             .saturating_add(u64::try_from(self.config.cooldown.as_millis()).unwrap_or(u64::MAX));
         shared.half_open_inflight = 0;
         shared.half_open_successes = 0;
+        crate::obs::circuit_transition(from, "Open", 2);
     }
 
     /// Reports a successful protected call. Prefer settling a [`Permit`].

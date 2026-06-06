@@ -41,7 +41,7 @@
 
 <h2>What it does</h2>
 
-**Available now (v0.6):**
+**Available now (v0.7):**
 
 - **Token-bucket throttling** &mdash; smooth refill with burst headroom; lock-free accounting (one atomic compare-and-swap per acquire)
 - **Exact sliding-window-log** &mdash; when you need no boundary burst at all, an exact alternative that composes everywhere the bucket does
@@ -55,11 +55,12 @@
 - **Queueing** &mdash; a bounded, deadline-aware, priority queue with fair-across-keys scheduling and reject / drop-oldest / drop-lowest-priority overflow
 - **Adaptive concurrency** &mdash; AIMD and Vegas-style controllers that discover the right in-flight limit from outcome feedback, slowing down when a downstream struggles with no explicit signal, bounded by a floor and a hard ceiling
 - **Provider-aware** &mdash; parse `x-ratelimit-*` / `retry-after` headers from OpenAI, Anthropic, GitHub, Stripe, AWS, or the RFC draft; reconcile your limiter with the server's view; start from LLM tier presets
+- **Observability** &mdash; metrics (`metrics` crate) and tracing events around every acquire and state transition, feature-gated and zero-cost when off
 
 **On the roadmap:**
 
-- **Observability** (v0.7) &mdash; metrics and tracing, zero-cost when disabled
 - **Runtime-agnostic** (v0.8) &mdash; tokio today, with async-std and smol planned
+- **Polish & 1.0** (v0.9 → 1.0) &mdash; fuzzing, loom model checks, comparative benchmarks, API freeze
 
 <br>
 
@@ -67,10 +68,10 @@
 
 ```toml
 [dependencies]
-throttle-net = "0.6"
+throttle-net = "0.7"
 
 # Optional features:
-throttle-net = { version = "0.6", features = ["circuit-breaker", "adaptive", "provider-llm"] }
+throttle-net = { version = "0.7", features = ["circuit-breaker", "adaptive", "provider-llm", "metrics", "tracing"] }
 ```
 
 <br>
