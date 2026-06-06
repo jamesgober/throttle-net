@@ -41,7 +41,7 @@
 
 <h2>What it does</h2>
 
-**Available now (v0.4):**
+**Available now (v0.5):**
 
 - **Token-bucket throttling** &mdash; smooth refill with burst headroom; lock-free accounting (one atomic compare-and-swap per acquire)
 - **Exact sliding-window-log** &mdash; when you need no boundary burst at all, an exact alternative that composes everywhere the bucket does
@@ -53,11 +53,12 @@
 - **Retry + backoff** &mdash; constant / linear / exponential backoff with full, equal, or decorrelated jitter; a retry policy with per-error classification; `Retry-After` parsed and honored
 - **Circuit breaker** &mdash; closed / open / half-open recovery; wraps any limiter and fails fast when open, without consuming it
 - **Queueing** &mdash; a bounded, deadline-aware, priority queue with fair-across-keys scheduling and reject / drop-oldest / drop-lowest-priority overflow
+- **Adaptive concurrency** &mdash; AIMD and Vegas-style controllers that discover the right in-flight limit from outcome feedback, slowing down when a downstream struggles with no explicit signal, bounded by a floor and a hard ceiling
 
 **On the roadmap:**
 
-- **Adaptive throttling** (v0.5) &mdash; AIMD and latency-based controllers that slow down when a downstream struggles, with no explicit signal
 - **Provider-aware** (v0.6) &mdash; parse `x-ratelimit-*` / `retry-after` headers and sync internal state
+- **Observability** (v0.7) &mdash; metrics and tracing, zero-cost when disabled
 - **Runtime-agnostic** (v0.8) &mdash; tokio today, with async-std and smol planned
 
 <br>
@@ -66,10 +67,10 @@
 
 ```toml
 [dependencies]
-throttle-net = "0.4"
+throttle-net = "0.5"
 
 # Optional features:
-throttle-net = { version = "0.4", features = ["circuit-breaker"] }
+throttle-net = { version = "0.5", features = ["circuit-breaker", "adaptive"] }
 ```
 
 <br>
@@ -202,9 +203,10 @@ async fn main() {
 Full runnable examples live in [`examples/`](./examples/):
 
 ```bash
-cargo run --example llm_budget                              # multi-dimensional LLM budgets
-cargo run --example retry_backoff                           # retry with backoff + Retry-After
-cargo run --example circuit_breaker --features circuit-breaker  # trip, shed, recover
+cargo run --example llm_budget                                       # multi-dimensional LLM budgets
+cargo run --example retry_backoff                                    # retry with backoff + Retry-After
+cargo run --example circuit_breaker      --features circuit-breaker  # trip, shed, recover
+cargo run --example adaptive_concurrency --features adaptive         # learn the limit from feedback
 ```
 
 <br>

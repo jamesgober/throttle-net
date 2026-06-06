@@ -23,6 +23,7 @@
 - [`parse_retry_after`](#parse_retry_after) &mdash; `Retry-After` parsing
 - [`CircuitBreaker`](#circuitbreaker) &mdash; fail fast on failures
 - [`Queue`](#queue) &mdash; bounded, deadline-aware waiting
+- [`AdaptiveLimiter`](#adaptivelimiter) &mdash; learn the limit from feedback
 - [Clock seam](#clock-seam) &mdash; deterministic time
 - [Feature flags](#feature-flags)
 
@@ -804,6 +805,77 @@ queue.acquire("tenant:1", 0, Some(Duration::from_secs(2))).await?;
 
 ---
 
+## `AdaptiveLimiter`
+
+```rust
+pub struct AdaptiveLimiter<S, C = SystemClock> { /* ... */ } // feature = "adaptive"
+
+pub trait AdaptiveStrategy { fn adjust(&self, current: u32, in_flight: u32, outcome: Outcome) -> u32; }
+pub struct Aimd { /* ... */ }
+pub struct Vegas { /* ... */ }
+
+#[non_exhaustive]
+pub enum Outcome { Success { rtt: Duration }, Failure }
+```
+
+A concurrency limiter that **discovers** the right in-flight limit instead of
+being told it. It caps the number of concurrent requests at a limit it adjusts
+from observed outcomes — growing while requests succeed (and the limit is
+saturated), shrinking when they fail or slow down — bounded by a floor and a
+ceiling. The limit **never exceeds the ceiling**, so adaptation is only ever more
+conservative than your hard cap. Behind the `adaptive` feature.
+
+Unlike the rate limiters, the waiting `acquire` blocks on a *slot* freeing, not on
+a timer; the clock is used only to measure round-trip time.
+
+### Strategies
+
+| Strategy | Behavior |
+|---|---|
+| `Aimd::new(increase, decrease)` | Add `increase` on a saturated success; multiply by `decrease` on failure. The classic congestion response. |
+| `Vegas::new(alpha, beta)` | Estimate downstream queue depth from RTT vs the learned no-load latency; grow below `alpha`, shrink above `beta`. |
+| custom | Implement `AdaptiveStrategy::adjust`. |
+
+### Build and use
+
+Build with `AdaptiveLimiter::builder()`:
+
+| Builder method | Description |
+|---|---|
+| `.floor(n)` / `.ceiling(n)` | Bounds; the ceiling is the hard limit. |
+| `.initial(n)` | Starting limit (defaults to the floor). |
+| `.build(strategy)` | Wrap the strategy. |
+
+| Method | Description |
+|---|---|
+| `try_acquire()` | `Some(permit)` if a slot is free, else `None`. |
+| `acquire().await` _(tokio)_ | Wait until a slot frees. |
+| `current_limit()` / `in_flight()` / `ceiling()` | Observe the adapting state. |
+
+Outcomes are reported through an `AdaptivePermit`: settle it with `.success()` (its
+RTT is measured from acquisition) or `.failure()`. **Dropping it unsettled counts
+as a failure.**
+
+```rust
+# async fn run() {
+use throttle_net::{Aimd, AdaptiveLimiter};
+
+let limiter = AdaptiveLimiter::builder()
+    .floor(2)
+    .ceiling(50)
+    .initial(10)
+    .build(Aimd::default()); // +1 on saturated success, halve on failure
+
+if let Some(permit) = limiter.try_acquire() {
+    // ... call the downstream, then report how it went ...
+    let ok = true;
+    if ok { permit.success() } else { permit.failure() }
+}
+# }
+```
+
+---
+
 ## Clock seam
 
 throttle-net re-exports the time abstraction so the `with_clock` methods are usable without depending on `clock-lib` directly:
@@ -836,7 +908,7 @@ assert!(throttle.try_acquire());
 |---------|---------|-------------|
 | `std` | yes | Standard library. Gates the entire limiter surface. With it off the crate is `no_std` and exposes only `VERSION`. |
 | `tokio` | yes | The waiting `acquire` surface and the [`Queue`](#queue), driven by tokio's timer/sync. Implies `std`. |
-| `adaptive` | no | AIMD + latency-based adaptive limiters. _(planned: 0.5)_ |
+| `adaptive` | no | The [`AdaptiveLimiter`](#adaptivelimiter) (AIMD + Vegas). Implies `std` + `tokio`. |
 | `circuit-breaker` | no | The [`CircuitBreaker`](#circuitbreaker) state machine. Implies `std`. |
 | `provider-headers` | no | HTTP rate-limit header parsing. _(planned: 0.6)_ |
 | `provider-llm` | no | LLM provider presets. _(planned: 0.6)_ |

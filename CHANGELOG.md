@@ -21,6 +21,26 @@
 
 ---
 
+## [0.5.0] - 2026-06-05
+
+Adaptive. Find the right limit without being told it: a concurrency limiter that learns the downstream's capacity from observed outcomes and never exceeds the hard ceiling.
+
+### Added
+
+- `AdaptiveLimiter` + `AdaptiveLimiterBuilder` + `AdaptivePermit` (behind the `adaptive` feature) — a concurrency limiter whose in-flight limit adapts to feedback. Grows while requests succeed and the limit is saturated, shrinks when they fail or slow, bounded by a floor and a ceiling, and **never exceeds the ceiling** (the hard limit). Outcomes are reported through an `AdaptivePermit` whose drop counts as a failure.
+- `AdaptiveStrategy` trait plus two strategies: `Aimd` (additive increase, multiplicative decrease) and `Vegas` (latency-based, estimating downstream queue depth from round-trip time against the learned no-load latency). `Outcome::{Success { rtt }, Failure}` carries the feedback.
+- `examples/adaptive_concurrency.rs` — the limit growing while healthy, collapsing to the floor on degradation, and recovering, all bounded.
+
+### Changed
+
+- The `adaptive` feature now implies `std` and `tokio` (the adaptive limiter waits on a freed slot via tokio's `Notify`).
+
+### Fixed
+
+- The crate-level docs no longer link to the feature-gated `CircuitBreaker` type, so `cargo doc` is warning-free on the default feature set (not only `--all-features`).
+
+---
+
 ## [0.4.0] - 2026-06-05
 
 Resilience. The pieces that decide *whether* to call at all and how callers wait: a circuit breaker, a bounded deadline-aware queue, and an exact sliding-window-log limiter.
@@ -97,7 +117,8 @@ Initial scaffold and repository bootstrap. No throttle-net logic yet &mdash; thi
 - `deny.toml`, `clippy.toml`, `rustfmt.toml`, `.gitattributes`, `.gitignore`.
 - `.dev/` AI-editor briefing (`PROMPT.md`, `ROADMAP.md`) &mdash; gitignored.
 
-[Unreleased]: https://github.com/jamesgober/throttle-net/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/jamesgober/throttle-net/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/jamesgober/throttle-net/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/jamesgober/throttle-net/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/jamesgober/throttle-net/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jamesgober/throttle-net/compare/v0.1.0...v0.2.0

@@ -9,7 +9,7 @@
 #╚═══════════════════════════════╝
 [package]
 name    = "throttle-net"
-version = "0.4.0"
+version = "0.5.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -90,8 +90,9 @@ std = [
 # Tokio async runtime integration (default). Provides the waiting `acquire`
 # surface; implies `std`, since the limiter sits underneath it.
 tokio = ["std", "dep:tokio"]
-# AIMD + latency-based adaptive limiters.
-adaptive = []
+# AIMD + latency-based adaptive limiters. The adaptive concurrency limiter waits
+# on a freed slot via tokio's `Notify`, so it pulls the tokio integration.
+adaptive = ["std", "tokio"]
 # Circuit breaker state machine. Requires the limiter surface (std).
 circuit-breaker = ["std"]
 # HTTP rate-limit header parsing.
@@ -159,6 +160,10 @@ required-features = ["tokio"]
 [[example]]
 name              = "circuit_breaker"
 required-features = ["circuit-breaker", "tokio"]
+
+[[example]]
+name              = "adaptive_concurrency"
+required-features = ["adaptive"]
 
 
 # BENCHMARKS

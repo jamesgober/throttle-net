@@ -14,16 +14,19 @@
 //!
 //! ## Status
 //!
-//! **Pre-1.0 (v0.4).** The limiter and resilience surface so far: the [`Limiter`]
+//! **Pre-1.0 (v0.5).** The limiter and resilience surface so far: the [`Limiter`]
 //! trait, the [`Throttle`] token bucket and the exact [`SlidingWindowLog`], each
 //! with a waiting cost-aware [`acquire`](Throttle::acquire); the composites —
 //! [`Hybrid`] (must pass all), [`MultiLimiter`] (multi-dimensional budgets),
 //! [`PerKey`] (independent per-key state, bounded memory), and [`Layered`]
 //! (global / per-key / per-endpoint scopes); standalone [`Retry`]/[`Backoff`]
-//! with jittered backoff and `Retry-After` parsing; and the resilience layer —
-//! a [`CircuitBreaker`] that wraps any limiter and fails fast, and a deadline-aware,
-//! priority [`Queue`]. Adaptive limiting and provider presets land across the
-//! rest of the 0.x series. The public API is frozen at 1.0.
+//! with jittered backoff and `Retry-After` parsing; the resilience layer —
+//! a `CircuitBreaker` that wraps any limiter and fails fast (`circuit-breaker`
+//! feature), and a deadline-aware, priority [`Queue`]; and adaptive concurrency —
+//! an `AdaptiveLimiter` that discovers the right in-flight limit from outcome
+//! feedback via AIMD or Vegas (`adaptive` feature). Provider presets and
+//! observability land across the rest of the 0.x series. The public API is
+//! frozen at 1.0.
 //!
 //! ```
 //! # #[cfg(feature = "tokio")]
@@ -99,6 +102,8 @@
 // The limiter surface requires the standard library (the clock-driven token
 // bucket and the domain error type). With `std` off the crate is `no_std` and
 // exposes only `VERSION`.
+#[cfg(feature = "adaptive")]
+mod adaptive;
 #[cfg(feature = "std")]
 mod backoff;
 #[cfg(feature = "circuit-breaker")]
@@ -130,6 +135,10 @@ mod sliding;
 #[cfg(feature = "std")]
 mod throttle;
 
+#[cfg(feature = "adaptive")]
+pub use crate::adaptive::{
+    AdaptiveLimiter, AdaptiveLimiterBuilder, AdaptivePermit, AdaptiveStrategy, Aimd, Outcome, Vegas,
+};
 #[cfg(feature = "std")]
 pub use crate::backoff::{Backoff, BackoffIter, Jitter};
 #[cfg(feature = "circuit-breaker")]
