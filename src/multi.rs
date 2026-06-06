@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use crate::decision::Decision;
-#[cfg(feature = "tokio")]
+#[cfg(feature = "runtime")]
 use crate::error::ThrottleError;
 use crate::limiter::{Limiter, acquire_all, peek_all};
 
@@ -140,8 +140,8 @@ impl MultiLimiter {
     }
 }
 
-#[cfg(feature = "tokio")]
-#[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
+#[cfg(feature = "runtime")]
+#[cfg_attr(docsrs, doc(cfg(feature = "runtime")))]
 impl MultiLimiter {
     /// Charges the call's per-dimension costs, waiting until every dimension can
     /// afford its share.
@@ -175,7 +175,7 @@ impl MultiLimiter {
             match acquire_all(self.pairs(costs)) {
                 Decision::Acquired => return Ok(()),
                 Decision::Impossible => return Err(self.capacity_error(costs)),
-                Decision::Retry { after } => tokio::time::sleep(after).await,
+                Decision::Retry { after } => crate::rt::sleep(after).await,
             }
         }
     }
@@ -346,7 +346,7 @@ mod tests {
         assert!(limiter.try_acquire_costs(&[("requests", 2), ("tokens", 10)]));
     }
 
-    #[cfg(feature = "tokio")]
+    #[cfg(feature = "runtime")]
     #[tokio::test]
     async fn test_acquire_costs_errors_and_names_the_overspent_dimension() {
         use crate::error::ThrottleError;

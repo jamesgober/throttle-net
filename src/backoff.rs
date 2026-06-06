@@ -193,10 +193,13 @@ impl Backoff {
         self.jitter
     }
 
-    /// Starts a delay sequence, seeded from system entropy.
+    /// Starts a delay sequence, seeded from process entropy.
     ///
     /// Each call returns an independent [`BackoffIter`] with its own random
     /// state, so two retry loops sharing one policy still jitter independently.
+    /// The seed mixes a per-call counter with the wall clock under `std`; under
+    /// `no_std` it is counter-only (still distinct per iterator within a run). For
+    /// a fully reproducible sequence, use [`iter_seeded`](Self::iter_seeded).
     #[must_use]
     pub fn iter(&self) -> BackoffIter {
         self.iter_seeded(entropy_seed())
@@ -286,11 +289,14 @@ impl BackoffIter {
                 base.saturating_add(inc.saturating_mul(u64::from(attempt)))
             }
             Kind::Exponential => {
-                // Clamp the exponent so `powi` cannot overflow f64 to infinity for
-                // pathological attempt counts; the result is clamped to the cap
-                // by the caller anyway.
-                let exp = i32::try_from(attempt.min(64)).unwrap_or(64);
-                let scaled = (base as f64) * self.policy.factor.powi(exp);
+                // `base * factor^attempt`, by repeated multiplication so it works
+                // in `no_std` (where `f64::powi` is unavailable). The exponent is
+                // clamped so the loop is bounded and the value cannot run away; the
+                // result is clamped to the cap by the caller anyway.
+                let mut scaled = base as f64;
+                for _ in 0..attempt.min(64) {
+                    scaled *= self.policy.factor;
+                }
                 if scaled.is_finite() && scaled >= 0.0 && scaled < (u64::MAX as f64) {
                     scaled as u64
                 } else {
@@ -364,19 +370,23 @@ impl Rng {
     }
 }
 
-/// Derives a seed from a monotonically-increasing counter mixed with the wall
-/// clock, so distinct `BackoffIter`s — even within one process and one instant —
-/// start from different states.
+/// Derives a seed from a monotonically-increasing counter, mixed with the wall
+/// clock under `std`, so distinct `BackoffIter`s start from different states.
+/// `no_std` builds have no clock, so the seed is counter-only — still distinct per
+/// iterator within a run, though it repeats across process restarts.
 fn entropy_seed() -> u64 {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use core::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+    #[cfg(feature = "std")]
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos() as u64);
+    #[cfg(not(feature = "std"))]
+    let nanos = 0u64;
 
-    // Mix the two sources through the SplitMix64 finalizer for avalanche.
+    // Mix the sources through the SplitMix64 finalizer for avalanche.
     let mut z = nanos ^ counter.wrapping_mul(0x9E37_79B9_7F4A_7C15);
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);

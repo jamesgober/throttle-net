@@ -10,7 +10,7 @@ use ahash::RandomState;
 use clock_lib::{Clock, Monotonic, SystemClock};
 
 use crate::decision::Decision;
-#[cfg(feature = "tokio")]
+#[cfg(feature = "runtime")]
 use crate::error::ThrottleError;
 use crate::eviction::Eviction;
 use crate::limiter::Limiter;
@@ -426,8 +426,8 @@ where
     }
 }
 
-#[cfg(feature = "tokio")]
-#[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
+#[cfg(feature = "runtime")]
+#[cfg_attr(docsrs, doc(cfg(feature = "runtime")))]
 impl<K, C> PerKey<K, C>
 where
     K: Eq + Hash + Clone + Send + Sync + 'static,
@@ -471,7 +471,7 @@ where
                         capacity: self.amount,
                     });
                 }
-                Decision::Retry { after } => tokio::time::sleep(after).await,
+                Decision::Retry { after } => crate::rt::sleep(after).await,
             }
         }
     }
@@ -635,7 +635,7 @@ mod tests {
         assert!(limiter.try_acquire(&"hot".to_string()));
     }
 
-    #[cfg(feature = "tokio")]
+    #[cfg(feature = "runtime")]
     #[tokio::test]
     async fn test_acquire_errors_when_cost_exceeds_capacity() {
         use crate::error::ThrottleError;
@@ -651,7 +651,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "tokio")]
+    #[cfg(feature = "runtime")]
     #[tokio::test]
     async fn test_acquire_waits_then_succeeds() {
         let limiter: PerKey<&str> = PerKey::per_second(1000);

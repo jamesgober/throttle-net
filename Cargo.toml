@@ -9,7 +9,7 @@
 #╚═══════════════════════════════╝
 [package]
 name    = "throttle-net"
-version = "0.7.0"
+version = "0.8.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -87,12 +87,21 @@ std = [
     "dep:error-forge",
     "dep:ahash",
 ]
-# Tokio async runtime integration (default). Provides the waiting `acquire`
-# surface; implies `std`, since the limiter sits underneath it.
-tokio = ["std", "dep:tokio"]
-# AIMD + latency-based adaptive limiters. The adaptive concurrency limiter waits
-# on a freed slot via tokio's `Notify`, so it pulls the tokio integration.
-adaptive = ["std", "tokio"]
+# Internal marker: an async runtime backend is selected, so the waiting `acquire`
+# surface (and the queue) is available. Enabled by `tokio` / `smol`; not meant to
+# be turned on directly. Pulls the runtime-agnostic async primitives: a
+# notification primitive (`event-listener`) and a future combinator for racing a
+# wake-up against a timeout (`futures-lite`).
+runtime = ["std", "dep:event-listener", "dep:futures-lite"]
+# Tokio async runtime integration (default): drives the waiting `acquire` timer.
+tokio = ["runtime", "dep:tokio"]
+# smol async runtime integration: an alternative timer backend for the waiting
+# `acquire` surface. (async-std is intentionally unsupported — it is discontinued,
+# RUSTSEC-2025-0052.)
+smol = ["runtime", "dep:smol"]
+# AIMD + latency-based adaptive limiters. The synchronous surface needs only
+# `std`; the waiting `acquire` additionally needs a runtime (`tokio` / `smol`).
+adaptive = ["std", "dep:event-listener"]
 # Circuit breaker state machine. Requires the limiter surface (std).
 circuit-breaker = ["std"]
 # HTTP rate-limit header parsing. Requires the limiter surface (std).
@@ -109,8 +118,6 @@ serde = ["dep:serde"]
 
 # DEPENDENCIES
 # #################################
-# Runtime adapters beyond tokio (async-std, smol) land with v0.8.0 runtime
-# flexibility; they are not wired here until there is code that uses them.
 [dependencies]
 # Token-bucket accounting (the single source of truth; never re-implemented).
 # Its `clock` feature exposes the `Bucket` surface and the `acquire(n)` path
@@ -126,10 +133,17 @@ error-forge   = { version = "1", optional = true }
 # runtime-rng default seeds each store randomly, keeping it collision-attack
 # resistant against hostile keys.
 ahash         = { version = "0.8", optional = true }
-# Async runtime for the waiting `acquire` surface: the timer for backoff/refill
-# waits, `sync::Notify` for the queue's waiter coordination, and `macros` for
-# `select!` (waiting on a wake-up or a deadline, whichever comes first).
-tokio   = { version = "1", optional = true, default-features = false, features = ["time", "sync", "macros"] }
+# Runtime-agnostic notification primitive: the queue and adaptive limiter wait on
+# an `Event` rather than a tokio-specific `Notify`, so the same code runs on any
+# executor.
+event-listener = { version = "5", default-features = false, optional = true }
+# Runtime-agnostic future combinator (`future::or`) for racing a wake-up against a
+# timeout in the queue, without a runtime-specific `select!`.
+futures-lite   = { version = "2", default-features = false, optional = true }
+# Tokio timer backend for the waiting `acquire` surface (only the timer is used).
+tokio   = { version = "1", optional = true, default-features = false, features = ["time"] }
+# smol timer backend (`smol::Timer`) for the waiting `acquire` surface.
+smol    = { version = "2", optional = true }
 metrics = { version = "0.23", optional = true }
 tracing = { version = "0.1", optional = true }
 serde   = { version = "1", optional = true, default-features = false, features = ["derive"] }
@@ -164,6 +178,10 @@ required-features = ["circuit-breaker", "tokio"]
 [[example]]
 name              = "adaptive_concurrency"
 required-features = ["adaptive"]
+
+[[example]]
+name              = "per_tenant_quotas"
+required-features = ["tokio"]
 
 
 # BENCHMARKS

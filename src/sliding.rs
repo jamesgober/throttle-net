@@ -17,7 +17,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use clock_lib::{Clock, Monotonic, SystemClock};
 
 use crate::decision::Decision;
-#[cfg(feature = "tokio")]
+#[cfg(feature = "runtime")]
 use crate::error::ThrottleError;
 use crate::limiter::Limiter;
 
@@ -279,8 +279,8 @@ where
     }
 }
 
-#[cfg(feature = "tokio")]
-#[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
+#[cfg(feature = "runtime")]
+#[cfg_attr(docsrs, doc(cfg(feature = "runtime")))]
 impl<C> SlidingWindowLog<C>
 where
     C: Clock + Clone,
@@ -310,7 +310,7 @@ where
                         capacity: self.limit,
                     });
                 }
-                Decision::Retry { after } => tokio::time::sleep(after).await,
+                Decision::Retry { after } => crate::rt::sleep(after).await,
             }
         }
     }

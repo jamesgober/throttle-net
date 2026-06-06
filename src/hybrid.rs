@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use crate::decision::Decision;
-#[cfg(feature = "tokio")]
+#[cfg(feature = "runtime")]
 use crate::error::ThrottleError;
 use crate::limiter::{Limiter, acquire_all, peek_all};
 
@@ -83,8 +83,8 @@ impl Hybrid {
     }
 }
 
-#[cfg(feature = "tokio")]
-#[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
+#[cfg(feature = "runtime")]
+#[cfg_attr(docsrs, doc(cfg(feature = "runtime")))]
 impl Hybrid {
     /// Takes one token from every constituent, waiting until all are free.
     ///
@@ -124,7 +124,7 @@ impl Hybrid {
                         capacity: self.capacity(),
                     });
                 }
-                Decision::Retry { after } => tokio::time::sleep(after).await,
+                Decision::Retry { after } => crate::rt::sleep(after).await,
             }
         }
     }
@@ -299,7 +299,7 @@ mod tests {
         assert!(hybrid.try_acquire());
     }
 
-    #[cfg(feature = "tokio")]
+    #[cfg(feature = "runtime")]
     #[tokio::test]
     async fn test_acquire_errors_when_a_constituent_can_never_grant() {
         use crate::error::ThrottleError;

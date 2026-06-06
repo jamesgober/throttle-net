@@ -32,7 +32,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). Async-first. Runtime-agnostic. Multi-dimensional, cost-aware, adaptive.
     </p>
     <blockquote>
-        <strong>Status: pre-1.0, in active development.</strong> The algorithm and composition surface is being built and frozen across the 0.x series; <code>1.0.0</code> freezes the public API. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> for detail.
+        <strong>Status: pre-1.0, public API frozen.</strong> The algorithm and composition surface is complete and the public API is frozen as of <code>v0.8</code>; the remaining 0.x work is hardening before <code>1.0.0</code>. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> for detail.
     </blockquote>
 </div>
 
@@ -41,7 +41,7 @@
 
 <h2>What it does</h2>
 
-**Available now (v0.7):**
+**Available now (v0.8):**
 
 - **Token-bucket throttling** &mdash; smooth refill with burst headroom; lock-free accounting (one atomic compare-and-swap per acquire)
 - **Exact sliding-window-log** &mdash; when you need no boundary burst at all, an exact alternative that composes everywhere the bucket does
@@ -56,11 +56,12 @@
 - **Adaptive concurrency** &mdash; AIMD and Vegas-style controllers that discover the right in-flight limit from outcome feedback, slowing down when a downstream struggles with no explicit signal, bounded by a floor and a hard ceiling
 - **Provider-aware** &mdash; parse `x-ratelimit-*` / `retry-after` headers from OpenAI, Anthropic, GitHub, Stripe, AWS, or the RFC draft; reconcile your limiter with the server's view; start from LLM tier presets
 - **Observability** &mdash; metrics (`metrics` crate) and tracing events around every acquire and state transition, feature-gated and zero-cost when off
+- **Runtime-agnostic** &mdash; the waiting surface runs on either **tokio** or **smol**; the async code is the same, you pick the timer backend by feature (async-std is unsupported &mdash; it is discontinued, RUSTSEC-2025-0052)
+- **`no_std` core** &mdash; with `std` off, the pure algorithm types (`Backoff`, `Jitter`, `Decision`) compile without the standard library
 
 **On the roadmap:**
 
-- **Runtime-agnostic** (v0.8) &mdash; tokio today, with async-std and smol planned
-- **Polish & 1.0** (v0.9 → 1.0) &mdash; fuzzing, loom model checks, comparative benchmarks, API freeze
+- **Polish & 1.0** (v0.9 → 1.0) &mdash; fuzzing, loom model checks, comparative benchmarks. The public API is already frozen as of v0.8.
 
 <br>
 
@@ -68,10 +69,16 @@
 
 ```toml
 [dependencies]
-throttle-net = "0.7"
+throttle-net = "0.8"
 
 # Optional features:
-throttle-net = { version = "0.7", features = ["circuit-breaker", "adaptive", "provider-llm", "metrics", "tracing"] }
+throttle-net = { version = "0.8", features = ["circuit-breaker", "adaptive", "provider-llm", "metrics", "tracing"] }
+
+# Run the waiting surface on smol instead of tokio:
+throttle-net = { version = "0.8", default-features = false, features = ["smol"] }
+
+# no_std algorithm core only (Backoff, Jitter, Decision):
+throttle-net = { version = "0.8", default-features = false }
 ```
 
 <br>
@@ -231,6 +238,7 @@ cargo run --example llm_budget                                       # multi-dim
 cargo run --example retry_backoff                                    # retry with backoff + Retry-After
 cargo run --example circuit_breaker      --features circuit-breaker  # trip, shed, recover
 cargo run --example adaptive_concurrency --features adaptive         # learn the limit from feedback
+cargo run --example per_tenant_quotas                               # per-tenant budgets under a global cap
 ```
 
 <br>
@@ -260,7 +268,7 @@ It stays foreign-compatible: the obvious default for "I need to call an external
 
 ## Contributing
 
-Before opening a PR, `cargo fmt --all`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test --all-features` must be clean. Hot-path changes require a `criterion` benchmark; correctness-critical paths require property and/or `loom` tests.
+Before opening a PR, `cargo fmt --all`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test --all-features` must be clean. The runtime matrix must also build and test on smol (`cargo test --no-default-features --features smol`) and the `no_std` core must build (`cargo build --no-default-features`). Hot-path changes require a `criterion` benchmark; correctness-critical paths require property and/or `loom` tests.
 
 <br>
 

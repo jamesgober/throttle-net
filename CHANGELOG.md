@@ -21,6 +21,28 @@
 
 ---
 
+## [0.8.0] - 2026-06-05
+
+Runtime flexibility and feature freeze. The waiting surface now runs on either tokio or smol, the pure algorithm core compiles `no_std`, and the public API is frozen for 1.0.
+
+### Added
+
+- smol runtime support (behind the `smol` feature) — an alternative timer backend for the waiting `acquire` surface. The async code is runtime-agnostic; you pick the backend by feature (`tokio` stays the default). Both are exercised in CI.
+- `no_std` core: with `std` off, the pure algorithm types (`Backoff`, `BackoffIter`, `Jitter`, `Decision`) and their math compile without the standard library, alongside `VERSION`. The limiter surface still requires `std`. CI builds the `no_std` core and runs its doctests.
+- `examples/per_tenant_quotas.rs` — per-tenant budgets under a shared global ceiling via a `Layered` global + `PerKey` stack, so one noisy tenant cannot starve the others.
+
+### Changed
+
+- The waiting surface (`Queue`, the waiting `acquire`, and the adaptive limiter's slot wait) was made runtime-agnostic: it waits on an `event-listener` `Event` and races a wake-up against a timeout with `futures-lite`, instead of a tokio-specific `Notify` / `select!`. The internal `runtime` marker feature is enabled by `tokio` or `smol`; selecting neither while requesting the waiting surface is a clear compile error.
+- The `tokio` feature now pulls only tokio's `time` feature (the timer is all that is used), trimming the default dependency footprint.
+- **Feature freeze.** The public API is frozen as of this release and will not change incompatibly before 1.0.
+
+### Security
+
+- async-std is intentionally unsupported: it is discontinued (RUSTSEC-2025-0052). Runtime flexibility is delivered through tokio and smol instead.
+
+---
+
 ## [0.7.0] - 2026-06-05
 
 Observability. See what the limiters are doing in production — metrics and tracing, feature-gated and zero-cost when off.
@@ -154,7 +176,8 @@ Initial scaffold and repository bootstrap. No throttle-net logic yet &mdash; thi
 - `deny.toml`, `clippy.toml`, `rustfmt.toml`, `.gitattributes`, `.gitignore`.
 - `.dev/` AI-editor briefing (`PROMPT.md`, `ROADMAP.md`) &mdash; gitignored.
 
-[Unreleased]: https://github.com/jamesgober/throttle-net/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/jamesgober/throttle-net/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/jamesgober/throttle-net/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/jamesgober/throttle-net/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/jamesgober/throttle-net/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/jamesgober/throttle-net/compare/v0.4.0...v0.5.0

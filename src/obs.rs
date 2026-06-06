@@ -19,13 +19,13 @@
 /// Measures wait time for the metrics histogram and the tracing event. Holds an
 /// `Instant` only when at least one observability feature is enabled; otherwise
 /// it is zero-sized and `start` is a no-op.
-#[cfg(feature = "tokio")]
+#[cfg(feature = "runtime")]
 pub(crate) struct Timer {
     #[cfg(any(feature = "metrics", feature = "tracing"))]
     start: std::time::Instant,
 }
 
-#[cfg(feature = "tokio")]
+#[cfg(feature = "runtime")]
 impl Timer {
     /// Begins timing (a no-op unless an observability feature is enabled).
     #[inline]
@@ -45,7 +45,7 @@ impl Timer {
 }
 
 /// Records a granted acquisition (`throttle_acquired_total`).
-#[cfg(feature = "tokio")]
+#[cfg(feature = "runtime")]
 #[inline]
 pub(crate) fn acquired(limiter: &'static str) {
     #[cfg(feature = "metrics")]
@@ -55,7 +55,7 @@ pub(crate) fn acquired(limiter: &'static str) {
 }
 
 /// Records how long an acquisition waited (`throttle_wait_duration`, seconds).
-#[cfg(feature = "tokio")]
+#[cfg(feature = "runtime")]
 #[inline]
 pub(crate) fn wait(limiter: &'static str, timer: &Timer) {
     #[cfg(feature = "metrics")]
@@ -65,7 +65,7 @@ pub(crate) fn wait(limiter: &'static str, timer: &Timer) {
 }
 
 /// Emits a tracing event describing a completed acquisition.
-#[cfg(feature = "tokio")]
+#[cfg(feature = "runtime")]
 #[inline]
 pub(crate) fn trace_acquire(limiter: &'static str, cost: u32, granted: bool, timer: &Timer) {
     #[cfg(feature = "tracing")]
@@ -82,7 +82,7 @@ pub(crate) fn trace_acquire(limiter: &'static str, cost: u32, granted: bool, tim
 }
 
 /// Sets the current queue depth gauge (`throttle_queue_depth`).
-#[cfg(feature = "tokio")]
+#[cfg(feature = "runtime")]
 #[inline]
 pub(crate) fn queue_depth(depth: usize) {
     #[cfg(feature = "metrics")]
@@ -93,7 +93,7 @@ pub(crate) fn queue_depth(depth: usize) {
 }
 
 /// Emits a structured event for a queue overflow (a waiter rejected or evicted).
-#[cfg(feature = "tokio")]
+#[cfg(feature = "runtime")]
 #[inline]
 pub(crate) fn queue_overflow(policy: &'static str) {
     #[cfg(feature = "tracing")]
@@ -103,7 +103,7 @@ pub(crate) fn queue_overflow(policy: &'static str) {
 }
 
 /// Emits a structured event for a waiter dropped because its deadline passed.
-#[cfg(feature = "tokio")]
+#[cfg(feature = "runtime")]
 #[inline]
 pub(crate) fn deadline_exceeded() {
     #[cfg(feature = "tracing")]
@@ -144,7 +144,7 @@ pub(crate) fn rate_change(old: u32, new: u32) {
 
 #[cfg(all(
     test,
-    feature = "tokio",
+    feature = "runtime",
     not(any(feature = "metrics", feature = "tracing"))
 ))]
 mod tests {

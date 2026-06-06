@@ -95,8 +95,8 @@ impl Retry {
     }
 }
 
-#[cfg(feature = "tokio")]
-#[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
+#[cfg(feature = "runtime")]
+#[cfg_attr(docsrs, doc(cfg(feature = "runtime")))]
 impl Retry {
     /// Runs `operation`, retrying on failure per the policy until it succeeds,
     /// the classifier says to stop, or the attempt ceiling is reached.
@@ -163,7 +163,7 @@ impl Retry {
                             }
                         }
                     };
-                    tokio::time::sleep(delay).await;
+                    crate::rt::sleep(delay).await;
                     attempt += 1;
                 }
             }
@@ -291,6 +291,10 @@ mod tests {
         );
     }
 
+    // These two assert *exact* elapsed time via tokio's paused virtual clock,
+    // which requires the tokio timer; under a real (smol) timer the wait is real,
+    // so they are tokio-specific. The honor/ignore logic itself is runtime-agnostic.
+    #[cfg(feature = "tokio")]
     #[tokio::test(start_paused = true)]
     async fn test_retry_after_is_honored_when_enabled() {
         let start = tokio::time::Instant::now();
@@ -307,6 +311,7 @@ mod tests {
         assert_eq!(start.elapsed(), Duration::from_secs(30));
     }
 
+    #[cfg(feature = "tokio")]
     #[tokio::test(start_paused = true)]
     async fn test_retry_after_is_ignored_when_disabled() {
         let start = tokio::time::Instant::now();

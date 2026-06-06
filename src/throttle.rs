@@ -6,7 +6,7 @@ use better_bucket::{Bucket, Decision as BucketDecision};
 use clock_lib::{Clock, SystemClock};
 
 use crate::decision::Decision;
-#[cfg(feature = "tokio")]
+#[cfg(feature = "runtime")]
 use crate::error::ThrottleError;
 use crate::limiter::Limiter;
 
@@ -238,8 +238,8 @@ impl<C: Clock> Throttle<C> {
     }
 }
 
-#[cfg(feature = "tokio")]
-#[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
+#[cfg(feature = "runtime")]
+#[cfg_attr(docsrs, doc(cfg(feature = "runtime")))]
 impl<C: Clock> Throttle<C> {
     /// Takes one token, waiting until one is available.
     ///
@@ -302,7 +302,7 @@ impl<C: Clock> Throttle<C> {
                         capacity: self.capacity(),
                     });
                 }
-                Decision::Retry { after } => tokio::time::sleep(after).await,
+                Decision::Retry { after } => crate::rt::sleep(after).await,
             }
         };
         if result.is_ok() {

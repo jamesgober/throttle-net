@@ -14,25 +14,30 @@
 //!
 //! ## Status
 //!
-//! **Pre-1.0 (v0.7).** The limiter and resilience surface so far: the [`Limiter`]
-//! trait, the [`Throttle`] token bucket and the exact [`SlidingWindowLog`], each
-//! with a waiting cost-aware [`acquire`](Throttle::acquire); the composites —
-//! [`Hybrid`] (must pass all), [`MultiLimiter`] (multi-dimensional budgets),
-//! [`PerKey`] (independent per-key state, bounded memory), and [`Layered`]
-//! (global / per-key / per-endpoint scopes); standalone [`Retry`]/[`Backoff`]
-//! with jittered backoff and `Retry-After` parsing; the resilience layer —
-//! a `CircuitBreaker` that wraps any limiter and fails fast (`circuit-breaker`
-//! feature), and a deadline-aware, priority [`Queue`]; adaptive concurrency —
-//! an `AdaptiveLimiter` that discovers the right in-flight limit from outcome
-//! feedback (`adaptive` feature); provider integration — response-header parsers
-//! with limiter sync (`provider`, `provider-headers` feature) and LLM tier
-//! `presets` (`provider-llm` feature); and observability — metrics and tracing
-//! events, feature-gated and zero-cost when off (`metrics`, `tracing` features).
-//! Runtime flexibility lands across the rest of the 0.x series. The public API is
-//! frozen at 1.0.
+//! **Pre-1.0 (v0.8 — public API frozen).** The limiter and resilience surface:
+//! the [`Limiter`] trait, the [`Throttle`] token bucket and the exact
+//! [`SlidingWindowLog`], each with a waiting cost-aware
+//! [`acquire`](Throttle::acquire); the composites — [`Hybrid`] (must pass all),
+//! [`MultiLimiter`] (multi-dimensional budgets), [`PerKey`] (independent per-key
+//! state, bounded memory), and [`Layered`] (global / per-key / per-endpoint
+//! scopes); standalone [`Retry`]/[`Backoff`] with jittered backoff and
+//! `Retry-After` parsing; the resilience layer — a `CircuitBreaker` that wraps
+//! any limiter and fails fast (`circuit-breaker` feature), and a deadline-aware,
+//! priority [`Queue`]; adaptive concurrency — an `AdaptiveLimiter` that discovers
+//! the right in-flight limit from outcome feedback (`adaptive` feature); provider
+//! integration — response-header parsers with limiter sync (`provider-headers`
+//! feature) and LLM tier `presets` (`provider-llm` feature); and observability —
+//! metrics and tracing events, feature-gated and zero-cost when off (`metrics`,
+//! `tracing` features).
+//!
+//! The waiting surface runs on either [`tokio`](crate#feature-flags) or
+//! [`smol`](crate#feature-flags) — the async code is runtime-agnostic, and you
+//! choose the timer backend by feature. With `std` off, the pure algorithm core
+//! ([`Backoff`], [`Jitter`], [`Decision`]) compiles `no_std`. The public API is
+//! now frozen and will not change incompatibly before 1.0.
 //!
 //! ```
-//! # #[cfg(feature = "tokio")]
+//! # #[cfg(feature = "runtime")]
 //! # async fn run() -> Result<(), throttle_net::ThrottleError> {
 //! use throttle_net::Throttle;
 //!
@@ -79,10 +84,13 @@
 //!
 //! | Feature | Default | Description |
 //! |---------|---------|-------------|
-//! | `std`   | yes | Standard library. Gates the limiter surface. With it off the crate is `no_std` and exposes only [`VERSION`]. |
-//! | `tokio` | yes | The waiting [`acquire`](Throttle::acquire) surface, driven by tokio's timer. Implies `std`. |
+//! | `std`   | yes | Standard library — the limiter surface. With it off the crate is `no_std` and exposes the pure algorithm core ([`Backoff`], [`Jitter`], [`Decision`]) plus [`VERSION`]. |
+//! | `tokio` | yes | tokio timer backend for the waiting [`acquire`](Throttle::acquire) surface. Implies `std`. |
+//! | `smol`  | no  | smol timer backend, as an alternative to `tokio`. (async-std is unsupported — it is discontinued.) |
 //!
-//! See `docs/API.md` for the full feature matrix as later phases land.
+//! The `circuit-breaker`, `adaptive`, `provider-headers` / `provider-llm`, and
+//! `metrics` / `tracing` features are documented in `docs/API.md`, which carries
+//! the full feature matrix.
 
 // `no_std` for the library build when `std` is off, but always link `std` under
 // `test` so the unit-test harness and dev-dependencies have what they need.
@@ -107,11 +115,11 @@
 // exposes only `VERSION`.
 #[cfg(feature = "adaptive")]
 mod adaptive;
-#[cfg(feature = "std")]
+// `backoff` and `decision` are the `no_std`-capable algorithm core: pure types
+// and math, no clock or async. The rest of the surface requires `std`.
 mod backoff;
 #[cfg(feature = "circuit-breaker")]
 mod circuit;
-#[cfg(feature = "std")]
 mod decision;
 #[cfg(feature = "std")]
 mod error;
@@ -125,7 +133,7 @@ mod layered;
 mod limiter;
 #[cfg(feature = "std")]
 mod multi;
-#[cfg(any(feature = "tokio", feature = "circuit-breaker", feature = "adaptive"))]
+#[cfg(any(feature = "runtime", feature = "circuit-breaker", feature = "adaptive"))]
 mod obs;
 #[cfg(feature = "std")]
 mod perkey;
@@ -133,12 +141,14 @@ mod perkey;
 pub mod presets;
 #[cfg(feature = "provider-headers")]
 pub mod provider;
-#[cfg(feature = "tokio")]
+#[cfg(feature = "runtime")]
 mod queue;
 #[cfg(feature = "std")]
 mod retry;
 #[cfg(feature = "std")]
 mod retry_after;
+#[cfg(feature = "runtime")]
+mod rt;
 #[cfg(feature = "std")]
 mod sliding;
 #[cfg(feature = "std")]
@@ -150,11 +160,9 @@ mod timeutil;
 pub use crate::adaptive::{
     AdaptiveLimiter, AdaptiveLimiterBuilder, AdaptivePermit, AdaptiveStrategy, Aimd, Outcome, Vegas,
 };
-#[cfg(feature = "std")]
 pub use crate::backoff::{Backoff, BackoffIter, Jitter};
 #[cfg(feature = "circuit-breaker")]
 pub use crate::circuit::{BreakerState, CircuitBreaker, CircuitBreakerBuilder, Permit, Trip};
-#[cfg(feature = "std")]
 pub use crate::decision::Decision;
 #[cfg(feature = "std")]
 pub use crate::error::ThrottleError;
@@ -170,7 +178,7 @@ pub use crate::limiter::Limiter;
 pub use crate::multi::{MultiLimiter, MultiLimiterBuilder};
 #[cfg(feature = "std")]
 pub use crate::perkey::PerKey;
-#[cfg(feature = "tokio")]
+#[cfg(feature = "runtime")]
 pub use crate::queue::{Overflow, Queue, QueueBuilder};
 #[cfg(feature = "std")]
 pub use crate::retry::{Retry, RetryAction, retry_if_retryable};

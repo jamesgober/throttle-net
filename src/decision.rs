@@ -16,13 +16,16 @@ use core::time::Duration;
 /// # Examples
 ///
 /// ```
-/// use throttle_net::{Decision, Limiter, Throttle};
+/// use std::time::Duration;
+/// use throttle_net::Decision;
 ///
-/// let throttle = Throttle::per_second(1);
-/// // The bucket starts full, so the first unit is granted immediately.
-/// assert_eq!(throttle.acquire_cost(1), Decision::Acquired);
-/// // The next unit must wait for the bucket to refill.
-/// assert!(matches!(throttle.acquire_cost(1), Decision::Retry { .. }));
+/// // Granted now:
+/// assert!(Decision::Acquired.is_acquired());
+/// // Refused for now, retry after the wait:
+/// let d = Decision::Retry { after: Duration::from_millis(20) };
+/// assert_eq!(d.retry_after(), Some(Duration::from_millis(20)));
+/// // Can never succeed (cost exceeds capacity):
+/// assert!(!Decision::Impossible.is_acquired());
 /// ```
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

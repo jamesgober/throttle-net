@@ -22,7 +22,7 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use core::time::Duration;
 
 use clock_lib::{Clock, Monotonic, SystemClock};
-use tokio::sync::Notify;
+use event_listener::Event;
 
 /// The observed result of one completed request, fed back to the strategy.
 ///
@@ -218,7 +218,7 @@ where
     in_flight: AtomicU32,
     floor: u32,
     ceiling: u32,
-    notify: Notify,
+    notify: Event,
     clock: C,
 }
 
@@ -244,7 +244,7 @@ where
             in_flight: AtomicU32::new(0),
             floor,
             ceiling,
-            notify: Notify::new(),
+            notify: Event::new(),
             clock,
         }
     }
@@ -326,7 +326,7 @@ where
         }
         let _ = self.in_flight.fetch_sub(1, Ordering::AcqRel);
         // A slot freed (and the limit may have grown): wake a waiter.
-        self.notify.notify_waiters();
+        let _ = self.notify.notify(usize::MAX);
     }
 
     /// Round-trip time since `started`, per this limiter's clock.
@@ -340,8 +340,8 @@ where
     }
 }
 
-#[cfg(feature = "tokio")]
-#[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
+#[cfg(feature = "runtime")]
+#[cfg_attr(docsrs, doc(cfg(feature = "runtime")))]
 impl<S, C> AdaptiveLimiter<S, C>
 where
     S: AdaptiveStrategy,
@@ -354,13 +354,13 @@ where
     /// request's outcome.
     pub async fn acquire(&self) -> AdaptivePermit<'_, S, C> {
         loop {
-            let notified = self.notify.notified();
-            tokio::pin!(notified);
-            let _ = notified.as_mut().enable();
+            // `listen` registers immediately, so a slot freed before the await is
+            // delivered on the first poll (no lost wake-up).
+            let listener = self.notify.listen();
             if self.try_reserve() {
                 return AdaptivePermit::new(self);
             }
-            notified.await;
+            listener.await;
         }
     }
 }
@@ -633,7 +633,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "tokio")]
+    #[cfg(feature = "runtime")]
     #[tokio::test]
     async fn test_async_acquire_waits_for_a_freed_slot() {
         let limiter = Arc::new(

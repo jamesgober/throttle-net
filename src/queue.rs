@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use clock_lib::{Clock, Monotonic, SystemClock};
-use tokio::sync::Notify;
+use event_listener::Event;
 
 use crate::decision::Decision;
 use crate::error::ThrottleError;
@@ -192,7 +192,7 @@ where
 {
     inner: L,
     state: Mutex<State<K>>,
-    notify: Notify,
+    notify: Event,
     capacity: usize,
     overflow: Overflow,
     clock: C,
@@ -220,7 +220,7 @@ where
         Self {
             inner,
             state: Mutex::new(State::new()),
-            notify: Notify::new(),
+            notify: Event::new(),
             capacity: capacity.max(1),
             overflow,
             clock,
@@ -325,7 +325,7 @@ where
             crate::obs::queue_overflow("reject");
         }
         if did_evict || outcome.is_ok() {
-            self.notify.notify_waiters();
+            let _ = self.notify.notify(usize::MAX);
             crate::obs::queue_depth(self.len());
         }
         outcome
@@ -362,12 +362,9 @@ where
 
         loop {
             // Register interest before checking, so a wake between the check and
-            // the await is not lost.
-            let notified = self.notify.notified();
-            tokio::pin!(notified);
-            // Register interest now; ignore whether a notification was already
-            // pending (the loop re-checks the condition regardless).
-            let _ = notified.as_mut().enable();
+            // the await is not lost: `Event::listen` registers immediately, and a
+            // notification arriving before the await is delivered on the first poll.
+            let listener = self.notify.listen();
 
             if evicted.load(Ordering::Acquire) {
                 return Err(ThrottleError::QueueFull);
@@ -386,7 +383,7 @@ where
                         Decision::Acquired => {
                             state.serve(id);
                             drop(state);
-                            self.notify.notify_waiters();
+                            let _ = self.notify.notify(usize::MAX);
                             crate::obs::acquired("queue");
                             crate::obs::wait("queue", &timer);
                             crate::obs::trace_acquire("queue", 1, true, &timer);
@@ -408,10 +405,8 @@ where
             };
 
             let sleep_for = cap_to_deadline(wait, now_ms, deadline_ms);
-            tokio::select! {
-                () = notified.as_mut() => {}
-                () = tokio::time::sleep(sleep_for) => {}
-            }
+            // Wake on a notification or the timeout, whichever comes first.
+            futures_lite::future::or(listener, crate::rt::sleep(sleep_for)).await;
         }
     }
 }
@@ -455,7 +450,7 @@ where
             state.waiters.len()
         };
         // Wake peers so the next-in-line re-evaluates its turn.
-        self.queue.notify.notify_waiters();
+        let _ = self.queue.notify.notify(usize::MAX);
         crate::obs::queue_depth(depth);
     }
 }

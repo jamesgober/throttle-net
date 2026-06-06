@@ -91,7 +91,7 @@ fn half_open_recovery_closes_on_success_reopens_on_failure() {
     assert_eq!(breaker.state(), BreakerState::Closed);
 }
 
-#[cfg(feature = "tokio")]
+#[cfg(feature = "runtime")]
 #[tokio::test]
 async fn open_breaker_fails_fast_without_waiting() {
     let clock = Arc::new(ManualClock::new());

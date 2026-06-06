@@ -37,6 +37,24 @@ jobs:
         env:
           RUSTDOCFLAGS: "-D warnings"
 
+  runtimes:
+    name: Runtimes (smol + no_std core)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy (smol backend)
+        run: cargo clippy --no-default-features --features smol --all-targets -- -D warnings
+      - name: Test (smol backend)
+        run: cargo test --no-default-features --features smol
+      - name: Build no_std core
+        run: cargo build --no-default-features
+      - name: Clippy (no default features)
+        run: cargo clippy --no-default-features --all-targets -- -D warnings
+
   loom:
     name: Loom (concurrency model check)
     runs-on: ubuntu-latest

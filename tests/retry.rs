@@ -59,7 +59,7 @@ fn decorrelated_jitter_scatters_a_thundering_herd() {
 
 /// A server's `Retry-After` header is parsed and honored over the computed
 /// backoff when the policy opts in.
-#[cfg(feature = "tokio")]
+#[cfg(feature = "runtime")]
 #[tokio::test(start_paused = true)]
 async fn retry_after_header_is_parsed_and_honored() {
     use throttle_net::{Retry, RetryAction, parse_retry_after};

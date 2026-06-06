@@ -2,7 +2,11 @@
 
 > Complete reference for every public item in `throttle-net`, with examples.
 >
-> **Status: pre-1.0.** This document tracks the API surface as it lands across the 0.x series. Sections marked _(planned)_ describe an intended surface that is not yet shipped. Everything else is available as of the version in [`CHANGELOG.md`](../CHANGELOG.md).
+> **Status: pre-1.0, public API frozen (v0.8).** The surface documented here is complete and frozen; the remaining 0.x work is hardening, not API change. Sections marked _(planned)_ describe an intended surface that is not yet shipped. Everything else is available as of the version in [`CHANGELOG.md`](../CHANGELOG.md).
+>
+> **Runtime backends.** The waiting `acquire` surface (every method marked _(runtime)_ below, plus the [`Queue`](#queue)) needs an async runtime backend: enable **either** `tokio` (the default) **or** `smol`. The async code is identical on both — you only pick the timer. async-std is not supported (it is discontinued, RUSTSEC-2025-0052). See [Runtime backends](#runtime-backends).
+>
+> **`no_std`.** With `std` off, the pure algorithm core — [`Backoff`](#backoff), [`BackoffIter`](#backoff), [`Jitter`](#backoff), and [`Decision`](#decision) — compiles without the standard library. Everything else (the limiters, the clock seam, the error type) needs `std`.
 
 ## Table of Contents
 
@@ -27,6 +31,8 @@
 - [Provider integration](#provider-integration) &mdash; header parsing, sync, presets
 - [Observability](#observability) &mdash; metrics and tracing
 - [Clock seam](#clock-seam) &mdash; deterministic time
+- [Runtime backends](#runtime-backends) &mdash; tokio or smol
+- [`no_std` core](#no_std-core) &mdash; the runtime-free algorithm types
 - [Feature flags](#feature-flags)
 
 ---
@@ -39,9 +45,11 @@ It does not reimplement token-bucket accounting; it consumes [`better-bucket`](h
 
 Every limiter exposes the same shape:
 
-- a **waiting** acquire (`acquire().await`) that paces the caller &mdash; requires the `tokio` feature;
+- a **waiting** acquire (`acquire().await`) that paces the caller &mdash; requires a runtime backend (`tokio` or `smol`);
 - a **non-blocking** attempt (`try_acquire()`) that returns a `bool` immediately;
 - a **non-consuming** check (`peek()`) that reports what *would* happen.
+
+Throughout this document, a method marked _(runtime)_ is part of that waiting surface and needs `tokio` or `smol`. The non-blocking and inspection methods need only `std`.
 
 ---
 
@@ -80,7 +88,7 @@ assert_eq!(per_sec.capacity(), 100);
 assert_eq!(per_min.capacity(), 60);
 ```
 
-### Waiting acquire (requires `tokio`)
+### Waiting acquire (requires a runtime: `tokio` or `smol`)
 
 | Method | Description |
 |---|---|
@@ -157,7 +165,7 @@ pub enum Decision {
 }
 ```
 
-The synchronous outcome of an attempt. `Acquired` means the tokens were granted and deducted; `Retry { after }` means they will be available after `after`; `Impossible` means the cost exceeds capacity and no wait would ever satisfy it.
+The synchronous outcome of an attempt. `Acquired` means the tokens were granted and deducted; `Retry { after }` means they will be available after `after`; `Impossible` means the cost exceeds capacity and no wait would ever satisfy it. `Decision` is part of the [`no_std` core](#no_std-core) — it compiles with `std` off.
 
 | Method | Returns | Description |
 |---|---|---|
@@ -251,8 +259,8 @@ Build with `Hybrid::builder()`:
 |---|---|---|
 | `try_acquire(&self)` | `bool` | One token from every constituent, non-blocking. |
 | `try_acquire_with_cost(&self, cost)` | `bool` | `cost` tokens from every constituent. |
-| `acquire(&self).await` _(tokio)_ | `Result<(), ThrottleError>` | Waiting. |
-| `acquire_with_cost(&self, cost).await` _(tokio)_ | `Result<(), ThrottleError>` | Waiting, cost-aware. |
+| `acquire(&self).await` _(runtime)_ | `Result<(), ThrottleError>` | Waiting. |
+| `acquire_with_cost(&self, cost).await` _(runtime)_ | `Result<(), ThrottleError>` | Waiting, cost-aware. |
 | `peek`, `acquire_cost`, `available`, `capacity` | via [`Limiter`](#limiter) | `available`/`capacity` report the binding (smallest) constituent. |
 
 ```rust
@@ -307,7 +315,7 @@ Costs are supplied per call as `&[(dimension, cost)]`. A dimension not named in 
 |---|---|---|
 | `peek_costs(&self, costs)` | [`Decision`](#decision) | Would all dimensions grant? Takes nothing. |
 | `try_acquire_costs(&self, costs)` | `bool` | Charge all dimensions, non-blocking, all-or-nothing. |
-| `acquire_costs(&self, costs).await` _(tokio)_ | `Result<(), ThrottleError>` | Waiting. |
+| `acquire_costs(&self, costs).await` _(runtime)_ | `Result<(), ThrottleError>` | Waiting. |
 | `available(&self, dimension: &str)` | `Option<u32>` | Tokens left in a dimension, or `None` if unknown. |
 
 ```rust
@@ -376,8 +384,8 @@ A throttle that keeps independent state per key &mdash; a tenant, a user, an API
 | `try_acquire(&self, key: &K)` | `bool` | One token for `key`, non-blocking. |
 | `try_acquire_with_cost(&self, key, cost)` | `bool` | `cost` tokens for `key`. |
 | `peek(&self, key, cost)` | [`Decision`](#decision) | Non-consuming; does not create state for an unseen key. |
-| `acquire(&self, key).await` _(tokio)_ | `Result<(), ThrottleError>` | Waiting. |
-| `acquire_with_cost(&self, key, cost).await` _(tokio)_ | `Result<(), ThrottleError>` | Waiting, cost-aware. |
+| `acquire(&self, key).await` _(runtime)_ | `Result<(), ThrottleError>` | Waiting. |
+| `acquire_with_cost(&self, key, cost).await` _(runtime)_ | `Result<(), ThrottleError>` | Waiting, cost-aware. |
 | `available(&self, key)` | `u32` | Tokens for `key` (full capacity if unseen). |
 | `capacity(&self)` | `u32` | Per-key burst ceiling. |
 | `len(&self)` / `is_empty(&self)` | `usize` / `bool` | Live-key count snapshot. |
@@ -476,8 +484,8 @@ Build with `Layered::<K>::builder()` (or `Layered::<K, E>::builder()`):
 | `try_acquire(&self, key, endpoint)` | `bool` | Admit one request, non-blocking. |
 | `try_acquire_with_cost(&self, key, endpoint, cost)` | `bool` | Weighted, non-blocking. |
 | `peek(&self, key, endpoint, cost)` | [`Decision`](#decision) | Non-consuming. |
-| `acquire(&self, key, endpoint).await` _(tokio)_ | `Result<(), ThrottleError>` | Waiting. |
-| `acquire_with_cost(&self, key, endpoint, cost).await` _(tokio)_ | `Result<(), ThrottleError>` | Waiting, weighted. |
+| `acquire(&self, key, endpoint).await` _(runtime)_ | `Result<(), ThrottleError>` | Waiting. |
+| `acquire_with_cost(&self, key, endpoint, cost).await` _(runtime)_ | `Result<(), ThrottleError>` | Waiting, weighted. |
 | `capacity(&self)` | `u32` | The smallest scope capacity. |
 
 ```rust
@@ -510,6 +518,32 @@ let layered = Layered::<u64, String>::builder()
 assert!(layered.try_acquire(&42, &"/v1/chat".to_string()));
 ```
 
+Per-tenant quotas under a shared ceiling — each tenant gets its own budget, and no
+tenant can starve another or the service (a global cap over a per-tenant cap):
+
+```rust
+use throttle_net::{Layered, PerKey, Throttle};
+
+// 1000/s overall, but at most 10/s for any one tenant.
+let limiter = Layered::<String>::builder()
+    .global(Throttle::per_second(1000))
+    .per_key(PerKey::per_second(10))
+    .build();
+
+let endpoint = "/v1/api".to_string();
+let mut admitted = 0;
+for _ in 0..15 {
+    if limiter.try_acquire(&"acme".to_string(), &endpoint) {
+        admitted += 1;
+    }
+}
+assert_eq!(admitted, 10);                                   // capped at the per-tenant 10
+assert!(limiter.try_acquire(&"globex".to_string(), &endpoint)); // a different tenant is untouched
+```
+
+See [`examples/per_tenant_quotas.rs`](../examples/per_tenant_quotas.rs) for the
+waiting form, which paces a throttled tenant instead of dropping it.
+
 ---
 
 ## `SlidingWindowLog`
@@ -532,7 +566,7 @@ implements [`Limiter`](#limiter), so it composes everywhere the bucket does.
 | `.with_clock(clock)` | Inject a clock for tests. |
 | `try_acquire` / `try_acquire_with_cost(n)` | Non-blocking; returns `bool`. |
 | `peek(cost)` | Non-consuming [`Decision`](#decision). |
-| `acquire().await` / `acquire_with_cost(n).await` _(tokio)_ | Waiting. |
+| `acquire().await` / `acquire_with_cost(n).await` _(runtime)_ | Waiting. |
 | `available()` / `capacity()` | Units left in the window / the limit. |
 
 ```rust
@@ -560,6 +594,8 @@ pub enum Jitter { None, Full, Equal, Decorrelated }
 ```
 
 A backoff *policy*: a base delay curve (constant, linear, or exponential) plus a [`Jitter`](#backoff) mode and a delay ceiling. It is independent of the limiters — pair it with [`Retry`](#retry), or call [`iter`](#backoff) and drive your own loop. Jitter spreads retries so a fleet that failed together does not retry in lockstep; `Decorrelated` is the default and the strongest at breaking up a thundering herd.
+
+`Backoff`, `BackoffIter`, and `Jitter` are part of the [`no_std` core](#no_std-core): they compile and run with `std` off (under `no_std`, `iter()` seeds from a monotonic counter rather than system entropy; `iter_seeded` is unaffected).
 
 ### Constructors and tuning
 
@@ -627,7 +663,7 @@ A retry policy: a [`Backoff`](#backoff), an attempt ceiling, and whether to hono
 | `Retry::new(Backoff)` | Default 5 attempts, `Retry-After` honored. |
 | `.max_attempts(u32)` | Total attempts including the first (`0` ⇒ `1`). |
 | `.respect_retry_after(bool)` | Whether [`RetryAction::RetryAfter`] overrides the backoff. |
-| `async fn run(op, classify)` _(tokio)_ | Run `op`, retrying per `classify` until it succeeds, the classifier gives up, or attempts run out. |
+| `async fn run(op, classify)` _(runtime)_ | Run `op`, retrying per `classify` until it succeeds, the classifier gives up, or attempts run out. |
 
 `classify: Fn(&E) -> RetryAction` decides per error: retry with the backoff delay, retry honoring a `Retry-After`, or give up. For `error-forge` errors, [`retry_if_retryable`](#retry) classifies by the error's own `is_retryable()`.
 
@@ -725,7 +761,7 @@ Build with `CircuitBreaker::builder()`:
 | Method | Description |
 |---|---|
 | `try_acquire()` | Non-blocking. `Ok(Some(permit))` granted, `Ok(None)` rate-limited, `Err(CircuitOpen)` shed. |
-| `acquire().await` _(tokio)_ | Fail fast if open; otherwise pace on the limiter. Returns a [`Permit`]. |
+| `acquire().await` _(runtime)_ | Fail fast if open; otherwise pace on the limiter. Returns a [`Permit`]. |
 | `record_success()` / `record_failure()` | Report an outcome directly. |
 | `state()` | Current [`BreakerState`]. |
 
@@ -759,7 +795,7 @@ match breaker.acquire().await {
 ## `Queue`
 
 ```rust
-pub struct Queue<L, K = (), C = SystemClock> { /* ... */ } // feature = "tokio"
+pub struct Queue<L, K = (), C = SystemClock> { /* ... */ } // feature = "tokio" or "smol"
 
 #[non_exhaustive]
 pub enum Overflow { Reject, DropOldest, DropLowestPriority }
@@ -851,7 +887,7 @@ Build with `AdaptiveLimiter::builder()`:
 | Method | Description |
 |---|---|
 | `try_acquire()` | `Some(permit)` if a slot is free, else `None`. |
-| `acquire().await` _(tokio)_ | Wait until a slot frees. |
+| `acquire().await` _(runtime)_ | Wait until a slot frees. |
 | `current_limit()` / `in_flight()` / `ceiling()` | Observe the adapting state. |
 
 Outcomes are reported through an `AdaptivePermit`: settle it with `.success()` (its
@@ -1035,13 +1071,96 @@ assert!(throttle.try_acquire());
 
 ---
 
+## Runtime backends
+
+The waiting `acquire` surface and the [`Queue`](#queue) need an async runtime to
+drive their timers and wake-ups. The code that does the waiting is
+runtime-agnostic — it parks on an `event-listener` notification and races a
+wake-up against a timeout with `futures-lite` — so the **same** async methods run
+unchanged on either backend. You choose one by feature:
+
+| Backend | Feature | Notes |
+|---|---|---|
+| tokio | `tokio` (default) | The default. Pulls only tokio's `time` feature. |
+| smol | `smol` | An alternative timer backend. Enable with `default-features = false`. |
+| async-std | — | Unsupported: async-std is discontinued (RUSTSEC-2025-0052). |
+
+Selecting the waiting surface without a backend is a clear compile error rather
+than a confusing one — enable exactly one of `tokio` or `smol`.
+
+Run on tokio (the default — nothing extra to do):
+
+```toml
+throttle-net = "0.8"
+```
+
+Run on smol instead:
+
+```toml
+throttle-net = { version = "0.8", default-features = false, features = ["smol"] }
+```
+
+The call site is identical either way:
+
+```rust
+# async fn run() -> Result<(), throttle_net::ThrottleError> {
+use throttle_net::Throttle;
+
+let throttle = Throttle::per_second(100);
+throttle.acquire().await?; // same code on tokio or smol
+# Ok(())
+# }
+```
+
+The synchronous surface (`try_acquire`, `peek`, `available`, `capacity`) needs no
+runtime at all — only `std`.
+
+---
+
+## `no_std` core
+
+With `std` off, throttle-net compiles as a `no_std` crate exposing the pure
+algorithm types — no clock, no allocator, no async runtime:
+
+| Item | Available `no_std` |
+|---|---|
+| [`Decision`](#decision) | yes |
+| [`Backoff`](#backoff), [`BackoffIter`](#backoff), [`Jitter`](#backoff) | yes |
+| [`VERSION`](#feature-flags) | yes |
+| Everything else (limiters, clock seam, `ThrottleError`, retry, provider, …) | no — needs `std` |
+
+```toml
+# Algorithm core only, no standard library:
+throttle-net = { version = "0.8", default-features = false }
+```
+
+```rust
+// Compiles and runs under `no_std`.
+use core::time::Duration;
+use throttle_net::{Backoff, Decision};
+
+// Deterministic backoff sequence — no system clock needed.
+let mut delays = Backoff::exponential(Duration::from_millis(50), 2.0).iter_seeded(1);
+let first = delays.next_delay();
+assert!(first >= Duration::from_millis(50));
+
+// Reason about an outcome without any runtime.
+assert!(Decision::Acquired.is_acquired());
+```
+
+Under `no_std`, `Backoff::iter()` seeds its jitter from a monotonic counter
+instead of system entropy; `iter_seeded(seed)` is fully deterministic on both.
+
+---
+
 ## Feature flags
 
 | Feature | Default | Description |
 |---------|---------|-------------|
-| `std` | yes | Standard library. Gates the entire limiter surface. With it off the crate is `no_std` and exposes only `VERSION`. |
-| `tokio` | yes | The waiting `acquire` surface and the [`Queue`](#queue), driven by tokio's timer/sync. Implies `std`. |
-| `adaptive` | no | The [`AdaptiveLimiter`](#adaptivelimiter) (AIMD + Vegas). Implies `std` + `tokio`. |
+| `std` | yes | Standard library. Gates the limiter surface, the clock seam, and `ThrottleError`. With it off the crate is `no_std` and exposes the [algorithm core](#no_std-core) ([`Backoff`](#backoff), [`Jitter`](#backoff), [`Decision`](#decision)) plus `VERSION`. |
+| `tokio` | yes | tokio timer backend for the waiting `acquire` surface and the [`Queue`](#queue). Implies `std` (and the internal `runtime` marker). |
+| `smol` | no | smol timer backend, as an alternative to `tokio`. Implies `std`. See [Runtime backends](#runtime-backends). |
+| `adaptive` | no | The [`AdaptiveLimiter`](#adaptivelimiter) (AIMD + Vegas). Implies `std`; its waiting `acquire` additionally needs a runtime (`tokio` or `smol`). |
 | `circuit-breaker` | no | The [`CircuitBreaker`](#circuitbreaker) state machine. Implies `std`. |
 | `provider-headers` | no | The [`provider`](#provider-integration) module: rate-limit header parsing + sync. Implies `std`. |
 | `provider-llm` | no | The [`presets`](#provider-integration) module: LLM tier presets. Implies `provider-headers`. |

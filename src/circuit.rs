@@ -355,8 +355,8 @@ where
     }
 }
 
-#[cfg(feature = "tokio")]
-#[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
+#[cfg(feature = "runtime")]
+#[cfg_attr(docsrs, doc(cfg(feature = "runtime")))]
 impl<L, C> CircuitBreaker<L, C>
 where
     L: Limiter,
@@ -385,7 +385,7 @@ where
         loop {
             match self.inner.acquire_cost(1) {
                 Decision::Acquired => return Ok(Permit::new(self)),
-                Decision::Retry { after } => tokio::time::sleep(after).await,
+                Decision::Retry { after } => crate::rt::sleep(after).await,
                 Decision::Impossible => {
                     self.abort();
                     return Err(ThrottleError::CostExceedsCapacity {
