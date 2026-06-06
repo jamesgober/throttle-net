@@ -81,12 +81,15 @@ jobs:
           tool: cargo-fuzz
       # cargo-fuzz manages its own RUSTFLAGS (sanitizer instrumentation); clear
       # the workflow-wide `-D warnings` so it does not fight the fuzz build.
+      # Pin the fuzz target to the gnu triple: the prebuilt cargo-fuzz binary is
+      # musl-static, so it would otherwise default the fuzz target to musl, whose
+      # std/core the nightly toolchain does not ship ("can't find crate for core").
       - name: Fuzz parse_retry_after (30s)
-        run: cargo +nightly fuzz run retry_after -- -max_total_time=30
+        run: cargo +nightly fuzz run retry_after --target x86_64-unknown-linux-gnu -- -max_total_time=30
         env:
           RUSTFLAGS: ""
       - name: Fuzz provider headers (30s)
-        run: cargo +nightly fuzz run provider_headers -- -max_total_time=30
+        run: cargo +nightly fuzz run provider_headers --target x86_64-unknown-linux-gnu -- -max_total_time=30
         env:
           RUSTFLAGS: ""
 
