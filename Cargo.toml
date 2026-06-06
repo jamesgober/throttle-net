@@ -9,7 +9,7 @@
 #╚═══════════════════════════════╝
 [package]
 name    = "throttle-net"
-version = "0.5.0"
+version = "0.6.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -95,8 +95,8 @@ tokio = ["std", "dep:tokio"]
 adaptive = ["std", "tokio"]
 # Circuit breaker state machine. Requires the limiter surface (std).
 circuit-breaker = ["std"]
-# HTTP rate-limit header parsing.
-provider-headers = []
+# HTTP rate-limit header parsing. Requires the limiter surface (std).
+provider-headers = ["std"]
 # LLM provider presets (Anthropic, OpenAI, ...).
 provider-llm = ["provider-headers"]
 # Metrics counters/histograms.

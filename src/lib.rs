@@ -14,7 +14,7 @@
 //!
 //! ## Status
 //!
-//! **Pre-1.0 (v0.5).** The limiter and resilience surface so far: the [`Limiter`]
+//! **Pre-1.0 (v0.6).** The limiter and resilience surface so far: the [`Limiter`]
 //! trait, the [`Throttle`] token bucket and the exact [`SlidingWindowLog`], each
 //! with a waiting cost-aware [`acquire`](Throttle::acquire); the composites —
 //! [`Hybrid`] (must pass all), [`MultiLimiter`] (multi-dimensional budgets),
@@ -22,11 +22,12 @@
 //! (global / per-key / per-endpoint scopes); standalone [`Retry`]/[`Backoff`]
 //! with jittered backoff and `Retry-After` parsing; the resilience layer —
 //! a `CircuitBreaker` that wraps any limiter and fails fast (`circuit-breaker`
-//! feature), and a deadline-aware, priority [`Queue`]; and adaptive concurrency —
+//! feature), and a deadline-aware, priority [`Queue`]; adaptive concurrency —
 //! an `AdaptiveLimiter` that discovers the right in-flight limit from outcome
-//! feedback via AIMD or Vegas (`adaptive` feature). Provider presets and
-//! observability land across the rest of the 0.x series. The public API is
-//! frozen at 1.0.
+//! feedback (`adaptive` feature); and provider integration — response-header
+//! parsers with limiter sync (`provider`, `provider-headers` feature) and LLM
+//! tier `presets` (`provider-llm` feature). Observability and runtime flexibility
+//! land across the rest of the 0.x series. The public API is frozen at 1.0.
 //!
 //! ```
 //! # #[cfg(feature = "tokio")]
@@ -124,6 +125,10 @@ mod limiter;
 mod multi;
 #[cfg(feature = "std")]
 mod perkey;
+#[cfg(feature = "provider-llm")]
+pub mod presets;
+#[cfg(feature = "provider-headers")]
+pub mod provider;
 #[cfg(feature = "tokio")]
 mod queue;
 #[cfg(feature = "std")]
@@ -134,6 +139,8 @@ mod retry_after;
 mod sliding;
 #[cfg(feature = "std")]
 mod throttle;
+#[cfg(feature = "std")]
+mod timeutil;
 
 #[cfg(feature = "adaptive")]
 pub use crate::adaptive::{

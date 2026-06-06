@@ -21,6 +21,27 @@
 
 ---
 
+## [0.6.0] - 2026-06-05
+
+Provider integration. Read a downstream's own rate-limit headers, reconcile the limiter with them, and start from a provider tier preset.
+
+### Added
+
+- `provider` module (behind the `provider-headers` feature) — `HeaderProfile` with built-in profiles (`OPENAI`, `ANTHROPIC`, `GITHUB`, `RFC`, `STRIPE`, `AWS`) that parse a response's rate-limit headers into a normalized `RateLimitInfo` (`requests` / `tokens` windows + `retry_after`). Handles all four reset encodings — delta-seconds, duration strings (`6m0s`), Unix timestamps, and RFC 3339 instants — with no date-library dependency, and drops malformed values rather than panicking.
+- `RateLimitInfo::sync_requests` / `sync_tokens` — reconcile a `Throttle` with the server's reported remaining count by draining the local budget down to it. Only ever reduces, so synchronization can never raise the throttle above its hard limit.
+- `presets` module (behind the `provider-llm` feature) — ready-made `MultiLimiter` tier configurations: `presets::anthropic::{tier_1, tier_2, tier_4}` and `presets::openai::{tier_1, tier_2}`, pre-wiring the requests / input-tokens / output-tokens dimensions.
+
+### Changed
+
+- `provider-headers` now implies `std`; `provider-llm` implies `provider-headers`.
+- Internal: the civil-date math behind `Retry-After` and RFC 3339 parsing was extracted into a shared module (no public change).
+
+### Fixed
+
+- The token-bucket module no longer imports the error type unconditionally, so the `std`-without-`tokio` feature combination (reachable via `default-features = false, features = ["provider-llm"]`) builds clean.
+
+---
+
 ## [0.5.0] - 2026-06-05
 
 Adaptive. Find the right limit without being told it: a concurrency limiter that learns the downstream's capacity from observed outcomes and never exceeds the hard ceiling.
@@ -117,7 +138,8 @@ Initial scaffold and repository bootstrap. No throttle-net logic yet &mdash; thi
 - `deny.toml`, `clippy.toml`, `rustfmt.toml`, `.gitattributes`, `.gitignore`.
 - `.dev/` AI-editor briefing (`PROMPT.md`, `ROADMAP.md`) &mdash; gitignored.
 
-[Unreleased]: https://github.com/jamesgober/throttle-net/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/jamesgober/throttle-net/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/jamesgober/throttle-net/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/jamesgober/throttle-net/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/jamesgober/throttle-net/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/jamesgober/throttle-net/compare/v0.2.0...v0.3.0

@@ -6,6 +6,7 @@ use better_bucket::{Bucket, Decision as BucketDecision};
 use clock_lib::{Clock, SystemClock};
 
 use crate::decision::Decision;
+#[cfg(feature = "tokio")]
 use crate::error::ThrottleError;
 use crate::limiter::Limiter;
 

@@ -24,6 +24,7 @@
 - [`CircuitBreaker`](#circuitbreaker) &mdash; fail fast on failures
 - [`Queue`](#queue) &mdash; bounded, deadline-aware waiting
 - [`AdaptiveLimiter`](#adaptivelimiter) &mdash; learn the limit from feedback
+- [Provider integration](#provider-integration) &mdash; header parsing, sync, presets
 - [Clock seam](#clock-seam) &mdash; deterministic time
 - [Feature flags](#feature-flags)
 
@@ -876,6 +877,99 @@ if let Some(permit) = limiter.try_acquire() {
 
 ---
 
+## Provider integration
+
+### Header parsing &mdash; `provider` (feature `provider-headers`)
+
+```rust
+pub struct HeaderProfile { /* ... */ }
+pub struct RateLimitInfo { pub requests: Option<Window>, pub tokens: Option<Window>, pub retry_after: Option<Duration> }
+pub struct Window { pub limit: Option<u64>, pub remaining: Option<u64>, pub reset: Option<Duration> }
+```
+
+Downstreams advertise your remaining budget in response headers, and every
+provider spells it differently. A `HeaderProfile` captures one convention;
+[`parse`](#provider-integration) turns a header set (a slice of `(name, value)`
+pairs, matched case-insensitively) into a normalized `RateLimitInfo`. Parsing is
+defensive — malformed values are dropped, never a panic.
+
+| Profile | Headers | Reset format |
+|---|---|---|
+| `HeaderProfile::OPENAI` | `x-ratelimit-*-{requests,tokens}` | duration string (`6m0s`) |
+| `HeaderProfile::ANTHROPIC` | `anthropic-ratelimit-{requests,tokens}-*` | RFC 3339 instant |
+| `HeaderProfile::GITHUB` | `x-ratelimit-*` | Unix timestamp |
+| `HeaderProfile::RFC` | `RateLimit-*` (IETF draft) | delta-seconds |
+| `HeaderProfile::STRIPE` / `HeaderProfile::AWS` | `Retry-After` only | — |
+
+| Method | Description |
+|---|---|
+| `parse(headers)` | Parse using the system clock for absolute resets. |
+| `parse_at(headers, now_unix_secs)` | Parse against an explicit now (testable, deterministic). |
+
+```rust
+use throttle_net::provider::HeaderProfile;
+
+let headers = [
+    ("x-ratelimit-limit-requests", "5000"),
+    ("x-ratelimit-remaining-requests", "4999"),
+    ("x-ratelimit-reset-requests", "6m0s"),
+];
+let info = HeaderProfile::OPENAI.parse(&headers);
+let requests = info.requests.unwrap();
+assert_eq!(requests.remaining, Some(4999));
+```
+
+### Synchronization
+
+```rust
+impl RateLimitInfo {
+    pub fn sync_requests<C>(&self, throttle: &Throttle<C>) -> u32;
+    pub fn sync_tokens<C>(&self, throttle: &Throttle<C>) -> u32;
+}
+```
+
+Reconcile a [`Throttle`](#throttle) with the server's reported remaining count by
+draining the local budget down to it. It **only ever reduces** — never adds — so
+synchronization corrects client/server drift without ever raising the throttle
+above its hard limit. Returns the number of tokens drained.
+
+```rust
+use throttle_net::Throttle;
+use throttle_net::provider::{RateLimitInfo, Window};
+
+let throttle = Throttle::per_second(100); // locally believes 100 are free
+let info = RateLimitInfo {
+    requests: Some(Window { remaining: Some(10), ..Window::default() }),
+    ..RateLimitInfo::default()
+};
+assert_eq!(info.sync_requests(&throttle), 90); // drained
+assert_eq!(throttle.available(), 10);          // now matches the server
+```
+
+### LLM presets &mdash; `presets` (feature `provider-llm`)
+
+Ready-made [`MultiLimiter`](#multilimiter) tier configurations, pre-wiring the
+requests / input-tokens / output-tokens dimensions. The numbers are illustrative
+starting points — verify against current provider docs.
+
+| Preset | |
+|---|---|
+| `presets::anthropic::{tier_1, tier_2, tier_4}` | Anthropic tiers |
+| `presets::openai::{tier_1, tier_2}` | OpenAI tiers |
+
+```rust
+use throttle_net::presets;
+
+let limiter = presets::anthropic::tier_2();
+assert!(limiter.try_acquire_costs(&[
+    ("requests", 1),
+    ("input_tokens", 1500),
+    ("output_tokens", 200),
+]));
+```
+
+---
+
 ## Clock seam
 
 throttle-net re-exports the time abstraction so the `with_clock` methods are usable without depending on `clock-lib` directly:
@@ -910,8 +1004,8 @@ assert!(throttle.try_acquire());
 | `tokio` | yes | The waiting `acquire` surface and the [`Queue`](#queue), driven by tokio's timer/sync. Implies `std`. |
 | `adaptive` | no | The [`AdaptiveLimiter`](#adaptivelimiter) (AIMD + Vegas). Implies `std` + `tokio`. |
 | `circuit-breaker` | no | The [`CircuitBreaker`](#circuitbreaker) state machine. Implies `std`. |
-| `provider-headers` | no | HTTP rate-limit header parsing. _(planned: 0.6)_ |
-| `provider-llm` | no | LLM provider presets. _(planned: 0.6)_ |
+| `provider-headers` | no | The [`provider`](#provider-integration) module: rate-limit header parsing + sync. Implies `std`. |
+| `provider-llm` | no | The [`presets`](#provider-integration) module: LLM tier presets. Implies `provider-headers`. |
 | `metrics` | no | Metrics counters/histograms. _(planned: 0.7)_ |
 | `tracing` | no | Tracing spans around `acquire()`. _(planned: 0.7)_ |
 | `serde` | no | Serializable limiter configs. _(planned)_ |

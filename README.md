@@ -41,7 +41,7 @@
 
 <h2>What it does</h2>
 
-**Available now (v0.5):**
+**Available now (v0.6):**
 
 - **Token-bucket throttling** &mdash; smooth refill with burst headroom; lock-free accounting (one atomic compare-and-swap per acquire)
 - **Exact sliding-window-log** &mdash; when you need no boundary burst at all, an exact alternative that composes everywhere the bucket does
@@ -54,10 +54,10 @@
 - **Circuit breaker** &mdash; closed / open / half-open recovery; wraps any limiter and fails fast when open, without consuming it
 - **Queueing** &mdash; a bounded, deadline-aware, priority queue with fair-across-keys scheduling and reject / drop-oldest / drop-lowest-priority overflow
 - **Adaptive concurrency** &mdash; AIMD and Vegas-style controllers that discover the right in-flight limit from outcome feedback, slowing down when a downstream struggles with no explicit signal, bounded by a floor and a hard ceiling
+- **Provider-aware** &mdash; parse `x-ratelimit-*` / `retry-after` headers from OpenAI, Anthropic, GitHub, Stripe, AWS, or the RFC draft; reconcile your limiter with the server's view; start from LLM tier presets
 
 **On the roadmap:**
 
-- **Provider-aware** (v0.6) &mdash; parse `x-ratelimit-*` / `retry-after` headers and sync internal state
 - **Observability** (v0.7) &mdash; metrics and tracing, zero-cost when disabled
 - **Runtime-agnostic** (v0.8) &mdash; tokio today, with async-std and smol planned
 
@@ -67,10 +67,10 @@
 
 ```toml
 [dependencies]
-throttle-net = "0.5"
+throttle-net = "0.6"
 
 # Optional features:
-throttle-net = { version = "0.5", features = ["circuit-breaker", "adaptive"] }
+throttle-net = { version = "0.6", features = ["circuit-breaker", "adaptive", "provider-llm"] }
 ```
 
 <br>
@@ -197,6 +197,29 @@ async fn main() {
         }
         Err(_shed) => { /* breaker open: fail fast */ }
     }
+}
+```
+
+Stay in sync with a provider's own rate-limit headers, and start from a tier preset (needs the `provider-llm` feature):
+
+```rust
+use throttle_net::presets;
+use throttle_net::provider::HeaderProfile;
+
+#[tokio::main]
+async fn main() -> Result<(), throttle_net::ThrottleError> {
+    let limiter = presets::anthropic::tier_2(); // requests + input/output token budgets
+
+    // ... after a response, reconcile with what the server reported ...
+    let headers = [
+        ("anthropic-ratelimit-requests-remaining", "12"),
+        ("anthropic-ratelimit-tokens-remaining", "40000"),
+    ];
+    let info = HeaderProfile::ANTHROPIC.parse(&headers);
+    let _ = info; // info.sync_requests(&throttle) drains a Throttle to the server's count
+
+    limiter.acquire_costs(&[("requests", 1), ("input_tokens", 1500)]).await?;
+    Ok(())
 }
 ```
 
