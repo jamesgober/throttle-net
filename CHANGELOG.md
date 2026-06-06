@@ -21,6 +21,24 @@
 
 ---
 
+## [0.9.0] - 2026-06-06
+
+Polish and hardening. Adversarial testing, a concurrency model check, expanded property tests, and comparative benchmarks. No API change (the surface was frozen at 0.8).
+
+### Added
+
+- Fuzz targets (`fuzz/`, cargo-fuzz): `retry_after` and `provider_headers` assert the byte-facing parsers never panic on arbitrary input. A CI job runs each as a timed smoke check; `tests/fuzz_smoke.rs` carries an always-on deterministic corpus + pseudo-random sweep of the same contract.
+- `loom` concurrency model check (`tests/loom_throttle.rs`): exhaustively explores the adaptive limiter's lock-free slot accounting and proves it never over-admits past the ceiling and never leaks a slot. Wired through a crate-private `--cfg throttle_loom` so it does not disturb dependencies' own loom paths.
+- Property tests: exact sliding-window bound and capacity reclamation, backoff delays staying within the ceiling across all jitter modes, and the adaptive limit always staying within `[floor, ceiling]`.
+- Benchmarks: `comparison_bench` (uncontended `try_acquire` against `governor`) and `contention_bench` (aggregate throughput at 1 / 4 / 16 / 64 concurrent acquirers).
+- Documentation: `docs/COOKBOOK.md` (task-oriented recipes) and `docs/MIGRATING_FROM_GOVERNOR.md` (API mapping + before/after).
+
+### Fixed
+
+- Provider header parsing: an extreme rate-limit reset timestamp combined with an extreme reference time could overflow the `reset - now` subtraction and panic in debug builds. The subtraction now saturates; a past or unreachable reset clamps to zero. Found by the new fuzz-smoke suite; covered by a regression test.
+
+---
+
 ## [0.8.0] - 2026-06-05
 
 Runtime flexibility and feature freeze. The waiting surface now runs on either tokio or smol, the pure algorithm core compiles `no_std`, and the public API is frozen for 1.0.
@@ -176,7 +194,8 @@ Initial scaffold and repository bootstrap. No throttle-net logic yet &mdash; thi
 - `deny.toml`, `clippy.toml`, `rustfmt.toml`, `.gitattributes`, `.gitignore`.
 - `.dev/` AI-editor briefing (`PROMPT.md`, `ROADMAP.md`) &mdash; gitignored.
 
-[Unreleased]: https://github.com/jamesgober/throttle-net/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/jamesgober/throttle-net/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/jamesgober/throttle-net/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/jamesgober/throttle-net/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/jamesgober/throttle-net/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/jamesgober/throttle-net/compare/v0.5.0...v0.6.0

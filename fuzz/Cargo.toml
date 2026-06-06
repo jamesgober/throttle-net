@@ -1,0 +1,43 @@
+# cargo-fuzz target crate for throttle-net's byte-facing parsers.
+#
+# Run locally (needs nightly + `cargo install cargo-fuzz`):
+#   cargo +nightly fuzz run retry_after
+#   cargo +nightly fuzz run provider_headers
+#
+# CI runs each target for a fixed time budget as a smoke check.
+[package]
+name    = "throttle-net-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary     = { version = "1", features = ["derive"] }
+
+[dependencies.throttle-net]
+path     = ".."
+features = ["provider-headers"]
+
+# Keep the fuzz crate out of any parent workspace.
+[workspace]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name    = "retry_after"
+path    = "fuzz_targets/retry_after.rs"
+test    = false
+doc     = false
+bench   = false
+
+[[bin]]
+name    = "provider_headers"
+path    = "fuzz_targets/provider_headers.rs"
+test    = false
+doc     = false
+bench   = false

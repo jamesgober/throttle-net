@@ -18,11 +18,16 @@
 //! [`acquire`](AdaptiveLimiter::acquire) blocks on a *slot* freeing, not on a
 //! timer, so its clock is only used to measure round-trip time.
 
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 use core::time::Duration;
 
 use clock_lib::{Clock, Monotonic, SystemClock};
 use event_listener::Event;
+
+// `in_flight` and `limit` route through the loom-aware indirection so the
+// concurrency model check can explore their interleavings; `AtomicU64` (Vegas's
+// min-RTT) is not part of the slot-accounting invariant and stays on `core`.
+use crate::sync::AtomicU32;
 
 /// The observed result of one completed request, fed back to the strategy.
 ///

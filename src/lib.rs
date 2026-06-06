@@ -14,7 +14,7 @@
 //!
 //! ## Status
 //!
-//! **Pre-1.0 (v0.8 — public API frozen).** The limiter and resilience surface:
+//! **Pre-1.0 (v0.9 — public API frozen, hardening).** The limiter and resilience surface:
 //! the [`Limiter`] trait, the [`Throttle`] token bucket and the exact
 //! [`SlidingWindowLog`], each with a waiting cost-aware
 //! [`acquire`](Throttle::acquire); the composites — [`Hybrid`] (must pass all),
@@ -34,7 +34,9 @@
 //! [`smol`](crate#feature-flags) — the async code is runtime-agnostic, and you
 //! choose the timer backend by feature. With `std` off, the pure algorithm core
 //! ([`Backoff`], [`Jitter`], [`Decision`]) compiles `no_std`. The public API is
-//! now frozen and will not change incompatibly before 1.0.
+//! frozen and will not change incompatibly before 1.0; the remaining work is
+//! hardening — fuzzing, `loom` model checks, expanded property tests, and
+//! comparative benchmarks.
 //!
 //! ```
 //! # #[cfg(feature = "runtime")]
@@ -151,6 +153,9 @@ mod retry_after;
 mod rt;
 #[cfg(feature = "std")]
 mod sliding;
+// Loom-aware atomics indirection for the adaptive limiter's slot accounting.
+#[cfg(feature = "adaptive")]
+mod sync;
 #[cfg(feature = "std")]
 mod throttle;
 #[cfg(feature = "std")]

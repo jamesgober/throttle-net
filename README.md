@@ -32,7 +32,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). Async-first. Runtime-agnostic. Multi-dimensional, cost-aware, adaptive.
     </p>
     <blockquote>
-        <strong>Status: pre-1.0, public API frozen.</strong> The algorithm and composition surface is complete and the public API is frozen as of <code>v0.8</code>; the remaining 0.x work is hardening before <code>1.0.0</code>. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> for detail.
+        <strong>Status: pre-1.0, public API frozen, hardening.</strong> The algorithm and composition surface is complete and the public API is frozen as of <code>v0.8</code>. <code>v0.9</code> adds the hardening layer &mdash; fuzzing, a <code>loom</code> model check, expanded property tests, and comparative benchmarks &mdash; on the way to <code>1.0.0</code>. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> for detail.
     </blockquote>
 </div>
 
@@ -41,7 +41,7 @@
 
 <h2>What it does</h2>
 
-**Available now (v0.8):**
+**Available now (v0.9):**
 
 - **Token-bucket throttling** &mdash; smooth refill with burst headroom; lock-free accounting (one atomic compare-and-swap per acquire)
 - **Exact sliding-window-log** &mdash; when you need no boundary burst at all, an exact alternative that composes everywhere the bucket does
@@ -58,10 +58,11 @@
 - **Observability** &mdash; metrics (`metrics` crate) and tracing events around every acquire and state transition, feature-gated and zero-cost when off
 - **Runtime-agnostic** &mdash; the waiting surface runs on either **tokio** or **smol**; the async code is the same, you pick the timer backend by feature (async-std is unsupported &mdash; it is discontinued, RUSTSEC-2025-0052)
 - **`no_std` core** &mdash; with `std` off, the pure algorithm types (`Backoff`, `Jitter`, `Decision`) compile without the standard library
+- **Hardened** &mdash; fuzzed parsers, a `loom` model check of the lock-free slot accounting, property tests for every limiter invariant, and comparative benchmarks against `governor`
 
 **On the roadmap:**
 
-- **Polish & 1.0** (v0.9 → 1.0) &mdash; fuzzing, loom model checks, comparative benchmarks. The public API is already frozen as of v0.8.
+- **1.0** &mdash; first-consumer integration and final benchmarks, then the stable release. The public API is frozen as of v0.8.
 
 <br>
 
@@ -69,16 +70,16 @@
 
 ```toml
 [dependencies]
-throttle-net = "0.8"
+throttle-net = "0.9"
 
 # Optional features:
-throttle-net = { version = "0.8", features = ["circuit-breaker", "adaptive", "provider-llm", "metrics", "tracing"] }
+throttle-net = { version = "0.9", features = ["circuit-breaker", "adaptive", "provider-llm", "metrics", "tracing"] }
 
 # Run the waiting surface on smol instead of tokio:
-throttle-net = { version = "0.8", default-features = false, features = ["smol"] }
+throttle-net = { version = "0.9", default-features = false, features = ["smol"] }
 
 # no_std algorithm core only (Backoff, Jitter, Decision):
-throttle-net = { version = "0.8", default-features = false }
+throttle-net = { version = "0.9", default-features = false }
 ```
 
 <br>
@@ -240,6 +241,15 @@ cargo run --example circuit_breaker      --features circuit-breaker  # trip, she
 cargo run --example adaptive_concurrency --features adaptive         # learn the limit from feedback
 cargo run --example per_tenant_quotas                               # per-tenant budgets under a global cap
 ```
+
+<br>
+
+## Documentation
+
+- [API reference](./docs/API.md) &mdash; every public item, with parameters and multiple examples each
+- [Cookbook](./docs/COOKBOOK.md) &mdash; task-oriented recipes for common problems
+- [Migrating from `governor`](./docs/MIGRATING_FROM_GOVERNOR.md) &mdash; API mapping and before/after
+- [CHANGELOG](./CHANGELOG.md)
 
 <br>
 

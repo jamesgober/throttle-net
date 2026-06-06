@@ -282,9 +282,11 @@ impl HeaderProfile {
                 .trim()
                 .parse::<i64>()
                 .ok()
-                .map(|at| Duration::from_secs(u64::try_from(at - now).unwrap_or(0))),
+                // Saturating: an extreme reset timestamp or `now` must not overflow
+                // the subtraction (a past reset already clamps to zero below).
+                .map(|at| Duration::from_secs(u64::try_from(at.saturating_sub(now)).unwrap_or(0))),
             ResetFormat::Rfc3339 => parse_rfc3339(value.trim())
-                .map(|at| Duration::from_secs(u64::try_from(at - now).unwrap_or(0))),
+                .map(|at| Duration::from_secs(u64::try_from(at.saturating_sub(now)).unwrap_or(0))),
         }
     }
 }
@@ -474,6 +476,23 @@ mod tests {
     fn test_missing_headers_yield_none() {
         let info = HeaderProfile::OPENAI.parse_at(&[], 0);
         assert_eq!(info, RateLimitInfo::default());
+    }
+
+    #[test]
+    fn test_extreme_reset_and_now_do_not_overflow() {
+        // A reset timestamp and `now` at the i64 extremes must not overflow the
+        // `at - now` subtraction (regression: the fuzz-smoke suite caught a panic
+        // here). A past or unreachable reset clamps the time-until-reset to zero.
+        let headers = [("x-ratelimit-reset", "9223372036854775807")]; // i64::MAX
+        let info = HeaderProfile::GITHUB.parse_at(&headers, i64::MIN);
+        assert!(
+            info.requests.is_some(),
+            "an extreme reset still parses a window"
+        );
+
+        let past = [("x-ratelimit-reset", "-9223372036854775808")]; // i64::MIN
+        let info = HeaderProfile::GITHUB.parse_at(&past, i64::MAX);
+        assert_eq!(info.requests.unwrap().reset, Some(Duration::ZERO));
     }
 
     #[test]

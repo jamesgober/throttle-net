@@ -9,7 +9,7 @@
 #╚═══════════════════════════════╝
 [package]
 name    = "throttle-net"
-version = "0.8.0"
+version = "0.9.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -61,12 +61,13 @@ path = "src/lib.rs"
 
 # LINTS
 # #################################
-# `loom` is a build-time cfg toggled via `RUSTFLAGS="--cfg loom"` for the
-# concurrency model check; `docsrs` is set by docs.rs. Registering them keeps
-# `unexpected_cfgs` quiet under `-D warnings`.
+# `throttle_loom` is a build-time cfg toggled via `RUSTFLAGS="--cfg throttle_loom"`
+# for the concurrency model check (crate-private so it does not switch on the
+# `cfg(loom)` paths in transitive deps); `docsrs` is set by docs.rs. Registering
+# them keeps `unexpected_cfgs` quiet under `-D warnings`.
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = [
-    'cfg(loom)',
+    'cfg(throttle_loom)',
     'cfg(docsrs)',
 ] }
 
@@ -155,8 +156,14 @@ serde   = { version = "1", optional = true, default-features = false, features =
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest  = "1"
 tokio     = { version = "1", features = ["full", "test-util"] }
+# Comparative baseline for the benchmarks only (not a runtime dependency). Pinned
+# to a release whose MSRV is at or below this crate's 1.85.
+governor  = "0.6"
 
-[target.'cfg(loom)'.dev-dependencies]
+# `loom` is a regular dependency (not dev) because the library's `sync` module
+# imports it under `--cfg throttle_loom`; the cfg is only ever set for the model
+# check, so normal builds never pull it.
+[target.'cfg(throttle_loom)'.dependencies]
 loom = "0.7"
 
 
@@ -188,6 +195,16 @@ required-features = ["tokio"]
 # #################################
 [[bench]]
 name    = "throttle_bench"
+harness = false
+
+# Comparative throughput against `governor` (uncontended single-acquire floor).
+[[bench]]
+name    = "comparison_bench"
+harness = false
+
+# Throughput under contention at 1 / 4 / 16 / 64 concurrent acquirers.
+[[bench]]
+name    = "contention_bench"
 harness = false
 
 

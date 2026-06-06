@@ -63,9 +63,32 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Loom
-        run: cargo test --test loom_throttle || echo "(loom test not yet present)"
+        run: cargo test --test loom_throttle --no-default-features --features adaptive --release
         env:
-          RUSTFLAGS: "--cfg loom"
+          RUSTFLAGS: "--cfg throttle_loom"
+          LOOM_MAX_PREEMPTIONS: "3"
+
+  fuzz:
+    name: Fuzz (smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      # cargo-fuzz manages its own RUSTFLAGS (sanitizer instrumentation); clear
+      # the workflow-wide `-D warnings` so it does not fight the fuzz build.
+      - name: Fuzz parse_retry_after (30s)
+        run: cargo +nightly fuzz run retry_after -- -max_total_time=30
+        env:
+          RUSTFLAGS: ""
+      - name: Fuzz provider headers (30s)
+        run: cargo +nightly fuzz run provider_headers -- -max_total_time=30
+        env:
+          RUSTFLAGS: ""
 
   security:
     name: Security (audit + deny)

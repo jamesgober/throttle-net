@@ -13,9 +13,13 @@
 #![cfg(feature = "std")]
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use proptest::prelude::*;
-use throttle_net::{Eviction, Hybrid, Layered, ManualClock, MultiLimiter, PerKey, Throttle};
+use throttle_net::{
+    Backoff, Eviction, Hybrid, Jitter, Layered, ManualClock, MultiLimiter, PerKey,
+    SlidingWindowLog, Throttle,
+};
 
 proptest! {
     /// A single throttle hands out exactly its capacity from full, never more.
@@ -175,5 +179,129 @@ proptest! {
             }
         }
         prop_assert_eq!(granted, attempts.min(requests.min(tokens)));
+    }
+
+    /// The exact sliding-window log admits no more than `limit` units in any
+    /// trailing window. With a frozen clock the whole burst falls in one window,
+    /// so the count is exactly `min(attempts, limit)` — never more.
+    #[test]
+    fn sliding_window_admits_at_most_limit_per_window(
+        limit in 1u32..500,
+        attempts in 0u32..1_000,
+    ) {
+        let clock = Arc::new(ManualClock::new());
+        let limiter = SlidingWindowLog::new(limit, Duration::from_secs(1)).with_clock(clock);
+
+        let mut granted = 0u32;
+        for _ in 0..attempts {
+            if limiter.try_acquire() {
+                granted += 1;
+            }
+        }
+        prop_assert_eq!(granted, attempts.min(limit));
+    }
+
+    /// As the window slides, capacity is reclaimed exactly: after the window fully
+    /// passes, the limiter admits another `limit` units and never more across the
+    /// two windows than `2 * limit`.
+    #[test]
+    fn sliding_window_reclaims_capacity_after_the_window(
+        limit in 1u32..200,
+    ) {
+        let clock = Arc::new(ManualClock::new());
+        let window = Duration::from_secs(1);
+        let limiter = SlidingWindowLog::new(limit, window).with_clock(clock.clone());
+
+        // Fill the first window.
+        let mut first = 0u32;
+        for _ in 0..(limit * 2) {
+            if limiter.try_acquire() { first += 1; }
+        }
+        prop_assert_eq!(first, limit);
+
+        // Slide past the window: the earlier grants age out and capacity returns.
+        clock.advance(window + Duration::from_millis(1));
+        let mut second = 0u32;
+        for _ in 0..(limit * 2) {
+            if limiter.try_acquire() { second += 1; }
+        }
+        prop_assert_eq!(second, limit);
+    }
+
+    /// Every backoff delay, under every jitter mode, stays within `[0, max]` — a
+    /// jittered curve never overshoots the configured ceiling, and the unjittered
+    /// curve is monotonically non-decreasing up to the cap.
+    #[test]
+    fn backoff_delays_stay_within_the_ceiling(
+        base_ms in 1u64..1_000,
+        max_ms in 1u64..60_000,
+        factor in 1.0f64..4.0,
+        seed in any::<u64>(),
+        jitter in prop_oneof![
+            Just(Jitter::None),
+            Just(Jitter::Full),
+            Just(Jitter::Equal),
+            Just(Jitter::Decorrelated),
+        ],
+    ) {
+        let max = Duration::from_millis(max_ms);
+        let backoff = Backoff::exponential(Duration::from_millis(base_ms), factor)
+            .with_max(max)
+            .with_jitter(jitter);
+
+        let mut delays = backoff.iter_seeded(seed);
+        let mut prev = Duration::ZERO;
+        for _ in 0..32 {
+            let d = delays.next_delay();
+            prop_assert!(d <= max, "delay {d:?} exceeded max {max:?} under {jitter:?}");
+            if jitter == Jitter::None {
+                // The unjittered curve never decreases until it saturates at max.
+                prop_assert!(d >= prev || d == max, "unjittered curve went backwards");
+                prev = d;
+            }
+        }
+    }
+}
+
+/// The adaptive limit, after any sequence of outcomes, is always clamped to
+/// `[floor, ceiling]` and never exceeds the hard ceiling.
+#[cfg(feature = "adaptive")]
+mod adaptive_props {
+    use super::{Arc, Duration, ManualClock};
+    use proptest::prelude::*;
+    use throttle_net::{AdaptiveLimiter, Aimd};
+
+    proptest! {
+        #[test]
+        fn adaptive_limit_stays_within_floor_and_ceiling(
+            floor in 1u32..20,
+            span in 0u32..200,
+            // A sequence of outcomes: `true` = success, `false` = failure.
+            outcomes in proptest::collection::vec(any::<bool>(), 0..200),
+        ) {
+            let ceiling = floor + span;
+            let clock = Arc::new(ManualClock::new());
+            let limiter = AdaptiveLimiter::builder()
+                .floor(floor)
+                .ceiling(ceiling)
+                .initial(floor)
+                .build(Aimd::new(3, 0.5))
+                .with_clock(clock.clone());
+
+            for ok in outcomes {
+                if let Some(permit) = limiter.try_acquire() {
+                    prop_assert!(limiter.in_flight() <= ceiling, "in-flight exceeded ceiling");
+                    if ok {
+                        clock.advance(Duration::from_millis(1));
+                        permit.success();
+                    } else {
+                        permit.failure();
+                    }
+                }
+                let limit = limiter.current_limit();
+                prop_assert!(limit >= floor && limit <= ceiling,
+                    "limit {limit} escaped [{floor}, {ceiling}]");
+            }
+        }
     }
 }
