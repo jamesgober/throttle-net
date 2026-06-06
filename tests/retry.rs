@@ -59,7 +59,12 @@ fn decorrelated_jitter_scatters_a_thundering_herd() {
 
 /// A server's `Retry-After` header is parsed and honored over the computed
 /// backoff when the policy opts in.
-#[cfg(feature = "runtime")]
+///
+/// Asserts *exact* elapsed time via tokio's paused virtual clock, which only
+/// advances when the wait is on the tokio timer; under a real (smol) timer the
+/// wait is real, so this is tokio-specific. The parse-and-honor logic itself is
+/// runtime-agnostic and is exercised by the unit tests.
+#[cfg(feature = "tokio")]
 #[tokio::test(start_paused = true)]
 async fn retry_after_header_is_parsed_and_honored() {
     use throttle_net::{Retry, RetryAction, parse_retry_after};
