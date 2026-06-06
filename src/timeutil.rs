@@ -25,12 +25,22 @@ pub(crate) fn civil_to_unix(
     m: u32,
     s: u32,
 ) -> Option<i64> {
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || h > 23 || m > 59 || s > 60 {
+    // HTTP-date and RFC 3339 both use four-digit years; anything outside that is
+    // malformed. The bound also keeps the day-count arithmetic far from `i64`
+    // overflow (a fuzzer found a 16-digit year overflowing `days * SECS_PER_DAY`).
+    if !(0..=9999).contains(&year)
+        || !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || h > 23
+        || m > 59
+        || s > 60
+    {
         return None;
     }
     let days = days_from_civil(year, month, day);
     let secs_of_day = i64::from(h) * 3600 + i64::from(m) * 60 + i64::from(s);
-    Some(days * SECS_PER_DAY + secs_of_day)
+    // Checked as defense-in-depth even though the year bound already precludes it.
+    days.checked_mul(SECS_PER_DAY)?.checked_add(secs_of_day)
 }
 
 /// Days since the Unix epoch (1970-01-01) for a proleptic-Gregorian date, by
@@ -69,6 +79,21 @@ mod tests {
         assert_eq!(civil_to_unix(2026, 13, 1, 0, 0, 0), None);
         assert_eq!(civil_to_unix(2026, 1, 32, 0, 0, 0), None);
         assert_eq!(civil_to_unix(2026, 1, 1, 24, 0, 0), None);
+    }
+
+    #[test]
+    fn test_civil_to_unix_rejects_overflowing_year() {
+        // Regression: a 16-digit year overflowed `days * SECS_PER_DAY` (found by
+        // the retry_after fuzz target). Out-of-range years are now rejected.
+        assert_eq!(civil_to_unix(1_777_777_777_777_777, 5, 1, 2, 2, 22), None);
+        assert_eq!(civil_to_unix(i64::MAX, 1, 1, 0, 0, 0), None);
+        assert_eq!(civil_to_unix(10_000, 1, 1, 0, 0, 0), None);
+        assert_eq!(civil_to_unix(-1, 1, 1, 0, 0, 0), None);
+        // The four-digit boundary still parses.
+        assert_eq!(
+            civil_to_unix(9999, 12, 31, 23, 59, 59),
+            Some(253_402_300_799)
+        );
     }
 
     #[test]

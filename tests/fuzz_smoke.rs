@@ -59,6 +59,11 @@ const RETRY_AFTER_CORPUS: &[&str] = &[
     "Thu Jan  1 00:00:00 2026",
     "Thu, 01 Jan", // truncated
     "Mon, 01 Jan 0000 00:00:00 GMT",
+    // Astronomically large years that overflowed the day-count arithmetic
+    // (regression, found by the retry_after fuzz target).
+    "Thu, 01 Jan 1777777777777777 00:00:00 GMT",
+    "Sun Jan  1 02:02:22 1777777777777777",
+    "Sunday, 01-Jan-99999999999999 00:00:00 GMT",
     ",,,,,,",
     "GMT GMT GMT",
     "\0\0\0",

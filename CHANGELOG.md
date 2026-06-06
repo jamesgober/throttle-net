@@ -36,6 +36,7 @@ Polish and hardening. Adversarial testing, a concurrency model check, expanded p
 ### Fixed
 
 - Provider header parsing: an extreme rate-limit reset timestamp combined with an extreme reference time could overflow the `reset - now` subtraction and panic in debug builds. The subtraction now saturates; a past or unreachable reset clamps to zero. Found by the new fuzz-smoke suite; covered by a regression test.
+- `Retry-After` / RFC 3339 date parsing: a date with an astronomically large year (e.g. a 16-digit year) overflowed the day-count arithmetic (`days * 86400`) and panicked in debug builds. Years are now bounded to the four digits both formats mandate, with checked arithmetic as a backstop. Found by the `retry_after` fuzz target; covered by a regression test and added to the smoke corpus.
 
 ---
 
