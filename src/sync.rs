@@ -13,6 +13,18 @@
 //! transitive dependencies (`concurrent-queue`, …) that expect the `loom` crate in
 //! *their* graph, breaking the build. Scoping the cfg to this crate keeps the model
 //! check to throttle-net's own atomics.
+//!
+//! # Locks and the async executor
+//!
+//! The circuit breaker's state, the queue's bookkeeping, and the sliding log
+//! are each guarded by a `std::sync::Mutex`. REPS rules out `std::sync::Mutex`
+//! in async code because a guard held across an `.await` blocks the executor
+//! thread. These guards never are: each is held only for a short, bounded,
+//! synchronous critical section — no `.await`, no I/O, no user callback — and
+//! the same state is shared with the synchronous API (`try_acquire`, the
+//! [`Limiter`](crate::Limiter) trait), which an async mutex could not serve.
+//! That is the case tokio's own guidance reserves the standard mutex for; an
+//! async mutex would only add an allocation and a wake-up to every call.
 
 #[cfg(not(throttle_loom))]
 pub(crate) use core::sync::atomic::AtomicU32;

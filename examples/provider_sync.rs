@@ -17,7 +17,7 @@ use throttle_net::provider::HeaderProfile;
 async fn main() -> Result<(), throttle_net::ThrottleError> {
     // OpenAI tier 1: 500 requests and 30,000 tokens per minute (one combined
     // token budget; `input_tokens` / `output_tokens` are aliases for it).
-    let limiter = presets::openai::tier_1().with_strict(true);
+    let limiter = presets::openai::tier_1();
 
     // A response says: 3 requests left, and the token window is exhausted
     // until it resets in 1.5 seconds.

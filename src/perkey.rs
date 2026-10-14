@@ -34,14 +34,16 @@ const DEFAULT_SHARDS: usize = 16;
 /// Memory is **bounded by eviction** (see [`Eviction`]): a hard cap bounds the
 /// number of keys and an optional idle TTL reclaims quiet ones, with a fixed,
 /// small amount of work per new key — a flood of unique keys reaches a ceiling
-/// and costs O(1) per insert instead of growing or stalling. Eviction only ever
-/// forgets a key whose bucket has **recovered** (is full again), so forgetting
-/// it loses nothing: the idle TTL is never shorter than a bucket's time to
-/// refill completely, and capacity eviction picks among recovered keys only.
-/// When a shard is full of keys that are all still limited, a *new* key waits
-/// (or, for `try_*`, is refused) until one recovers — the store fails closed
-/// rather than handing a flood fresh allowances. Size the cap above your real
-/// key cardinality. The default policy is bounded ([`Eviction::default`]).
+/// and costs O(1) per insert instead of growing or stalling. Eviction never
+/// hands a limited key a fresh allowance: the idle TTL reclaims only keys whose
+/// bucket has **recovered** (is full again), capacity eviction prefers
+/// recovered keys, and a still-limited key evicted to make room leaves its debt
+/// in a compact per-shard ledger and comes back in it. When a shard and its
+/// ledger are both full of limited keys, a *new* key waits (or, for `try_*`, is
+/// refused) until one recovers — by default the store fails closed rather than
+/// handing a flood fresh allowances ([`WhenFull`](crate::WhenFull) chooses).
+/// Size the cap above your real key cardinality. The default policy is bounded
+/// ([`Eviction::default`]).
 ///
 /// Like [`Throttle`](crate::Throttle), the headline [`acquire`](Self::acquire)
 /// **waits** (fairly, by reservation, and cancel-safely); the `try_*` variants

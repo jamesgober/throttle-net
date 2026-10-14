@@ -19,10 +19,10 @@
 //! limits, and keep the limiter in step with what the server reports using
 //! [`RateLimitInfo::sync_multi`](crate::provider::RateLimitInfo::sync_multi).
 //!
-//! The presets are lenient about unknown dimension names, like any
-//! [`MultiLimiter`] by default; call
-//! [`with_strict(true)`](MultiLimiter::with_strict) to have a misspelt name
-//! refused instead of charged nothing.
+//! Like any [`MultiLimiter`], the presets refuse unknown dimension names, so a
+//! misspelt name is not charged nothing; call
+//! [`with_strict(false)`](MultiLimiter::with_strict) to ignore unknown names
+//! instead.
 //!
 //! Behind the `provider-llm` feature.
 
@@ -201,8 +201,9 @@ mod tests {
     }
 
     #[test]
-    fn test_preset_admits_a_typical_call_and_can_be_made_strict() {
-        let limiter = openai::tier_1().with_strict(true);
+    fn test_preset_admits_a_typical_call_and_is_strict() {
+        let limiter = openai::tier_1();
+        assert!(limiter.is_strict());
         assert!(limiter.try_acquire_costs(&[
             ("requests", 1),
             ("input_tokens", 1_000),

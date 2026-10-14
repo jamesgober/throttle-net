@@ -472,7 +472,7 @@ impl<C: Clock> Throttle<C> {
         self.hold.extend(nanos_between(self.epoch, now), duration);
     }
 
-    /// Lifts any pause immediately.
+    /// Lifts any pause immediately, waking waiters that were sleeping it out.
     ///
     /// # Examples
     ///
@@ -598,7 +598,10 @@ impl<C: Clock> Throttle<C> {
     /// LLM call billed by token count. The waiter reserves its tokens at once
     /// and sleeps exactly until they have accrued, so waiters are served in
     /// arrival order and a large cost is never starved. While the throttle is
-    /// [paused](Self::pause_for), waiters sleep out the pause first.
+    /// [paused](Self::pause_for), waiters sleep out the pause — including
+    /// waiters that had already reserved when the pause began (they keep their
+    /// reservation and go when it ends) — and [`resume`](Self::resume) wakes
+    /// them at once.
     ///
     /// **Cancel-safe:** dropping the future before it completes returns the
     /// reserved tokens, so wrapping it in `tokio::time::timeout` or a `select!`

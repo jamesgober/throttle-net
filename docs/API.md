@@ -2,7 +2,7 @@
 
 > Every public item in `throttle-net`, with examples. Every Rust example in this file is compiled and run as a doctest (`cargo test --all-features --doc`).
 >
-> **Status: stable (1.x).** The surface is frozen under Semantic Versioning; 1.1 only adds to it. See [`CHANGELOG.md`](../CHANGELOG.md) for what changed in each release.
+> **Status: stable (2.x).** The surface follows Semantic Versioning. Coming from 1.x? See [`MIGRATION_1_TO_2.md`](./MIGRATION_1_TO_2.md); [`CHANGELOG.md`](../CHANGELOG.md) lists what changed in each release.
 >
 > **Runtime backends.** Methods marked _(runtime)_ wait asynchronously and need a timer backend: enable `tokio` (the default) or `smol`. If both are enabled, tokio's timer is used. async-std is not supported (it is discontinued, RUSTSEC-2025-0052).
 >
@@ -48,7 +48,7 @@ Token-bucket accounting comes from [`better-bucket`](https://crates.io/crates/be
 - a **non-blocking** attempt &mdash; `try_acquire()` returning `bool`;
 - a **non-consuming** check &mdash; `peek()` returning a [`Decision`](#decision).
 
-Over any window, a token bucket's grants never exceed its capacity plus what its rate accrues in that window, under any number of concurrent callers; composites hold that bound for each constituent.
+Over any window, a token bucket's grants never exceed its capacity plus what its rate accrues in that window, under any number of concurrent callers. Composites hold that bound for each constituent, both for what is charged and for when the request is released.
 
 ---
 
@@ -56,9 +56,11 @@ Over any window, a token bucket's grants never exceed its capacity plus what its
 
 Every waiting acquire runs on one engine:
 
-- **Reservations.** Token-bucket limiters (and composites of them) *reserve* the units at once and sleep exactly until they have accrued. Later callers queue behind earlier reservations, so a large request is never starved by a stream of small ones. Limiters without native reservations (the sliding log, your own [`Limiter`](#limiter)) sleep for their reported wait and try again.
-- **Timeouts.** `acquire_timeout` / `acquire_with_cost_timeout` (and the equivalents on every waiting surface) return [`ThrottleError::DeadlineExceeded`](#throttleerror) &mdash; *immediately*, reserving nothing, when the wait is known up front to exceed the timeout.
-- **Cancel safety.** Dropping a waiting future (a losing `select!` branch, an outer `tokio::time::timeout`) returns any reservation it held, releases a circuit breaker's half-open trial slot, and holds no bulkhead or adaptive slot.
+- **Reservations.** Token-bucket limiters *reserve* the units at once and sleep exactly until they have accrued. Later callers queue behind earlier reservations, so a large request is never starved by a stream of small ones. Limiters without native reservations (the sliding log, your own [`Limiter`](#limiter)) sleep for their reported wait and try again.
+- **Composites queue on their bottleneck.** A `Hybrid`, `MultiLimiter`, or `Layered` waiter peeks every constituent, reserves on the one with the longest wait, and takes the others only when that reservation matures. If another constituent then needs a longer wait, the matured units are given back and the waiter moves to it &mdash; unless that wait is a few milliseconds, or the bottleneck has already moved four times, in which case it reserves the rest too. So a constituent shared with other callers (a `Layered` global scope, a `HybridBuilder::shared` limiter) is never charged long before the request can go, and one caller's backlog on its own slow scope cannot starve everyone else.
+- **Timeouts.** `acquire_timeout` / `acquire_with_cost_timeout` (and `acquire_owned_timeout`, `call_timeout`) take a deadline that bounds the *whole* wait, whatever the constituents answer. A token bucket returns [`ThrottleError::DeadlineExceeded`](#throttleerror) *immediately*, reserving nothing, when the wait is known up front to exceed the timeout. (A bulkhead's timeout reports `BulkheadFull`.)
+- **Pauses.** A waiter sleeps out a limiter's pause &mdash; also when the pause is set after it reserved: it keeps the reservation and goes when the pause ends (failing with `DeadlineExceeded` at once if the pause outlasts its deadline). `resume()` wakes paused waiters immediately.
+- **Cancel safety.** Dropping a waiting future (a losing `select!` branch, an outer `tokio::time::timeout`) returns whatever it held &mdash; a reservation, a composite's bottleneck units, a circuit breaker's half-open trial slot (also when the breaker is a composite's constituent) &mdash; and holds no bulkhead or adaptive slot.
 
 ```rust
 # async fn run() {
@@ -231,6 +233,7 @@ A `Copy`, `#[non_exhaustive]` enum implementing `std::error::Error` and `error_f
 | `BulkheadFull` | No bulkhead slot within the timeout. | yes |
 | `InvalidConfig { reason }` | A builder's `try_build` rejected the configuration. | no |
 | `UnknownDimension { index }` | A strict `MultiLimiter` was charged an unknown name. | no |
+| `NotReady` | A `tower` service was called before `poll_ready` reported it ready; the request was not sent. | no |
 
 ```rust
 # async fn run() {
@@ -247,7 +250,7 @@ assert!(!err.is_retryable());
 
 ## `Limiter`
 
-The object-safe composition trait (`Send + Sync`), implemented by `Throttle`, `SlidingWindowLog`, `Hybrid`, `CircuitBreaker`, and `AdaptiveLimiter`.
+The object-safe composition trait (`Send + Sync`), implemented by `Throttle`, `SlidingWindowLog`, `Hybrid`, `CircuitBreaker`, and `AdaptiveLimiter` &mdash; and by `&L`, `Box<L>`, and `Arc<L>` for any limiter `L` (sized or `dyn`), forwarding every method, so a shared limiter is passed as is.
 
 ```text
 pub trait Limiter: Send + Sync {
@@ -259,10 +262,13 @@ pub trait Limiter: Send + Sync {
     fn refund(&self, cost: u32) {}                                        // default: keep units spent
     fn reserve(&self, cost: u32, max_wait: Duration) -> Option<Duration>; // default: only what is there now
     fn pause_for(&self, duration: Duration);                              // default: drain what is available
+    fn paused_for(&self) -> Duration;                                     // default: ZERO
+    fn resume(&self) {}                                                   // default: nothing
+    fn charge(&self, cost: u32) -> u32;                                   // units already spent; returns the uncharged rest
 }
 ```
 
-Composites peek every constituent and commit only when all would grant; a constituent that loses a race between the peek and its commit causes the ones already charged to be refunded.
+Composites peek every constituent and commit only when all would grant; a constituent that loses a race between the peek and its commit causes the ones already charged to be refunded. `charge` records units that were already spent downstream even when they do not fit and even while paused: a token bucket takes them as debt that later callers wait behind.
 
 ```rust
 use throttle_net::{Decision, Limiter, Throttle};
@@ -287,8 +293,9 @@ Several limiters a request must *all* satisfy. Build with `Hybrid::builder().lim
 |--------|---------|
 | `try_acquire()` / `try_acquire_with_cost(cost)` | All-or-nothing across constituents. |
 | `peek(cost)` | The longest constituent wait, or `Impossible`. |
-| `acquire*` / `acquire_with_cost_timeout` _(runtime)_ | Reserve on every constituent at once; cancel-safe. |
-| `pause_for(d)` / `len()` / `is_empty()` / `name()` | |
+| `acquire*` / `acquire_with_cost_timeout` _(runtime)_ | Queue on the bottleneck constituent, take the rest when it matures; cancel-safe. |
+| `pause_for(d)` / `resume()` / `paused_for()` | Pause every constituent / lift every pause / the longest pause left. |
+| `len()` / `is_empty()` / `name()` | |
 | `Limiter` impl | `capacity`/`available` report the binding constituent; an empty hybrid is unbounded. |
 
 ```rust
@@ -309,20 +316,20 @@ assert!(hybrid.try_acquire());
 
 Named, independently metered dimensions; a call is admitted only when every dimension can afford its share.
 
-Builder: `dimension(name, limiter)`, `shared(name, arc)`, `alias(alias, target)`, `strict(bool)`, `name(n)`, then `build()` (keeps mistakes: duplicate names are charged independently, a dangling alias never matches) or `try_build()` (rejects them with `InvalidConfig`).
+Builder: `dimension(name, limiter)`, `shared(name, arc)`, `alias(alias, target)`, `strict(bool)` (default `true`), `name(n)`, then `build()` (keeps mistakes: duplicate names are charged independently, a dangling alias never matches) or `try_build()` (rejects them with `InvalidConfig`).
 
 | Method | Meaning |
 |--------|---------|
 | `try_acquire_costs(&[(name, cost)])` | All-or-nothing. Repeated names and aliases are **summed** into their dimension. |
 | `peek_costs(costs)` | Non-consuming. |
 | `acquire_costs(costs)` / `acquire_costs_timeout(costs, t)` _(runtime)_ | Waiting, cancel-safe. |
-| `settle_costs(estimated, actual)` | Refund an underspend, charge an overspend as debt (LLM output tokens). |
+| `settle_costs(estimated, actual)` | Refund an underspend, charge an overspend as debt (LLM output tokens), even while paused. |
 | `refund_costs(costs)` | Give back a call that was charged but never sent. |
-| `drain_to(name, remaining)` / `pause_for(d)` | Reconcile with a downstream. |
+| `drain_to(name, remaining)` / `pause_for(d)` / `resume()` / `paused_for()` | Reconcile with a downstream. |
 | `available(name)` / `dimension(name)` / `dimensions()` | Inspection (aliases resolve to their dimension). |
 | `with_strict(bool)` / `is_strict()` / `with_name(n)` / `name()` | |
 
-Unknown names are ignored by default, so a typo charges nothing; a **strict** limiter refuses them (`Decision::Impossible`, or `ThrottleError::UnknownDimension { index }` from the waiting methods).
+Unknown names are refused by default (`Decision::Impossible`, or `ThrottleError::UnknownDimension { index }` from the waiting methods), so a typo cannot charge nothing and slip through. `strict(false)` restores the 1.x behaviour of ignoring them.
 
 ```rust
 use std::sync::Arc;
@@ -335,7 +342,6 @@ let limiter = MultiLimiter::builder()
     .dimension("tokens", Throttle::per_minute(30_000).with_clock(clock.clone()))
     .alias("input_tokens", "tokens")
     .alias("output_tokens", "tokens")
-    .strict(true)
     .try_build()?;
 
 // Admit on the max_tokens ceiling, then settle with the reported usage.
@@ -388,12 +394,15 @@ assert!(limiter.try_acquire(&"a"));
 
 ## `Eviction`
 
-How a `PerKey` store bounds its memory. `Eviction::capacity(max_keys)`, `idle(ttl)` (keeps the default cap), `new(max_keys, ttl)`, `unbounded()`, `with_capacity`, `with_idle`, `without_capacity`, `max_keys()`, `idle_ttl()`; the default is a cap of `DEFAULT_MAX_KEYS` (1,048,576) and no TTL.
+How a `PerKey` store bounds its memory. `Eviction::capacity(max_keys)`, `idle(ttl)` (keeps the default cap), `new(max_keys, ttl)`, `unbounded()`, `with_capacity`, `with_idle`, `without_capacity`, `with_when_full(WhenFull)`, `max_keys()`, `idle_ttl()`, `when_full()`; the default is a cap of `DEFAULT_MAX_KEYS` (1,048,576), no TTL, and `WhenFull::RefuseNew`.
 
-- **Only recovered keys are ever forgotten.** A key is evictable once its bucket is full again (forgetting it loses nothing) or it has been idle past the TTL; the effective TTL is never shorter than a bucket's time to refill completely.
-- **Capacity: CLOCK over recovered keys, failing closed.** A new key in a full shard evicts a recovered key found within a 32-slot scan, preferring one not used recently. If none of the scanned keys has recovered, the *new* key is refused (its `try_*` returns `false`; its waiting acquire waits until a key recovers). A flood of unique keys therefore cannot reset a limited key's allowance.
-- **Idle TTL: incremental.** Each insert also checks the next 8 slots for idle keys.
+- **A limited key never regains a fresh allowance.** A key whose bucket is full again is forgotten freely (that loses nothing).
+- **Capacity: CLOCK, recovered keys first, then the debt ledger.** A new key in a full shard evicts a recovered key found within a 32-slot scan, preferring one not used recently. If none of the scanned keys has recovered, a limited key is evicted but its debt (when it will be full again) goes into the shard's ledger &mdash; 16 bytes keyed by the key's hash &mdash; and the key is re-created in that debt if it returns. The ledger holds as many debts as the shard holds keys.
+- **When keys and ledger are both full of limited keys**, `WhenFull` decides: `RefuseNew` (default) refuses the new key (its `try_*` returns `false`; its waiting acquire waits until room is expected), so every limit holds; `ForgetDebt` admits it by forgetting the debt that settles soonest (a bounded bypass, traded for availability).
+- **Idle TTL: incremental, recovered keys only.** Each insert checks the next 8 slots for keys idle past the TTL *whose bucket has recovered*; a key in debt (behind its own reservations) is kept until it is full again. The effective TTL is never shorter than a bucket's time to refill completely.
 - **Bounded work.** Every insert does a fixed amount of work however large the store; shards are sized so none holds more than 16,384 keys of the cap.
+
+Locking newcomers out takes a flood that keeps every key slot *and* every ledger slot filled with drained keys: about `2 × max_keys / T` new keys per second, where `T` is how long a drained key takes to recover. At the default cap that is ~2.1 M keys/s for `per_minute(60)` keys drained of one token, ~35 k keys/s for `per_minute(100)` keys drained of all 100, and ~580 keys/s for `per_duration(1000, 1h)` keys drained of all 1,000 &mdash; the exposed case; size the cap above your real key cardinality, or choose `ForgetDebt`.
 
 ```rust
 use std::time::Duration;
@@ -411,7 +420,7 @@ assert_eq!(Eviction::default().max_keys(), Some(DEFAULT_MAX_KEYS));
 
 `Layered<K, E = K>`: an optional global [`Limiter`](#limiter), an optional per-key `PerKey<K>`, and an optional per-endpoint `PerKey<E>`, all of which a request must clear. Builder: `global(l)`, `shared_global(arc)`, `per_key(perkey)`, `per_endpoint(perkey)`, `name(n)`.
 
-Methods: `try_acquire(&key, &endpoint)`, `try_acquire_with_cost`, `peek`, `refund`, `pause_for` (the global scope), `capacity`, `name`; _(runtime)_ `acquire`, `acquire_with_cost`, `acquire_with_cost_timeout`.
+Methods: `try_acquire(&key, &endpoint)`, `try_acquire_with_cost`, `peek`, `refund`, `pause_for` / `resume` / `paused_for` (the global scope), `capacity`, `name`; _(runtime)_ `acquire`, `acquire_with_cost`, `acquire_with_cost_timeout`. A waiter queues on its tightest scope (usually its own per-key budget) and charges the global scope only when it can go, so one tenant's backlog never drains the global budget the others share.
 
 ```rust
 use throttle_net::{Layered, PerKey, Throttle};
@@ -431,7 +440,7 @@ assert!(layered.try_acquire(&"b", &"/x"));
 
 At most `limit` units in any trailing `window`, exactly (no boundary burst). Time is tracked to the nanosecond, so sub-millisecond windows are exact; a zero window is a per-instant limit.
 
-`new(limit, window)`, `per_second(rate)`, `per_minute(rate)`, `with_clock`, `with_name`; `try_acquire`, `try_acquire_with_cost`, `peek`, `available`, `capacity`, `window`, `refund` (removes the oldest units, never more permissive than the exact refund), `pause_for`, `resume`, `paused_for`; _(runtime)_ `acquire`, `acquire_with_cost`, `acquire_with_cost_timeout`. It does not reserve, so under sustained contention a large cost can wait behind smaller ones.
+`new(limit, window)`, `per_second(rate)`, `per_minute(rate)`, `with_clock`, `with_name`; `try_acquire`, `try_acquire_with_cost`, `peek`, `available`, `capacity`, `window`, `refund` (removes the oldest units, never more permissive than the exact refund), `pause_for`, `resume` (wakes paused waiters), `paused_for`; _(runtime)_ `acquire`, `acquire_with_cost`, `acquire_with_cost_timeout`. It does not reserve, so under sustained contention a large cost can wait behind smaller ones; in a composite it is charged when the request goes, not while it waits on a slower constituent.
 
 ```rust
 use std::sync::Arc;
@@ -476,7 +485,7 @@ for delay in (&backoff).into_iter().take(10) {
 
 ## `Retry`
 
-`Retry::new(backoff)` then `max_attempts(n)` (default 5, counting the first), `respect_retry_after(bool)` (default on), `max_retry_after(cap)` (default 5 minutes), `max_elapsed(budget)` (off by default), `name(&'static str)`. Accessors: `attempts()`, `backoff()`, `retry_after_cap()`, `elapsed_budget()`.
+`Retry::new(backoff)` then `max_attempts(n)` (default 5, counting the first), `respect_retry_after(bool)` (default on), `max_retry_after(cap)` (default 5 minutes), `max_elapsed(budget)` (off by default), `name(impl Into<Cow<'static, str>>)` (`Retry` is `Clone`). Accessors: `attempts()`, `backoff()`, `retry_after_cap()`, `elapsed_budget()`.
 
 _(runtime)_ `run(operation, classify)` and `run_with_budget(&budget, operation, classify)` call `operation` until it succeeds or a guardrail stops them, returning the last error. `classify` returns a `RetryAction`: `Retry`, `RetryAfter(delay)`, or `GiveUp`. A `RetryAfter` beyond `max_retry_after` ends the loop instead of sleeping; a wait that would cross `max_elapsed` is not taken. `retry_if_retryable` classifies an `error_forge::ForgeError` by its own retryability.
 
@@ -538,7 +547,7 @@ assert_eq!(parse_retry_after("soon"), None);
 
 ## `CircuitBreaker`
 
-`CircuitBreaker<L: Limiter, C = SystemClock>` (feature `circuit-breaker`). Builder: `trip(Trip)`, `cooldown(d)`, `half_open(trials, required)`, `name(&'static str)`, `build(limiter)`.
+`CircuitBreaker<L: Limiter, C = SystemClock>` (feature `circuit-breaker`). Builder: `trip(Trip)`, `cooldown(d)`, `half_open(trials, required)`, `name(impl Into<Cow<'static, str>>)`, `build(limiter)`.
 
 | `Trip` | Opens when |
 |--------|-----------|
@@ -551,14 +560,14 @@ Out-of-range parameters are normalised (zero counts become one; `ratio` is clamp
 | Method | Meaning |
 |--------|---------|
 | `try_acquire()` | `Ok(Some(Permit))`, `Ok(None)` (rate-limited), or `Err(CircuitOpen \| CostExceedsCapacity)`. |
-| `acquire()` / `acquire_timeout(t)` _(runtime)_ | Shed at once while open; otherwise wait on the limiter. Cancel-safe. |
-| `try_acquire_owned()` / `acquire_owned()` | `OwnedPermit`, which can move into a spawned task (on `Arc<CircuitBreaker>`). |
+| `acquire()` / `acquire_timeout(t)` _(runtime)_ | Shed at once while open; otherwise wait on the limiter. A waiter whose queued wait outlives the state it was admitted in is shed (`CircuitOpen`) if the breaker has opened meanwhile. Cancel-safe. |
+| `try_acquire_owned()` / `acquire_owned()` / `acquire_owned_timeout(t)` | `OwnedPermit`, which can move into a spawned task (on `Arc<CircuitBreaker>`). |
 | `call(operation)` _(runtime)_ | Admit, run, settle from the `Result`: `Err(CallError::Rejected(e))` or `Err(CallError::Failed(e))`. |
-| `record_success()` / `record_failure()` | Report a call made without a permit. |
+| `record_success()` / `record_failure()` | Report a call made without a permit. While half-open, frees a trial slot only if one is held by a trial admitted through the `Limiter` trait. |
 | `reset()` / `state()` / `inner()` / `with_clock` / `with_name` / `name()` | |
-| `Limiter` impl | Composes in a `Hybrid` or as a `Layered` global scope. |
+| `Limiter` impl | Composes in a `Hybrid` or as a `Layered` global scope. A half-open trial taken through the trait is released by `refund` (a composite's rollback or cancelled wait), so the breaker never wedges half-open. |
 
-Settle a `Permit` with `success()` or `failure()`; dropping it unsettled counts as a failure. Permits carry the breaker's state generation, so a slow call admitted before a transition never counts toward the state after it.
+Settle a `Permit` with `success()` or `failure()`, or give it back with `cancel()` when the call never reached the downstream (no outcome is recorded; the trial slot and the limiter's unit are returned). Dropping it unsettled counts as a **failure** &mdash; so hedged or `select!`ed calls should `cancel()` their losers. Permits carry the breaker's state generation, so a slow call admitted before a transition never counts toward the state after it.
 
 ```rust
 # async fn run() {
@@ -581,7 +590,7 @@ assert!(matches!(shed, Err(CallError::Rejected(_))));
 
 ## `Bulkhead`
 
-A fixed cap on concurrent calls. `Bulkhead::new(limit)`, `with_name`, `limit()`, `in_use()`, `available()`, `try_acquire()` / `try_acquire_owned()` (a slot as a `BulkheadPermit` / `OwnedBulkheadPermit`, released on drop); _(runtime)_ `acquire()`, `acquire_timeout(t)` (`BulkheadFull` on timeout), `acquire_owned()`, `call(operation)`, `try_call(operation)`.
+A fixed cap on concurrent calls. `Bulkhead::new(limit)`, `with_name`, `limit()`, `in_use()`, `available()`, `try_acquire()` / `try_acquire_owned()` (a slot as a `BulkheadPermit` / `OwnedBulkheadPermit`, released on drop); _(runtime)_ `acquire()`, `acquire_timeout(t)` (`BulkheadFull` on timeout), `acquire_owned()`, `acquire_owned_timeout(t)`, `call(operation)`, `call_timeout(t, operation)` (the timeout bounds the wait for a slot), `try_call(operation)`. Every freed slot wakes one more waiter.
 
 ```rust
 use throttle_net::Bulkhead;
@@ -598,7 +607,7 @@ assert_eq!(bulkhead.available(), 1);
 
 ## `Queue`
 
-`Queue<L: Limiter, K = (), C = SystemClock>` _(runtime)_: up to `capacity` waiters, served by priority, then least-recently-served key, then arrival. Builder: `capacity(n)` (default 1024), `overflow(Overflow)`, `name(&'static str)`, `build(limiter)`. `Overflow::{Reject, DropOldest, DropLowestPriority}`.
+`Queue<L: Limiter, K = (), C = SystemClock>` _(runtime)_: up to `capacity` waiters, served by priority, then least-recently-served key, then arrival. Builder: `capacity(n)` (default 1024), `overflow(Overflow)`, `name(impl Into<Cow<'static, str>>)`, `build(limiter)`. `Overflow::{Reject, DropOldest, DropLowestPriority}`.
 
 `acquire(key, priority, deadline)` / `acquire_with_cost(key, priority, deadline, cost)` return `QueueFull`, `DeadlineExceeded`, or `CostExceedsCapacity`. Also `len`, `is_empty`, `capacity`, `overflow`, `inner`, `with_clock`, `with_name`, `name`. Scheduling is O(log n), only the new turn-holder is woken, and per-key fairness state is bounded by the capacity.
 
@@ -620,14 +629,14 @@ queue.acquire("tenant:1", 0, Some(Duration::from_secs(2))).await?;
 
 ## `AdaptiveLimiter`
 
-`AdaptiveLimiter<S: AdaptiveStrategy, C = SystemClock>` (feature `adaptive`): an in-flight limit between a floor and a ceiling, moved by outcomes. Builder: `floor`, `ceiling`, `initial`, `name(&'static str)`, `build(strategy)`. Strategies: `Aimd::new(increase, decrease)` and `Vegas::new(alpha, beta).with_probe_interval(samples)`, or your own `AdaptiveStrategy`.
+`AdaptiveLimiter<S: AdaptiveStrategy, C = SystemClock>` (feature `adaptive`): an in-flight limit between a floor and a ceiling, moved by outcomes. Builder: `floor`, `ceiling`, `initial`, `name(impl Into<Cow<'static, str>>)`, `build(strategy)`. Strategies: `Aimd::new(increase, decrease)` and `Vegas::new(alpha, beta).with_probe_interval(samples)`, or your own `AdaptiveStrategy`.
 
 Every update is a compare-and-swap, a failure lowers the limit at most once per congestion event (only if its request started after the last decrease), and Vegas re-probes its no-load latency.
 
 | Method | Meaning |
 |--------|---------|
-| `try_acquire()` / `try_acquire_owned()` | An `AdaptivePermit` / `OwnedAdaptivePermit`; settle with `success()` / `failure()` (drop = failure). |
-| `acquire()` / `acquire_timeout(t)` / `acquire_owned()` _(runtime)_ | Wait for a slot; cancel-safe. |
+| `try_acquire()` / `try_acquire_owned()` | An `AdaptivePermit` / `OwnedAdaptivePermit`; settle with `success()` / `failure()` (drop = failure), or `cancel()` to free the slot with no outcome. |
+| `acquire()` / `acquire_timeout(t)` / `acquire_owned()` / `acquire_owned_timeout(t)` _(runtime)_ | Wait for a slot; cancel-safe. Every freed slot (and every slot the limit grows by) wakes one more waiter. |
 | `release(outcome)` | Settle a slot taken through the `Limiter` trait. |
 | `current_limit()` / `in_flight()` / `floor()` / `ceiling()` / `with_clock` / `with_name` / `name()` | |
 
@@ -652,7 +661,7 @@ Runtime-agnostic combinators _(runtime)_:
 
 - `timeout(duration, future) -> Result<T, Elapsed>` &mdash; `Elapsed` converts into `ThrottleError::DeadlineExceeded`.
 - `fallback(primary, |err| async { .. }) -> T` &mdash; a degraded answer on error.
-- `hedge(delay, || attempt) -> Result<T, E>` &mdash; a second attempt if the first is slow; the first success wins.
+- `hedge(delay, || attempt) -> Result<T, E>` &mdash; a second attempt if the first is slow; the first success wins. The loser is dropped: through a circuit breaker, `cancel()` its permit rather than let the drop count as a failure.
 
 ```rust
 # async fn run() {
@@ -676,10 +685,10 @@ assert_eq!(value, 0);
 ### Reconciliation
 
 - `Window::apply(&limiter)` drains any `Limiter` to `remaining` and, when `remaining` is `0` and a reset is known, pauses it until the reset.
-- `RateLimitInfo::sync_requests(&limiter)` / `sync_tokens(&limiter)` apply one window and pause for a `Retry-After`.
+- `RateLimitInfo::sync_requests(&limiter)` / `sync_tokens(&limiter)` apply one window and pause for a `Retry-After`. Any `Limiter` works, including an `Arc<Throttle>` passed as `&arc`.
 - `RateLimitInfo::sync_multi(&multi)` reconciles a whole `MultiLimiter`: requests to `requests`, tokens to `tokens` (or each of `input_tokens` / `output_tokens`), `Retry-After` to every dimension.
 
-Reconciliation only ever reduces the local budget.
+Reconciliation only ever reduces the local budget. Every pause it sets comes from the server, so it is clamped to `provider::DEFAULT_MAX_PAUSE` (five minutes): a hostile `Retry-After: 999999999` pauses for five minutes, not 31 years. `Window::apply_capped`, `sync_requests_capped`, `sync_tokens_capped`, and `sync_multi_capped` take your own ceiling (`Duration::ZERO` drains without pausing).
 
 ```rust
 use std::sync::Arc;
@@ -705,7 +714,7 @@ assert_eq!(throttle.paused_for(), Duration::from_secs(20));
 ```rust
 use throttle_net::presets;
 
-let limiter = presets::openai::tier_1().with_strict(true);
+let limiter = presets::openai::tier_1();
 assert!(limiter.try_acquire_costs(&[("requests", 1), ("input_tokens", 1_000), ("output_tokens", 500)]));
 assert_eq!(limiter.available("tokens"), Some(28_500));
 ```
@@ -714,7 +723,9 @@ assert_eq!(limiter.available("tokens"), Some(28_500));
 
 ## `tower` integration
 
-Feature `tower` (only `tower-layer` and `tower-service`). `ThrottleLayer::new(limiter)` / `shared(arc)` / `with_cost(n)` paces calls; `CircuitBreakerLayer::new(Arc<CircuitBreaker>)` sheds while open and settles each call from its `Result`; `AdaptiveLayer::new(Arc<AdaptiveLimiter>)` caps in-flight calls and feeds outcomes back. Inner services must be `Clone`; errors are boxed (`tower::BoxError`).
+Feature `tower` (only `tower-layer` and `tower-service`). `ThrottleLayer::new(limiter)` / `shared(arc)` / `with_cost(n)` paces calls; `CircuitBreakerLayer::new(Arc<CircuitBreaker>)` sheds while open and settles each call from its `Result`; `AdaptiveLayer::new(Arc<AdaptiveLimiter>)` caps in-flight calls and feeds outcomes (and the call's latency) back. Each has `with_timeout(t)`.
+
+Each service acquires its admission in **`poll_ready`** &mdash; then polls the inner service's readiness &mdash; and spends it in `call`, like tower's `RateLimit`: `load_shed`, `buffer`, and balancers see real backpressure, and an inner layer whose readiness reserves capacity (a `ConcurrencyLimit` permit, a pooled connection) is not held through the wait. A service dropped (or cloned) while ready gives its admission back; one called without being ready fails with `ThrottleError::NotReady`. Errors are boxed (`tower::BoxError`).
 
 ```rust
 # async fn run() -> Result<(), throttle_net::tower::BoxError> {

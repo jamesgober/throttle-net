@@ -32,7 +32,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). Async-first, runtime-agnostic (tokio or smol), <code>no_std</code> algorithm core.
     </p>
     <blockquote>
-        <strong>Status: stable (1.x).</strong> The public API follows Semantic Versioning; 1.1 adds to it without breaking it, and fixes over-admission under thread contention inherited from better-bucket 1.0. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a>.
+        <strong>Status: stable (2.x).</strong> The public API follows Semantic Versioning. 2.0 is a major release: it fixes over-admission under thread contention inherited from better-bucket 1.0, and changes several defaults to fail safe (capped server pauses, a per-key store that never resets a limited key, strict multi-limiter names, readiness-based tower layers). Upgrading from 1.x: <a href="./docs/MIGRATION_1_TO_2.md"><code>docs/MIGRATION_1_TO_2.md</code></a>. History: <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a>.
     </blockquote>
 </div>
 
@@ -46,15 +46,16 @@
 - **Token bucket** (`Throttle`) &mdash; rate, burst, and initial fill set independently; `per_second` / `per_minute` / `per_duration`; `smooth` for GCRA-style even spacing. Lock-free: one atomic compare-and-swap per grant, and it never over-admits under any number of threads.
 - **Exact sliding window** (`SlidingWindowLog`) &mdash; no boundary burst, nanosecond-exact windows.
 - **Cost-aware** &mdash; `acquire_with_cost(n)`: not every request weighs one unit.
-- **Multi-dimensional** (`MultiLimiter`) &mdash; requests/min *and* tokens/min at once, with aliases for combined budgets, a strict mode that refuses misspelt dimensions, and `settle_costs` for calls admitted on an estimate.
-- **Composition** &mdash; `Hybrid` (must pass all), `PerKey` (independent state per tenant, bounded memory), `Layered` (global / per-key / per-endpoint).
+- **Multi-dimensional** (`MultiLimiter`) &mdash; requests/min *and* tokens/min at once, with aliases for combined budgets, misspelt dimensions refused rather than silently free, and `settle_costs` for calls admitted on an estimate.
+- **Composition** &mdash; `Hybrid` (must pass all), `PerKey` (independent state per tenant, bounded memory that never resets a limited key), `Layered` (global / per-key / per-endpoint). A tenant with a deep backlog on its own budget cannot drain a shared global scope ahead of time.
 
 **Waiting**
 
 - **Wait, don't reject** &mdash; `acquire().await` paces the caller; `try_acquire()` is the non-blocking answer; `peek()` consumes nothing.
-- **Fair** &mdash; waits are reservations: later callers queue behind earlier ones, so a large request is never starved by small ones.
-- **Timeouts that fail fast** &mdash; every waiting surface has a `*_timeout` variant that gives up at once when the wait is known to be too long.
-- **Cancel-safe** &mdash; dropping a waiting future returns what it reserved, frees a breaker's trial slot, holds no concurrency slot.
+- **Fair** &mdash; token-bucket waits are reservations: later callers queue behind earlier ones, so a large request is never starved by small ones. Composites queue on their bottleneck constituent and charge the others only when the request can go. (The exact `SlidingWindowLog` cannot reserve; its waiters retry as the window frees.)
+- **Timeouts** &mdash; every waiting `acquire` (including the owned-permit ones) has a `*_timeout` variant whose deadline bounds the whole wait; a token bucket gives up at once when the wait is known to be too long.
+- **Pauses** &mdash; `pause_for` a server's `Retry-After` holds every waiter, including those that had already reserved; `resume` wakes them at once.
+- **Cancel-safe** &mdash; dropping a waiting future returns what it held: reserved units, a breaker's trial slot (also when the breaker is a composite's constituent), a concurrency slot.
 
 **Resilience**
 
@@ -66,9 +67,9 @@
 
 **Integration**
 
-- **Providers** &mdash; parse rate-limit headers from OpenAI, Anthropic, GitHub, the IETF draft, Stripe, AWS; drain limiters to the server's remaining count and pause them until its reset; LLM tier presets.
+- **Providers** &mdash; parse rate-limit headers from OpenAI, Anthropic, GitHub, the IETF draft, Stripe, AWS; drain limiters to the server's remaining count and pause them until its reset (capped, so a hostile header cannot stall a client for years); LLM tier presets.
 - **Observability** &mdash; per-instance named metrics (grants, denials, timeouts, sheds, waits, state gauges) and tracing events; zero-cost when off.
-- **`tower` layers** (opt-in) for any `tower::Service` client stack.
+- **`tower` layers** (opt-in) for any `tower::Service` client stack, waiting in `poll_ready` so `load_shed`, `buffer`, and balancers see real backpressure.
 - **Deterministic testing** &mdash; inject a `ManualClock`, or a `TokioClock` that follows tokio's paused time.
 - **Runtime-agnostic** &mdash; tokio or smol; the `no_std` core (`Backoff`, `Jitter`, `Decision`) builds without the standard library.
 
@@ -78,16 +79,16 @@
 
 ```toml
 [dependencies]
-throttle-net = "1"
+throttle-net = "2"
 
 # Optional features:
-throttle-net = { version = "1", features = ["circuit-breaker", "adaptive", "provider-llm", "metrics", "tracing", "tower"] }
+throttle-net = { version = "2", features = ["circuit-breaker", "adaptive", "provider-llm", "metrics", "tracing", "tower"] }
 
 # Run the waiting surface on smol instead of tokio:
-throttle-net = { version = "1", default-features = false, features = ["smol"] }
+throttle-net = { version = "2", default-features = false, features = ["smol"] }
 
 # no_std algorithm core only (Backoff, Jitter, Decision):
-throttle-net = { version = "1", default-features = false }
+throttle-net = { version = "2", default-features = false }
 ```
 
 <br>
@@ -126,8 +127,7 @@ async fn main() -> Result<(), throttle_net::ThrottleError> {
         .dimension("requests", Throttle::per_minute(60))
         .dimension("input_tokens", Throttle::per_minute(100_000))
         .dimension("output_tokens", Throttle::per_minute(20_000))
-        .strict(true) // a misspelt dimension is refused, not silently free
-        .build();
+        .build(); // a misspelt dimension is refused, not silently free
 
     let estimate = [("requests", 1), ("input_tokens", 1500), ("output_tokens", 1024)];
     limiter.acquire_costs(&estimate).await?; // waits until every budget can afford it
@@ -151,7 +151,7 @@ async fn main() -> Result<(), throttle_net::ThrottleError> {
 }
 ```
 
-Stack scopes &mdash; an overall ceiling, a per-tenant share, and a per-endpoint cap:
+Stack scopes &mdash; an overall ceiling, a per-tenant share, and a per-endpoint cap. A waiter queues on its own tightest scope and charges the shared global one only when it can go, so one tenant's backlog never starves the others:
 
 ```rust
 use throttle_net::{Layered, PerKey, Throttle};
@@ -232,7 +232,8 @@ async fn main() -> Result<(), throttle_net::ThrottleError> {
     let limiter = presets::anthropic::tier_2(); // requests + input/output token budgets
 
     // After a response, reconcile with what the server reported: drain to its
-    // remaining counts, and pause until its reset if a window is exhausted.
+    // remaining counts, and pause until its reset if a window is exhausted
+    // (at most five minutes; `sync_multi_capped` chooses the ceiling).
     let headers = [
         ("anthropic-ratelimit-requests-remaining", "12"),
         ("anthropic-ratelimit-tokens-remaining", "40000"),
@@ -263,6 +264,7 @@ cargo run --example per_tenant_quotas                                    # per-t
 
 - [API reference](./docs/API.md) &mdash; every public item, with examples
 - [Cookbook](./docs/COOKBOOK.md) &mdash; task-oriented recipes
+- [Migrating from 1.x to 2.0](./docs/MIGRATION_1_TO_2.md) &mdash; every behaviour and API change, with before/after code
 - [Migrating from `governor`](./docs/MIGRATING_FROM_GOVERNOR.md) &mdash; API mapping and before/after
 - [CHANGELOG](./CHANGELOG.md) and [release notes](./docs/release/)
 
@@ -275,14 +277,15 @@ Criterion means from `cargo bench --bench throttle_bench --bench comparison_benc
 | Operation | Time |
 |---|---|
 | `Throttle::try_acquire`, uncontended | ~35 ns (dominated by the OS monotonic clock read) |
-| `governor` 0.10 `check`, same machine | ~10 ns |
+| `governor` 0.10 `check`, same machine | ~9 ns |
 | `Throttle::reserve` + `refund` | ~39 ns |
-| `PerKey::try_acquire`, existing key among 10,000 | ~64 ns |
-| `Hybrid` of two buckets | ~154 ns |
-| `MultiLimiter`, three dimensions | ~361 ns |
-| `SlidingWindowLog::try_acquire` | ~41 ns |
-| `PerKey`, new key into a full 1M-key store (unique-key flood) | ~0.42 µs (1.0: ~1.8 ms) |
-| `PerKey`, new key into a full store of limited keys (refused) | ~1.1 µs |
+| `PerKey::try_acquire`, existing key among 10,000 | ~51 ns |
+| `Hybrid` of two buckets | ~141 ns |
+| `MultiLimiter`, three dimensions | ~316 ns |
+| `SlidingWindowLog::try_acquire` | ~38 ns |
+| `PerKey`, new key into a full 1M-key store (unique-key flood) | ~0.36 µs (1.0: ~1.8 ms) |
+| `PerKey`, new key into a store whose keys and debt ledger are full of limited keys (refused) | ~0.52 µs |
+| `PerKey`, new key with an idle TTL configured, nothing expired | ~0.17 µs |
 
 <hr>
 <br>

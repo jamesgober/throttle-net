@@ -18,14 +18,20 @@
 //!   set independently; [`Throttle::smooth`] for GCRA-style pacing) and the
 //!   exact [`SlidingWindowLog`], both behind the [`Limiter`] trait.
 //! - **Composites** — [`Hybrid`] (must pass all), [`MultiLimiter`] (named
-//!   budgets such as requests + tokens, with aliases and a strict mode),
-//!   [`PerKey`] (independent per-key state with bounded memory), and
+//!   budgets such as requests + tokens, with aliases; strict about unknown
+//!   names), [`PerKey`] (independent per-key state with bounded memory), and
 //!   [`Layered`] (global / per-key / per-endpoint scopes).
-//! - **Waiting** — every limiter has a waiting `acquire` that reserves its units
-//!   and sleeps exactly until they accrue (fair: later callers queue behind it),
-//!   a `*_timeout` variant that gives up at once when the wait is known to be
-//!   too long, and is **cancel-safe**: dropping the future returns what it
-//!   reserved.
+//! - **Waiting** — every limiter has a waiting `acquire`. Token buckets
+//!   ([`Throttle`], [`PerKey`]) reserve their units and sleep exactly until
+//!   they accrue (fair: later callers queue behind them); composites queue on
+//!   their *bottleneck* constituent and take the others only when it is due,
+//!   so a scope shared with other callers is never held ahead of use; the
+//!   [`SlidingWindowLog`] cannot reserve, so its waiters retry when the window
+//!   frees. Each waiting `acquire` has a `*_timeout` variant whose deadline
+//!   bounds the whole wait (a token bucket gives up at once when the wait is
+//!   known to be too long), and every one is **cancel-safe**: dropping the
+//!   future returns what it held. A pause set while a waiter sleeps holds it
+//!   too, and `resume` wakes it.
 //! - **Resilience** — [`Retry`] with jittered [`Backoff`], a `Retry-After` cap, a
 //!   total time budget, and a shared [`RetryBudget`]; a `CircuitBreaker`
 //!   (`circuit-breaker` feature) with owned permits and
@@ -77,11 +83,19 @@
 //!   compare-and-swap in better-bucket's single-instant engine, where a stale or
 //!   backward clock reading can only deny more. Over any window, a token
 //!   bucket's grants never exceed its capacity plus what its rate accrues, under
-//!   any number of threads; composites hold the same bound per constituent.
-//!   This is checked by real-clock multi-threaded stress tests here and loom
-//!   models in better-bucket.
+//!   any number of threads. Composites hold the same bound per constituent,
+//!   both for what is charged and for when requests are released: a waiter
+//!   charges each constituent when its request is (within a few milliseconds)
+//!   ready to go, except the bottleneck it queues on — exactly as a waiter on
+//!   that limiter alone would. This is checked by real-clock multi-threaded
+//!   stress tests here and loom models in better-bucket.
 //! - **Bounded memory.** Per-key state, queue bookkeeping, and sliding logs are
-//!   all bounded, with O(1) or O(log n) work per operation.
+//!   all bounded, with O(1) or O(log n) work per operation. Bounding per-key
+//!   state never resets a limited key's allowance; see [`Eviction`] for what a
+//!   key flood can and cannot do.
+//! - **Untrusted server input is capped.** A `Retry-After` or reset from a
+//!   response pauses a limiter for at most five minutes by default, and
+//!   [`Retry`] waits at most five minutes for a `Retry-After`.
 //! - **No panics** on any input: hostile headers, extreme durations, rates, and
 //!   costs are all handled with checked or saturating arithmetic.
 //!
@@ -255,7 +269,7 @@ pub use clock_lib::{Clock, ManualClock, SystemClock};
 /// # Examples
 ///
 /// ```
-/// assert!(throttle_net::VERSION.starts_with("1."));
+/// assert!(throttle_net::VERSION.starts_with("2."));
 /// ```
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -301,3 +315,13 @@ struct CookbookDoctests;
 ))]
 #[doc = include_str!("../docs/MIGRATING_FROM_GOVERNOR.md")]
 struct MigratingDoctests;
+
+#[cfg(all(
+    doctest,
+    feature = "tokio",
+    feature = "circuit-breaker",
+    feature = "adaptive",
+    feature = "provider-llm"
+))]
+#[doc = include_str!("../docs/MIGRATION_1_TO_2.md")]
+struct MigrationGuideDoctests;

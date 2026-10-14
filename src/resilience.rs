@@ -127,6 +127,13 @@ where
 /// those). Once both are running, a failure from one waits for the other, and
 /// if both fail the later error is returned.
 ///
+/// **With a circuit breaker:** the losing attempt is dropped, and a breaker
+/// [`Permit`](crate::Permit) dropped unsettled counts as a **failure** — so
+/// hedging through `CircuitBreaker::call` would trip the breaker on latency
+/// alone. Take the permit inside the attempt and give the loser's back with
+/// [`Permit::cancel`](crate::Permit::cancel) (for example from a drop guard),
+/// or hedge outside the breaker.
+///
 /// # Errors
 ///
 /// The operation's own error, as described above.

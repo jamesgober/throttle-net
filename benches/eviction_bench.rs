@@ -55,9 +55,11 @@ fn bench_flood(c: &mut Criterion) {
     drop(recovering);
 
     // Limited keys: one token per hour, so nothing recovers during the run.
+    // Twice the cap fills both the key slots and the debt ledger, so every
+    // newcomer is scanned and refused.
     let limited = PerKey::<u64>::per_duration(1, Duration::from_secs(3600))
         .with_eviction(Eviction::capacity(100_000));
-    let mut next = fill(&limited, 100_000);
+    let mut next = fill(&limited, 200_000);
     group.bench_function("flood_at_cap_limited_keys", |b| {
         b.iter(|| {
             next += 1;

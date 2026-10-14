@@ -121,11 +121,13 @@ if throttle.peek(10).is_acquired() {
 
 ## Give up instead of waiting too long
 
-Every waiting acquire has a `*_timeout` variant. Waits are reservations with a
-known end, so when the budget cannot be met the call fails **at once** with
-`DeadlineExceeded`, reserving nothing, rather than sleeping to the deadline.
-Dropping a waiting future instead (an outer `tokio::time::timeout`, a `select!`)
-is also safe: its reservation goes back.
+Every waiting acquire has a `*_timeout` variant (owned permits too:
+`acquire_owned_timeout`), and its deadline bounds the whole wait. On a token
+bucket, waits are reservations with a known end, so when the budget cannot be
+met the call fails **at once** with `DeadlineExceeded`, reserving nothing,
+rather than sleeping to the deadline; a bulkhead or adaptive limiter waits for a
+slot until the deadline. Dropping a waiting future instead (an outer
+`tokio::time::timeout`, a `select!`) is also safe: whatever it held goes back.
 
 ```rust
 # async fn run() {
@@ -219,7 +221,9 @@ limiter.settle_costs(&estimate, &usage);
 ## Throttle per tenant
 
 `PerKey` keeps independent state per key, so one noisy tenant cannot spend
-another's budget. State is sharded and memory is bounded by default.
+another's budget. State is sharded and memory is bounded by default, and the
+bound never resets a limited key: a key evicted while limited leaves its debt in
+a compact ledger and comes back in that debt.
 
 ```rust
 # async fn run() -> Result<(), throttle_net::ThrottleError> {
@@ -242,13 +246,28 @@ let limiter: PerKey<String> = PerKey::per_second(100)
 # let _ = limiter;
 ```
 
+When a flood fills both the key slots and the debt ledger with limited keys, a
+new key is refused until one recovers, so every limit holds. If admitting
+newcomers matters more than exact limits for the keys closest to recovery,
+choose `WhenFull::ForgetDebt`:
+
+```rust
+use throttle_net::{Eviction, PerKey, WhenFull};
+
+let limiter: PerKey<String> = PerKey::per_minute(100)
+    .with_eviction(Eviction::capacity(50_000).with_when_full(WhenFull::ForgetDebt));
+# let _ = limiter;
+```
+
 ---
 
 ## Stack global, per-tenant, and per-endpoint caps
 
 A `Layered` limiter applies several scopes in order; a request must clear every
 one. The classic shape is a global ceiling over a per-tenant share over a
-per-endpoint cap.
+per-endpoint cap. A waiting request queues on its tightest scope and charges the
+shared global scope only when it can go, so a tenant with a deep backlog never
+drains the global budget the others need.
 
 ```rust
 # async fn run() -> Result<(), throttle_net::ThrottleError> {
@@ -515,15 +534,32 @@ limiter.acquire_costs(&[("requests", 1), ("input_tokens", 1_500)]).await?;
 ```
 
 Reconciliation only ever *reduces* the local budget, so it cannot raise a limiter
-above its configured capacity. For a single `Throttle`, use
+above its configured capacity. For a single `Throttle` (or an `Arc` of one), use
 `info.sync_requests(&throttle)` or `info.sync_tokens(&throttle)`.
+
+Server values are untrusted: every pause is capped at
+`provider::DEFAULT_MAX_PAUSE` (five minutes). Choose your own ceiling with the
+`*_capped` variants, or pass `Duration::ZERO` to drain without pausing:
+
+```rust
+use std::time::Duration;
+use throttle_net::Throttle;
+use throttle_net::provider::HeaderProfile;
+
+let throttle = Throttle::per_second(10);
+let info = HeaderProfile::STRIPE.parse(&[("Retry-After", "86400")]);
+info.sync_requests_capped(&throttle, Duration::from_secs(30));
+assert!(throttle.paused_for() <= Duration::from_secs(30));
+```
 
 ---
 
 ## Throttle a `tower` client
 
 With the `tower` feature, put a limiter, a breaker, or an adaptive concurrency
-limit in front of any `tower::Service` stack.
+limit in front of any `tower::Service` stack. The layers wait in `poll_ready`
+(and only then poll the inner service), so `load_shed` or `buffer` above them
+see real backpressure; `with_timeout` bounds that wait.
 
 ```rust
 # async fn run() -> Result<(), throttle_net::tower::BoxError> {
@@ -550,17 +586,17 @@ identical. Pick the backend in `Cargo.toml`:
 
 ```toml
 # tokio (default):
-throttle-net = "1"
+throttle-net = "2"
 
 # smol instead:
-throttle-net = { version = "1", default-features = false, features = ["smol"] }
+throttle-net = { version = "2", default-features = false, features = ["smol"] }
 ```
 
 For a `no_std` build, take the pure algorithm core only &mdash; `Backoff`, `Jitter`,
 and `Decision` &mdash; with the standard library off:
 
 ```toml
-throttle-net = { version = "1", default-features = false }
+throttle-net = { version = "2", default-features = false }
 ```
 
 ```rust
@@ -623,7 +659,7 @@ compile to nothing when the features are off. Name each instance so two of a kin
 get separate series:
 
 ```toml
-throttle-net = { version = "1", features = ["metrics", "tracing"] }
+throttle-net = { version = "2", features = ["metrics", "tracing"] }
 ```
 
 ```rust

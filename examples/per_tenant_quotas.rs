@@ -2,8 +2,11 @@
 //! ceiling, so one noisy tenant cannot starve the others or the service.
 //!
 //! A [`Layered`] limiter stacks a global cap over a per-tenant [`PerKey`] cap:
-//! a request must clear both. Per-tenant state is sharded and bounded, so a flood
-//! of unique tenants cannot grow memory without limit.
+//! a request must clear both. A waiting request queues on its tightest scope
+//! (a throttled tenant's own budget) and charges the shared global scope only
+//! when it can go, so a tenant with a deep backlog of waiting requests never
+//! drains the global budget ahead of the others. Per-tenant state is sharded and
+//! bounded, so a flood of unique tenants cannot grow memory without limit.
 //!
 //! Run with: `cargo run --example per_tenant_quotas`
 

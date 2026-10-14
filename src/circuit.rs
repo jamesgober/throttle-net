@@ -675,7 +675,10 @@ where
     /// Runs `operation` under the breaker: admits (failing fast while open),
     /// awaits the operation, and settles the permit from its result — `Ok` as a
     /// success, `Err` as a failure. If the returned future is dropped mid-call,
-    /// the call counts as a failure (a timed-out call is a failed one).
+    /// the call counts as a failure (a timed-out call is a failed one) — so do
+    /// not race `call` futures against each other (a hedge, a `select!`): the
+    /// losers would trip the breaker on latency alone. Settle those with
+    /// [`Permit::cancel`] instead.
     ///
     /// # Errors
     ///
