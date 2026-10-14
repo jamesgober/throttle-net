@@ -305,6 +305,8 @@ It aims to be the obvious default for "I need to call an external API in Rust an
 
 Before opening a PR: `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test --all-features` must be clean, and so must the feature matrix in `.github/workflows/ci.yml` (including `--no-default-features --features std` and the smol backend). Hot-path changes need a `criterion` benchmark; concurrency-critical changes need stress, property, or `loom` tests.
 
+**Development toolchain and lockfile.** `rust-toolchain.toml` pins the toolchain used inside this repository (formatting, lints, docs, tests), and `Cargo.lock` is committed so CI only changes when a commit does. Neither affects crates that depend on throttle-net: rustup reads the toolchain file only inside this directory tree, and dependents resolve versions from `Cargo.toml` (down to the MSRV, 1.85). CI selects every other toolchain it tests (MSRV, nightly, floating stable) explicitly, and a weekly latest-dependencies job runs `cargo update` before building, testing, linting, and auditing, so drift a fresh consumer would see is caught.
+
 <br>
 
 <div id="license">

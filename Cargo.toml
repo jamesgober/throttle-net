@@ -56,6 +56,7 @@ exclude = [
     "REPS.md",
     ".github/",
     ".dev/",
+    "rust-toolchain.toml",
 ]
 
 [package.metadata.docs.rs]

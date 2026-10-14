@@ -1,0 +1,9 @@
+# The toolchain for working in this repository: formatting, lints, docs, and
+# the default test runs. It is resolved by rustup only inside this directory
+# tree, so it never affects crates that depend on throttle-net (they use their
+# own toolchain, down to the MSRV in Cargo.toml). Bump it deliberately; CI jobs
+# that test another toolchain (MSRV, nightly, floating stable) select it
+# explicitly with `RUSTUP_TOOLCHAIN`.
+[toolchain]
+channel = "1.99.0"
+components = ["rustfmt", "clippy"]

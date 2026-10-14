@@ -41,5 +41,5 @@ Homestead.json
 *.sublime-project
 ._*
 
-# Cargo lock (libraries don't commit lock)
-Cargo.lock
+# Cargo.lock is committed (reproducible CI and bisection; it does not affect
+# dependents, which resolve from Cargo.toml).
