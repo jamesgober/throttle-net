@@ -206,9 +206,16 @@ work ships here.)
 ### Changed
 
 - Dependency floors: better-bucket 1.1, clock-lib 1.1, error-forge 1.0.2,
-  event-listener 5.4.2, metrics 0.24.6, tracing 0.1.40; new optional
-  `hashbrown` and `tower-layer` / `tower-service`.
-- `REPS.md`, `.github/`, and `.dev/` are excluded from the published package.
+  event-listener 5.4.2, metrics 0.24.6, tracing 0.1.40, ahash 0.8.11; new
+  `hashbrown` (with `std`) and optional `tower-layer` / `tower-service`.
+- Fewer dependencies: `futures-lite` is gone (the two combinators it provided
+  are a few lines in-house); the `smol` feature depends on `async-io` (smol's
+  timer) instead of all of `smol` (45 → 31 crates); `ahash` is used without
+  its `getrandom` default, keyed from std's OS-seeded `RandomState`. The
+  default build is 19 crates.
+- `REPS.md`, `.github/`, `.dev/`, and `rust-toolchain.toml` are excluded from
+  the published package. `Cargo.lock` is committed and the repository
+  toolchain is pinned in `rust-toolchain.toml` (neither affects dependents).
 - The locks that guard the breaker, queue, and sliding log stay
   `std::sync::Mutex`: each is held for a bounded synchronous section, never
   across an `.await`, and is shared with the synchronous API (documented in
