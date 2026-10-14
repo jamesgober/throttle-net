@@ -5,5 +5,3 @@ tab_spaces = 4
 newline_style = "Unix"
 reorder_imports = true
 reorder_modules = true
-group_imports = "StdExternalCrate"
-imports_granularity = "Crate"
