@@ -61,8 +61,8 @@ work ships here.)
   or borrowed name (`impl Into<Cow<'static, str>>`).
 - **`Limiter` gained provided methods** (`refund`, `reserve`, `pause_for`,
   `paused_for`, `resume`, `charge`) and blanket impls for `&L`, `Box<L>`, and
-  `Arc<L>`. A downstream blanket `impl<T: …> Limiter for T` that overlaps them
-  no longer compiles.
+  `Arc<L>`. A downstream `impl Limiter for Box<YourLimiter>` (or
+  `&YourLimiter`) now conflicts with them; delete it.
 - **`ThrottleError` has new variants** (`BulkheadFull`, `InvalidConfig`,
   `UnknownDimension`, `NotReady`); it is `#[non_exhaustive]`, so a wildcard arm
   covers them.

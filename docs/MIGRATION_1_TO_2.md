@@ -329,8 +329,10 @@ let hybrid = Hybrid::builder().limiter(Arc::clone(&shared)).build();
 assert!(hybrid.try_acquire());
 ```
 
-- A blanket `impl<T: YourTrait> Limiter for T` in your crate may now overlap
-  these impls; implement `Limiter` for your concrete types instead.
+- If your crate implemented `Limiter` for `Box<YourLimiter>` or
+  `&YourLimiter` (to pass a boxed or borrowed limiter where a `Limiter` was
+  expected), that impl now conflicts with the blanket impls: delete it — the
+  blanket impl forwards every method to `YourLimiter`.
 
 ---
 
@@ -409,4 +411,4 @@ owned permits and `cancel()` for the breaker and adaptive limiter;
 
 ---
 
-<sub>Copyright &copy; 2026 <strong>James Gober</strong>. All rights reserved.</sub>
+<sub>throttle-net v2.0.0 — Copyright &copy; 2026 James Gober. Apache-2.0 OR MIT.</sub>
