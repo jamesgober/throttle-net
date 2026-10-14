@@ -126,14 +126,13 @@ impl Bulkhead {
 
     /// Returns a slot and wakes one waiter.
     fn release(&self) {
-        let _released = self
-            .in_use
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                Some(n.saturating_sub(1))
-            });
-        // A waiter cancelled after being notified passes the wake-up on.
+        let _released = crate::sync::saturating_sub(&self.in_use, 1);
+        // One *additional* waiter per freed slot: a plain `notify(1)` only
+        // guarantees one notified listener in total, so two releases before
+        // the first woken waiter runs would wake just one (TN2-001). A waiter
+        // cancelled after being notified passes the wake-up on.
         #[cfg(feature = "runtime")]
-        let _woken = self.notify.notify(1);
+        let _woken = self.notify.notify_additional(1);
     }
 
     /// Takes a slot without waiting, or returns `None` (counted as shed) when
@@ -234,6 +233,41 @@ impl Bulkhead {
         })
     }
 
+    /// Like [`acquire_timeout`](Self::acquire_timeout), returning an
+    /// [`OwnedBulkheadPermit`].
+    ///
+    /// # Errors
+    ///
+    /// As [`acquire_timeout`](Self::acquire_timeout).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # async fn run() {
+    /// use std::sync::Arc;
+    /// use std::time::Duration;
+    /// use throttle_net::{Bulkhead, ThrottleError};
+    ///
+    /// let bulkhead = Arc::new(Bulkhead::new(1));
+    /// let held = bulkhead.try_acquire_owned().unwrap();
+    /// let err = bulkhead
+    ///     .acquire_owned_timeout(Duration::from_millis(5))
+    ///     .await
+    ///     .unwrap_err();
+    /// assert_eq!(err, ThrottleError::BulkheadFull);
+    /// drop(held);
+    /// # }
+    /// ```
+    pub async fn acquire_owned_timeout(
+        self: &Arc<Self>,
+        timeout: Duration,
+    ) -> Result<OwnedBulkheadPermit, ThrottleError> {
+        self.wait(Some(timeout)).await?;
+        Ok(OwnedBulkheadPermit {
+            bulkhead: Arc::clone(self),
+        })
+    }
+
     /// Runs `operation` inside the bulkhead: waits for a slot, awaits the
     /// operation, and frees the slot (also if the returned future is dropped).
     ///
@@ -260,6 +294,26 @@ impl Bulkhead {
         Fut: core::future::Future,
     {
         let _permit = self.acquire().await?;
+        Ok(operation().await)
+    }
+
+    /// Like [`call`](Self::call), but waits at most `timeout` for a slot (the
+    /// operation itself is not timed).
+    ///
+    /// # Errors
+    ///
+    /// [`ThrottleError::BulkheadFull`] if no slot frees within `timeout`;
+    /// [`ThrottleError::CostExceedsCapacity`] when the limit is `0`.
+    pub async fn call_timeout<F, Fut>(
+        &self,
+        timeout: Duration,
+        operation: F,
+    ) -> Result<Fut::Output, ThrottleError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: core::future::Future,
+    {
+        let _permit = self.acquire_timeout(timeout).await?;
         Ok(operation().await)
     }
 

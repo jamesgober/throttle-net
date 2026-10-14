@@ -35,10 +35,19 @@ use crate::decision::Decision as D;
 ///
 /// # Provided methods
 ///
-/// [`refund`](Self::refund), [`reserve`](Self::reserve), and
-/// [`pause_for`](Self::pause_for) have conservative default bodies, so an
+/// [`refund`](Self::refund), [`reserve`](Self::reserve),
+/// [`pause_for`](Self::pause_for), [`paused_for`](Self::paused_for), and
+/// [`resume`](Self::resume) have conservative default bodies, so an
 /// implementation only needs the four required methods; override them when the
 /// algorithm can do better (the built-in limiters do).
+///
+/// # Shared limiters
+///
+/// `Limiter` is implemented for `&L`, `Box<L>`, and `Arc<L>` whenever `L` is a
+/// `Limiter` (sized or not), forwarding every method. So a limiter shared
+/// behind an `Arc` can be passed wherever a `Limiter` is expected — to
+/// [`RateLimitInfo::sync_requests`](crate::provider::RateLimitInfo::sync_requests),
+/// or as a [`Hybrid`](crate::Hybrid) constituent — exactly as in 1.0.
 ///
 /// # Examples
 ///
@@ -136,6 +145,186 @@ pub trait Limiter: Send + Sync {
             // leaves the limiter no fuller than a successful drain would.
             let _drained = self.acquire_cost(available);
         }
+    }
+
+    /// How much longer this limiter stays paused (`Duration::ZERO` when it is
+    /// not). A waiting acquire that has already reserved its units sleeps this
+    /// out before it returns, so a pause set after it reserved still holds it.
+    ///
+    /// The default reports no pause (the default [`pause_for`](Self::pause_for)
+    /// drains instead of pausing).
+    fn paused_for(&self) -> Duration {
+        Duration::ZERO
+    }
+
+    /// Lifts any pause immediately, waking waiters that were sleeping it out.
+    /// The default does nothing.
+    fn resume(&self) {}
+
+    /// Charges `cost` units that were **already spent** downstream, whether or
+    /// not they fit — the overrun of a call admitted on an estimate. Returns
+    /// how many units could not be charged (`0` when all were).
+    ///
+    /// Unlike [`acquire_cost`](Self::acquire_cost) this never refuses for lack
+    /// of units, and unlike [`reserve`](Self::reserve) it ignores a pause: the
+    /// units are gone either way. A token bucket records them as debt that
+    /// later callers wait behind.
+    ///
+    /// The default reserves in capacity-sized chunks with no wait limit and,
+    /// where the limiter cannot reserve, drains what is available and reports
+    /// the rest as uncharged.
+    fn charge(&self, cost: u32) -> u32 {
+        let capacity = self.capacity();
+        if capacity == 0 {
+            return cost;
+        }
+        let mut left = cost;
+        while left > 0 {
+            let chunk = left.min(capacity);
+            if self.reserve(chunk, Duration::MAX).is_none() {
+                let available = self.available().min(left);
+                if available > 0 && self.acquire_cost(available).is_acquired() {
+                    left -= available;
+                }
+                return left;
+            }
+            left -= chunk;
+        }
+        0
+    }
+}
+
+/// Forwards every method, so `&L` is a limiter wherever `L` is.
+impl<L: Limiter + ?Sized> Limiter for &L {
+    #[inline]
+    fn peek(&self, cost: u32) -> Decision {
+        (**self).peek(cost)
+    }
+    #[inline]
+    fn acquire_cost(&self, cost: u32) -> Decision {
+        (**self).acquire_cost(cost)
+    }
+    #[inline]
+    fn available(&self) -> u32 {
+        (**self).available()
+    }
+    #[inline]
+    fn capacity(&self) -> u32 {
+        (**self).capacity()
+    }
+    #[inline]
+    fn refund(&self, cost: u32) {
+        (**self).refund(cost);
+    }
+    #[inline]
+    fn reserve(&self, cost: u32, max_wait: Duration) -> Option<Duration> {
+        (**self).reserve(cost, max_wait)
+    }
+    #[inline]
+    fn pause_for(&self, duration: Duration) {
+        (**self).pause_for(duration);
+    }
+    #[inline]
+    fn paused_for(&self) -> Duration {
+        (**self).paused_for()
+    }
+    #[inline]
+    fn resume(&self) {
+        (**self).resume();
+    }
+    #[inline]
+    fn charge(&self, cost: u32) -> u32 {
+        (**self).charge(cost)
+    }
+}
+
+/// Forwards every method, so `Box<L>` (including `Box<dyn Limiter>`) is a
+/// limiter wherever `L` is.
+impl<L: Limiter + ?Sized> Limiter for std::boxed::Box<L> {
+    #[inline]
+    fn peek(&self, cost: u32) -> Decision {
+        (**self).peek(cost)
+    }
+    #[inline]
+    fn acquire_cost(&self, cost: u32) -> Decision {
+        (**self).acquire_cost(cost)
+    }
+    #[inline]
+    fn available(&self) -> u32 {
+        (**self).available()
+    }
+    #[inline]
+    fn capacity(&self) -> u32 {
+        (**self).capacity()
+    }
+    #[inline]
+    fn refund(&self, cost: u32) {
+        (**self).refund(cost);
+    }
+    #[inline]
+    fn reserve(&self, cost: u32, max_wait: Duration) -> Option<Duration> {
+        (**self).reserve(cost, max_wait)
+    }
+    #[inline]
+    fn pause_for(&self, duration: Duration) {
+        (**self).pause_for(duration);
+    }
+    #[inline]
+    fn paused_for(&self) -> Duration {
+        (**self).paused_for()
+    }
+    #[inline]
+    fn resume(&self) {
+        (**self).resume();
+    }
+    #[inline]
+    fn charge(&self, cost: u32) -> u32 {
+        (**self).charge(cost)
+    }
+}
+
+/// Forwards every method, so a limiter shared behind an `Arc` (including
+/// `Arc<dyn Limiter>`) is a limiter wherever `L` is.
+impl<L: Limiter + ?Sized> Limiter for std::sync::Arc<L> {
+    #[inline]
+    fn peek(&self, cost: u32) -> Decision {
+        (**self).peek(cost)
+    }
+    #[inline]
+    fn acquire_cost(&self, cost: u32) -> Decision {
+        (**self).acquire_cost(cost)
+    }
+    #[inline]
+    fn available(&self) -> u32 {
+        (**self).available()
+    }
+    #[inline]
+    fn capacity(&self) -> u32 {
+        (**self).capacity()
+    }
+    #[inline]
+    fn refund(&self, cost: u32) {
+        (**self).refund(cost);
+    }
+    #[inline]
+    fn reserve(&self, cost: u32, max_wait: Duration) -> Option<Duration> {
+        (**self).reserve(cost, max_wait)
+    }
+    #[inline]
+    fn pause_for(&self, duration: Duration) {
+        (**self).pause_for(duration);
+    }
+    #[inline]
+    fn paused_for(&self) -> Duration {
+        (**self).paused_for()
+    }
+    #[inline]
+    fn resume(&self) {
+        (**self).resume();
+    }
+    #[inline]
+    fn charge(&self, cost: u32) -> u32 {
+        (**self).charge(cost)
     }
 }
 
@@ -253,10 +442,17 @@ where
     D::Acquired
 }
 
-/// Reserves on every constituent; if any cannot reserve within `max_wait`, the
-/// ones already reserved are refunded and nothing is held. Returns the longest
-/// wait.
-pub(crate) fn reserve_all<'a, I>(items: I, max_wait: Duration) -> Option<Duration>
+/// How long a composite may hold one constituent's units while it waits for
+/// the others. A held reservation ties up capacity that may be shared with
+/// other callers (a [`Layered`](crate::Layered) global scope, a
+/// [`HybridBuilder::shared`](crate::HybridBuilder::shared) limiter), so a
+/// composite never holds one for longer than this before the request can
+/// actually go (TN2-002).
+pub(crate) const HOLD_SLACK: Duration = Duration::from_millis(10);
+
+/// Reserves on every constituent, refunding the ones already reserved if any
+/// cannot reserve within `max_wait`. Returns the longest wait.
+fn reserve_each<'a, I>(items: I, max_wait: Duration) -> Option<Duration>
 where
     I: Iterator<Item = (&'a dyn Limiter, u32)> + Clone,
 {
@@ -269,6 +465,32 @@ where
         longest = longest.max(wait);
     }
     Some(longest)
+}
+
+/// A composite's [`Limiter::reserve`]: reserves on every constituent, but only
+/// when no constituent would be held more than [`HOLD_SLACK`] longer than it is
+/// needed — otherwise it takes nothing and returns `None`, and the caller
+/// waits without holding anyone's units. If any constituent cannot reserve
+/// within `max_wait`, the ones already reserved are refunded.
+pub(crate) fn reserve_all<'a, I>(items: I, max_wait: Duration) -> Option<Duration>
+where
+    I: Iterator<Item = (&'a dyn Limiter, u32)> + Clone,
+{
+    let mut longest = Duration::ZERO;
+    let mut shortest = Duration::MAX;
+    for (limiter, cost) in items.clone() {
+        let wait = match limiter.peek(cost) {
+            D::Acquired => Duration::ZERO,
+            D::Retry { after } => after,
+            _ => return None,
+        };
+        longest = longest.max(wait);
+        shortest = shortest.min(wait);
+    }
+    if longest > max_wait || longest.saturating_sub(shortest) > HOLD_SLACK {
+        return None;
+    }
+    reserve_each(items, max_wait)
 }
 
 /// Takes units from `limiter` until at most `remaining` are available, and
@@ -300,23 +522,217 @@ where
     }
 }
 
-/// One step of a composite's waiting acquire: reserve everywhere, or report how
-/// long until every constituent could grant.
+/// What a composite's waiting acquire holds between steps.
 #[cfg(feature = "runtime")]
-pub(crate) fn step_all<'a, I>(items: I, budget: Duration) -> crate::wait::Step
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Held {
+    /// Nothing is held.
+    Nothing,
+    /// The bottleneck constituent at this index holds a reservation.
+    One(usize),
+    /// Every constituent's units are taken.
+    All,
+}
+
+/// The per-wait state of a composite's waiting acquire.
+#[cfg(feature = "runtime")]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Progress {
+    held: Held,
+    /// When the held bottleneck reservation matures (runtime time): a waiter
+    /// woken early (by a `resume` elsewhere) must not take the rest before.
+    due: Option<crate::rt::Instant>,
+    /// How many times a matured bottleneck reservation was given back because
+    /// another constituent turned out to need a longer wait.
+    switches: u8,
+}
+
+#[cfg(feature = "runtime")]
+impl Progress {
+    /// A wait that holds nothing yet.
+    pub(crate) const fn new() -> Self {
+        Self {
+            held: Held::Nothing,
+            due: None,
+            switches: 0,
+        }
+    }
+}
+
+/// After this many bottleneck switches, a composite holds its matured
+/// reservation and reserves the rest too, so two constituents that keep
+/// overtaking each other cannot postpone a waiter indefinitely.
+#[cfg(feature = "runtime")]
+const MAX_SWITCHES: u8 = 4;
+
+/// One step of a composite's waiting acquire.
+///
+/// A request that must clear several constituents waits on the *bottleneck*
+/// only: it peeks every constituent, reserves on the one with the longest wait
+/// (queueing fairly behind that constituent's earlier waiters), and takes
+/// nothing from the others. When that reservation matures it takes the others
+/// at once. If one of them now needs a longer wait, the matured reservation is
+/// given back and the wait moves to the new bottleneck — unless that wait is
+/// within [`HOLD_SLACK`], or the bottleneck has already moved
+/// [`MAX_SWITCHES`] times, in which case the rest are reserved too.
+///
+/// So a fast constituent — typically a scope shared with other callers — is
+/// charged only when the request is (nearly) ready to go, never minutes ahead:
+/// one caller queued on its own slow scope cannot drain a shared one and starve
+/// everyone else (TN2-002).
+#[cfg(feature = "runtime")]
+pub(crate) fn step_all<'a, I>(
+    items: I,
+    budget: Duration,
+    progress: &mut Progress,
+) -> crate::wait::Step
 where
     I: Iterator<Item = (&'a dyn Limiter, u32)> + Clone,
 {
     use crate::wait::Step;
-    if let Some(wait) = reserve_all(items.clone(), budget) {
-        return Step::Granted(wait);
+    if let Held::One(bottleneck) = progress.held {
+        if let Some(due) = progress.due {
+            let left = due.saturating_duration_since(crate::rt::Instant::now());
+            if !left.is_zero() {
+                return Step::Holding(left);
+            }
+        }
+        let rest = || {
+            items
+                .clone()
+                .enumerate()
+                .filter(move |&(index, _)| index != bottleneck)
+                .map(|(_, item)| item)
+        };
+        match peek_all(rest()) {
+            D::Acquired => {
+                if acquire_all(rest()).is_acquired() {
+                    progress.held = Held::All;
+                    return Step::Granted(Duration::ZERO);
+                }
+                // A concurrent caller won a race on another constituent: keep
+                // the bottleneck's units and try again in a moment.
+                return Step::Holding(Duration::ZERO);
+            }
+            D::Retry { after } if after <= HOLD_SLACK || progress.switches >= MAX_SWITCHES => {
+                if let Some(wait) = reserve_each(rest(), budget) {
+                    progress.held = Held::All;
+                    return Step::Granted(wait);
+                }
+            }
+            D::Retry { .. } => {}
+            _ => {
+                release_all(items, progress);
+                return Step::Never;
+            }
+        }
+        // Another constituent became the bottleneck: give the matured units
+        // back rather than hold them while waiting on it.
+        release_all(items.clone(), progress);
+        progress.switches = progress.switches.saturating_add(1);
     }
-    match peek_all(items) {
-        D::Impossible => Step::Never,
-        D::Retry { after } => Step::Retry(after),
-        // Every constituent reads grantable now: a race with another caller
-        // (or a constituent without native reservations). Ask again.
-        _ => Step::Retry(Duration::ZERO),
+
+    let mut bottleneck: Option<(usize, Duration)> = None;
+    for (index, (limiter, cost)) in items.clone().enumerate() {
+        match limiter.peek(cost) {
+            D::Acquired => {}
+            D::Retry { after } => {
+                if bottleneck.is_none_or(|(_, longest)| after > longest) {
+                    bottleneck = Some((index, after));
+                }
+            }
+            _ => return Step::Never,
+        }
+    }
+    let Some((index, wait)) = bottleneck else {
+        // Every constituent would grant now: take them all at once.
+        return match acquire_all(items) {
+            D::Acquired => {
+                progress.held = Held::All;
+                Step::Granted(Duration::ZERO)
+            }
+            D::Impossible => Step::Never,
+            // A concurrent caller won a race between the peek and the commit.
+            _ => Step::Retry(Duration::ZERO),
+        };
+    };
+    if wait > budget {
+        return Step::Retry(wait);
+    }
+    match items.clone().nth(index) {
+        Some((limiter, cost)) => match limiter.reserve(cost, budget) {
+            Some(wait) => {
+                progress.held = Held::One(index);
+                progress.due = crate::rt::Instant::now().checked_add(wait);
+                Step::Holding(wait)
+            }
+            // The constituent cannot queue (no native reservations, or it is
+            // paused): sleep until it can grant and look again.
+            None => Step::Retry(wait),
+        },
+        None => Step::Retry(wait),
+    }
+}
+
+/// Gives back whatever a composite's waiting acquire holds.
+#[cfg(feature = "runtime")]
+pub(crate) fn release_all<'a, I>(items: I, progress: &mut Progress)
+where
+    I: Iterator<Item = (&'a dyn Limiter, u32)> + Clone,
+{
+    match progress.held {
+        Held::Nothing => {}
+        Held::One(index) => {
+            if let Some((limiter, cost)) = items.clone().nth(index) {
+                limiter.refund(cost);
+            }
+        }
+        Held::All => refund_all(items),
+    }
+    progress.held = Held::Nothing;
+    progress.due = None;
+}
+
+/// The longest remaining pause among the constituents.
+#[cfg(feature = "runtime")]
+pub(crate) fn paused_all<'a, I>(items: I) -> Duration
+where
+    I: Iterator<Item = (&'a dyn Limiter, u32)>,
+{
+    items
+        .map(|(limiter, _)| limiter.paused_for())
+        .max()
+        .unwrap_or(Duration::ZERO)
+}
+
+/// A keyed scope bound to one key, so a [`Layered`](crate::Layered) scope
+/// takes part in the composite algorithm like any other constituent.
+#[cfg(feature = "runtime")]
+pub(crate) struct KeyScope<'a, K> {
+    pub(crate) scope: &'a dyn KeyedLimiter<K>,
+    pub(crate) key: &'a K,
+}
+
+#[cfg(feature = "runtime")]
+impl<K: Sync> Limiter for KeyScope<'_, K> {
+    fn peek(&self, cost: u32) -> Decision {
+        self.scope.peek(self.key, cost)
+    }
+    fn acquire_cost(&self, cost: u32) -> Decision {
+        self.scope.acquire_cost(self.key, cost)
+    }
+    /// Not tracked per key here; the composite algorithm never reads it.
+    fn available(&self) -> u32 {
+        0
+    }
+    fn capacity(&self) -> u32 {
+        self.scope.capacity()
+    }
+    fn refund(&self, cost: u32) {
+        self.scope.refund(self.key, cost);
+    }
+    fn reserve(&self, cost: u32, max_wait: Duration) -> Option<Duration> {
+        self.scope.reserve(self.key, cost, max_wait)
     }
 }
 
@@ -358,14 +774,19 @@ mod tests {
         }
 
         fn acquire_cost(&self, cost: u32) -> Decision {
-            match self
-                .left
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
-                    left.checked_sub(cost)
-                }) {
-                Ok(_) => Decision::Acquired,
-                Err(_) => self.peek(cost),
+            let mut left = self.left.load(Ordering::Relaxed);
+            while let Some(rest) = left.checked_sub(cost) {
+                match self.left.compare_exchange_weak(
+                    left,
+                    rest,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => return Decision::Acquired,
+                    Err(actual) => left = actual,
+                }
             }
+            self.peek(cost)
         }
 
         fn available(&self) -> u32 {

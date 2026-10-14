@@ -707,14 +707,12 @@ where
 /// assert_eq!(queue.overflow(), Overflow::DropLowestPriority);
 /// assert_eq!(queue.name(), Some("crawler"));
 /// ```
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 #[must_use]
 pub struct QueueBuilder {
     capacity: usize,
     overflow: Overflow,
-    /// A static name, so the builder stays `Copy`; name an instance with an
-    /// owned string through its `with_name`.
-    label: Option<&'static str>,
+    label: Label,
 }
 
 impl Default for QueueBuilder {
@@ -730,7 +728,7 @@ impl QueueBuilder {
         Self {
             capacity: 1024,
             overflow: Overflow::Reject,
-            label: None,
+            label: Label::none(),
         }
     }
 
@@ -747,8 +745,8 @@ impl QueueBuilder {
     }
 
     /// Names the queue for metrics and events.
-    pub fn name(mut self, name: &'static str) -> Self {
-        self.label = Some(name);
+    pub fn name(mut self, name: impl Into<Cow<'static, str>>) -> Self {
+        self.label = Label::new(name);
         self
     }
 
@@ -764,7 +762,7 @@ impl QueueBuilder {
             self.capacity,
             self.overflow,
             SystemClock::new(),
-            self.label.map_or_else(Label::none, Label::new),
+            self.label,
         )
     }
 }

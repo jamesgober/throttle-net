@@ -216,7 +216,7 @@ pub use crate::decision::Decision;
 #[cfg(feature = "std")]
 pub use crate::error::ThrottleError;
 #[cfg(feature = "std")]
-pub use crate::eviction::{DEFAULT_MAX_KEYS, Eviction};
+pub use crate::eviction::{DEFAULT_MAX_KEYS, Eviction, WhenFull};
 #[cfg(feature = "std")]
 pub use crate::hybrid::{Hybrid, HybridBuilder};
 #[cfg(feature = "std")]

@@ -21,25 +21,29 @@
 //! Memory is bounded by eviction that is lazy, per shard, and does a fixed
 //! amount of work, under the write lock an insert already holds:
 //!
-//! - **Capacity — CLOCK (second chance) over recovered keys only.** Every
-//!   access sets the entry's *referenced* bit; a new key starts with it clear.
-//!   When a full shard needs room, a hand sweeps at most [`CLOCK_SCAN`] slots
-//!   looking for an entry that can go **losslessly**: idle past the TTL, or with
-//!   a full bucket (a full bucket recreated later is the same bucket, and a
-//!   recreated key starts no fuller than its configured initial fill). Among
-//!   those, one whose referenced bit was already clear is preferred; bits are
-//!   cleared as the hand passes. A key whose bucket has **not recovered** is
-//!   never evicted: forgetting it would hand it a fresh allowance and let a
-//!   key flood bypass the per-key limit. If the scan finds no recovered entry,
-//!   the *new* key is refused instead — it fails closed with the wait until the
-//!   soonest scanned entry recovers — so an insert never costs more than the
-//!   scan and the limit always holds.
+//! - **Capacity — CLOCK (second chance), recovered keys first.** Every access
+//!   sets the entry's *referenced* bit; a new key starts with it clear. When a
+//!   full shard needs room, a hand sweeps at most [`CLOCK_SCAN`] slots looking
+//!   for an entry that can go **losslessly**: one whose bucket is full (a full
+//!   bucket recreated later is the same bucket, and a recreated key starts no
+//!   fuller than its configured initial fill). Among those, one whose
+//!   referenced bit was already clear is preferred; bits are cleared as the
+//!   hand passes.
+//! - **The debt ledger.** If no scanned entry has recovered, a *limited* entry
+//!   (unreferenced, if one was scanned) is evicted, but its debt — the instant
+//!   its bucket would be full again — is first written to the shard's ledger:
+//!   16 bytes keyed by the key's hash instead of the whole entry. A key
+//!   re-created while its debt is in the ledger starts with that debt, so
+//!   forgetting its entry hands it nothing. The ledger holds as many debts as
+//!   the shard holds keys; settled debts are dropped as the inserts pass. When
+//!   the ledger is full of unsettled debts too, [`WhenFull`] decides: refuse
+//!   the new key with the wait until room is expected (the default — the
+//!   limit always holds), or forget the debt that settles soonest.
 //! - **Idle TTL — incremental sweep.** Each insert also examines the next
-//!   [`TTL_SWEEP`] slots from a second cursor and reclaims any idle past the
-//!   TTL, so idle state drains continuously rather than in one stop-the-world
-//!   pass. The effective TTL is never shorter than the bucket's time to refill
-//!   completely, so an expired key is always full: reclaiming it can never hand
-//!   a still-limited key a fresh allowance.
+//!   [`TTL_SWEEP`] slots from a second cursor and reclaims any entry idle past
+//!   the TTL **whose bucket has recovered**, so idle state drains continuously
+//!   rather than in one stop-the-world pass. An idle key still in debt (for
+//!   example behind its own reservations) waits until it has recovered.
 //!
 //! Removal is a swap-remove plus two table updates: O(1). The remaining
 //! shard-wide pass is amortized growth (the slot vector doubling, the index
@@ -56,7 +60,7 @@ use ahash::RandomState;
 use better_bucket::{BucketConfig, BucketCore};
 use hashbrown::HashTable;
 
-use crate::eviction::Eviction;
+use crate::eviction::{Eviction, WhenFull};
 
 /// The hash bits that pick a shard. `hashbrown` takes a bucket index from the
 /// low bits and a 7-bit tag from the top seven (57..64), so bits 40..56 never
@@ -92,6 +96,10 @@ pub(crate) const CLOCK_SCAN: usize = 32;
 
 /// The slots the idle sweep examines per insert.
 pub(crate) const TTL_SWEEP: usize = 8;
+
+/// The ledger entries examined per insert, for a settled debt to drop or
+/// replace.
+pub(crate) const LEDGER_SCAN: usize = 8;
 
 /// The shortest wait suggested to a key refused because its shard is full of
 /// unrecovered keys, so a retry loop cannot spin.
@@ -136,18 +144,190 @@ impl Entry {
 
     /// Whether the entry has been idle for at least `ttl_ms`.
     #[inline]
-    fn is_expired(&self, now_ms: u64, ttl_ms: Option<u64>) -> bool {
-        ttl_ms.is_some_and(|ttl| {
-            now_ms.saturating_sub(self.last_seen_ms.load(Ordering::Relaxed)) >= ttl
-        })
+    fn is_expired(&self, now_ms: u64, ttl_ms: u64) -> bool {
+        now_ms.saturating_sub(self.last_seen_ms.load(Ordering::Relaxed)) >= ttl_ms
     }
 
-    /// Whether evicting the entry loses nothing: idle past the TTL, or a full
-    /// bucket (which a later re-creation reproduces exactly, or more strictly
-    /// when the configured initial fill is below the capacity).
+    /// Whether evicting the entry loses nothing: its bucket is full, which a
+    /// later re-creation reproduces exactly (or more strictly, when the
+    /// configured initial fill is below the capacity). Being idle is not
+    /// enough: a bucket holding reservations is in debt however long ago it
+    /// was last touched (TN2-007).
     #[inline]
-    fn is_lossless(&self, now: Duration, now_ms: u64, ttl_ms: Option<u64>) -> bool {
-        self.is_expired(now_ms, ttl_ms) || self.bucket.available_at(now) >= self.bucket.capacity()
+    fn is_lossless(&self, now: Duration) -> bool {
+        self.bucket.available_at(now) >= self.bucket.capacity()
+    }
+
+    /// How long until the bucket is full again (`Duration::MAX` if never).
+    #[inline]
+    fn recovers_in(&self, now: Duration) -> Duration {
+        let capacity = self.bucket.capacity();
+        self.bucket
+            .time_until_at(capacity, now)
+            .unwrap_or(Duration::MAX)
+    }
+}
+
+/// A forgotten limited key's debt: when its bucket would be full again.
+#[derive(Clone, Copy)]
+struct Debt {
+    hash: u64,
+    settles_at: Duration,
+}
+
+/// The debts of limited keys evicted to make room, keyed by key hash. A key
+/// re-created while its debt is here starts with that debt.
+struct Ledger {
+    index: HashTable<u32>,
+    debts: Vec<Debt>,
+    /// The next entry examined for a settled debt.
+    cursor: usize,
+}
+
+impl Ledger {
+    fn new() -> Self {
+        Self {
+            index: HashTable::new(),
+            debts: Vec::new(),
+            cursor: 0,
+        }
+    }
+
+    fn position(&self, hash: u64) -> Option<usize> {
+        let debts = &self.debts;
+        self.index
+            .find(hash, |&pos| {
+                debts
+                    .get(pos as usize)
+                    .is_some_and(|debt| debt.hash == hash)
+            })
+            .map(|&pos| pos as usize)
+    }
+
+    /// Removes the debt at `pos` by swap-remove. O(1).
+    fn remove_at(&mut self, pos: usize) -> Option<Debt> {
+        let last = self.debts.len().checked_sub(1)?;
+        let hash = self.debts.get(pos)?.hash;
+        if let Ok(found) = self.index.find_entry(hash, |&p| p as usize == pos) {
+            let (_pos, _vacant) = found.remove();
+        }
+        if pos != last {
+            if let Some(moved_hash) = self.debts.get(last).map(|debt| debt.hash) {
+                if let Some(target) = self.index.find_mut(moved_hash, |&p| p as usize == last) {
+                    *target = u32::try_from(pos).unwrap_or(u32::MAX);
+                }
+            }
+        }
+        Some(self.debts.swap_remove(pos))
+    }
+
+    /// Takes the debt recorded for `hash`, if any.
+    fn take(&mut self, hash: u64) -> Option<Duration> {
+        let pos = self.position(hash)?;
+        self.remove_at(pos).map(|debt| debt.settles_at)
+    }
+
+    /// Records a debt, making room among the next [`LEDGER_SCAN`] entries when
+    /// the ledger already holds `cap`: a settled debt is dropped; failing that,
+    /// with `forget` set, the debt settling soonest is forgotten. Otherwise the
+    /// debt is not recorded and the soonest settle time scanned is returned.
+    fn record(
+        &mut self,
+        debt: Debt,
+        now: Duration,
+        cap: usize,
+        forget: bool,
+    ) -> Result<(), Duration> {
+        if let Some(pos) = self.position(debt.hash) {
+            // A hash collision with a debt already held: keep the later one.
+            if let Some(held) = self.debts.get_mut(pos) {
+                held.settles_at = held.settles_at.max(debt.settles_at);
+            }
+            return Ok(());
+        }
+        if self.debts.len() >= cap {
+            let len = self.debts.len();
+            let mut soonest: Option<(usize, Duration)> = None;
+            for _ in 0..LEDGER_SCAN.min(len) {
+                if self.cursor >= len {
+                    self.cursor = 0;
+                }
+                if let Some(held) = self.debts.get(self.cursor) {
+                    if held.settles_at <= now {
+                        soonest = Some((self.cursor, held.settles_at));
+                        break;
+                    }
+                    if soonest.is_none_or(|(_, at)| held.settles_at < at) {
+                        soonest = Some((self.cursor, held.settles_at));
+                    }
+                }
+                self.cursor += 1;
+            }
+            match soonest {
+                Some((pos, at)) if at <= now || forget => {
+                    let _dropped = self.remove_at(pos);
+                }
+                Some((_, at)) => return Err(at.saturating_sub(now)),
+                None => return Err(Duration::MAX),
+            }
+        }
+        let pos = u32::try_from(self.debts.len()).unwrap_or(u32::MAX);
+        let Self { index, debts, .. } = self;
+        debts.push(debt);
+        let _bucket = index.insert_unique(debt.hash, pos, |&p| {
+            debts.get(p as usize).map_or(0, |held| held.hash)
+        });
+        Ok(())
+    }
+
+    /// Drops settled debts among the next `budget` entries.
+    fn sweep(&mut self, now: Duration, budget: usize) {
+        for _ in 0..budget {
+            let len = self.debts.len();
+            if len == 0 {
+                break;
+            }
+            if self.cursor >= len {
+                self.cursor = 0;
+            }
+            if self
+                .debts
+                .get(self.cursor)
+                .is_some_and(|debt| debt.settles_at <= now)
+            {
+                let _settled = self.remove_at(self.cursor);
+            } else {
+                self.cursor += 1;
+            }
+        }
+    }
+}
+
+/// Puts a freshly created bucket into the debt a forgotten entry left: as
+/// though it had been kept, it will be full again at `settles_at`. Rounds the
+/// missing units up, so a restored key is never fuller than the original.
+fn restore_debt(bucket: &BucketCore, config: BucketConfig, now: Duration, settles_at: Duration) {
+    let remaining = settles_at.saturating_sub(now);
+    if remaining.is_zero() {
+        return;
+    }
+    let period = config.refill_period().as_nanos().max(1);
+    let missing = (remaining.as_nanos() * u128::from(config.refill_amount())).div_ceil(period);
+    let capacity = config.capacity();
+    let available = bucket.available_at(now);
+    // What should be left now: `capacity - missing`, or debt beyond empty.
+    let keep = u128::from(capacity).saturating_sub(missing);
+    let keep = u32::try_from(keep).unwrap_or(capacity);
+    if available > keep {
+        let _taken = bucket.acquire_up_to_at(available - keep, now);
+    }
+    let mut debt = missing.saturating_sub(u128::from(capacity));
+    while debt > 0 && capacity > 0 {
+        let chunk = u32::try_from(debt.min(u128::from(capacity))).unwrap_or(capacity);
+        if bucket.reserve_at(chunk, Duration::MAX, now).is_none() {
+            break;
+        }
+        debt -= u128::from(chunk);
     }
 }
 
@@ -159,8 +339,8 @@ struct Slot<K> {
     entry: Entry,
 }
 
-/// A shard's contents: dense slots, an index from key hash to slot, and the two
-/// eviction cursors.
+/// A shard's contents: dense slots, an index from key hash to slot, the two
+/// eviction cursors, and the debt ledger.
 struct ShardMap<K> {
     index: HashTable<u32>,
     slots: Vec<Slot<K>>,
@@ -168,6 +348,8 @@ struct ShardMap<K> {
     hand: usize,
     /// The next slot the idle sweep examines.
     sweep: usize,
+    /// Debts of limited keys evicted to make room.
+    ledger: Ledger,
 }
 
 impl<K: Eq> ShardMap<K> {
@@ -177,6 +359,7 @@ impl<K: Eq> ShardMap<K> {
             slots: Vec::new(),
             hand: 0,
             sweep: 0,
+            ledger: Ledger::new(),
         }
     }
 
@@ -232,9 +415,9 @@ impl<K: Eq> ShardMap<K> {
         Some(self.slots.swap_remove(pos))
     }
 
-    /// Reclaims idle-expired entries among the next `budget` slots from the
-    /// sweep cursor. Returns how many were reclaimed.
-    fn sweep_idle(&mut self, now_ms: u64, ttl_ms: u64, budget: usize) -> usize {
+    /// Reclaims idle-expired, recovered entries among the next `budget` slots
+    /// from the sweep cursor. Returns how many were reclaimed.
+    fn sweep_idle(&mut self, now: Duration, now_ms: u64, ttl_ms: u64, budget: usize) -> usize {
         let mut reclaimed = 0;
         for _ in 0..budget {
             let len = self.slots.len();
@@ -244,10 +427,9 @@ impl<K: Eq> ShardMap<K> {
             if self.sweep >= len {
                 self.sweep = 0;
             }
-            let expired = self
-                .slots
-                .get(self.sweep)
-                .is_some_and(|slot| slot.entry.is_expired(now_ms, Some(ttl_ms)));
+            let expired = self.slots.get(self.sweep).is_some_and(|slot| {
+                slot.entry.is_expired(now_ms, ttl_ms) && slot.entry.is_lossless(now)
+            });
             if expired {
                 // The swap moved an unexamined slot here; look at it next.
                 let _reclaimed = self.remove_at(self.sweep);
@@ -259,15 +441,19 @@ impl<K: Eq> ShardMap<K> {
         reclaimed
     }
 
-    /// Evicts one recovered entry within [`CLOCK_SCAN`] of the hand — an
-    /// unreferenced one if there is one, else the first recovered one seen.
-    /// When none of the scanned entries has recovered, evicts nothing and
-    /// returns the wait until the soonest of them will have.
+    /// Evicts one entry within [`CLOCK_SCAN`] of the hand.
+    ///
+    /// A recovered entry goes first — an unreferenced one if there is one,
+    /// else the first recovered one seen. If none of the scanned entries has
+    /// recovered, a limited one (unreferenced, if one was scanned) goes, but
+    /// only once its debt is in the ledger. When the ledger has no room either
+    /// (and `forget` is off), evicts nothing and returns the wait until room is
+    /// expected.
     fn evict_one(
         &mut self,
         now: Duration,
-        now_ms: u64,
-        ttl_ms: Option<u64>,
+        ledger_cap: usize,
+        forget: bool,
     ) -> Result<(), Duration> {
         let len = self.slots.len();
         if len == 0 {
@@ -275,6 +461,7 @@ impl<K: Eq> ShardMap<K> {
         }
         let mut victim = None;
         let mut first_recovered = None;
+        let mut limited: Option<(usize, bool, Duration)> = None;
         let mut soonest = Duration::MAX;
         for _ in 0..CLOCK_SCAN.min(len) {
             if self.hand >= len {
@@ -285,7 +472,7 @@ impl<K: Eq> ShardMap<K> {
                 // Second chance: an entry seen since the hand last passed keeps
                 // its place this time round.
                 let referenced = entry.referenced.swap(false, Ordering::Relaxed);
-                if entry.is_lossless(now, now_ms, ttl_ms) {
+                if entry.is_lossless(now) {
                     if !referenced {
                         victim = Some(self.hand);
                         break;
@@ -294,18 +481,33 @@ impl<K: Eq> ShardMap<K> {
                         first_recovered = Some(self.hand);
                     }
                 } else {
-                    let capacity = entry.bucket.capacity();
-                    let recovers_in = entry
-                        .bucket
-                        .time_until_at(capacity, now)
-                        .unwrap_or(Duration::MAX);
+                    let recovers_in = entry.recovers_in(now);
                     soonest = soonest.min(recovers_in);
+                    // Prefer moving an unreferenced (not recently used) key.
+                    if limited.is_none_or(|(_, was_referenced, _)| was_referenced && !referenced) {
+                        limited = Some((self.hand, referenced, recovers_in));
+                    }
                 }
             }
             self.hand += 1;
         }
-        let Some(pos) = victim.or(first_recovered) else {
-            return Err(soonest.max(MIN_REFUSAL_WAIT));
+        let pos = if let Some(pos) = victim.or(first_recovered) {
+            pos
+        } else {
+            let Some((pos, _, recovers_in)) = limited else {
+                return Err(soonest.max(MIN_REFUSAL_WAIT));
+            };
+            let Some(hash) = self.slots.get(pos).map(|slot| slot.hash) else {
+                return Err(soonest.max(MIN_REFUSAL_WAIT));
+            };
+            let debt = Debt {
+                hash,
+                settles_at: now.saturating_add(recovers_in),
+            };
+            if let Err(ledger_wait) = self.ledger.record(debt, now, ledger_cap, forget) {
+                return Err(soonest.min(ledger_wait).max(MIN_REFUSAL_WAIT));
+            }
+            pos
         };
         let _evicted = self.remove_at(pos);
         // The swap moved the newest slot into `pos`; step past it so a key that
@@ -335,6 +537,8 @@ pub(crate) struct Store<K> {
     per_shard_cap: usize,
     /// Effective idle expiry in milliseconds, or `None` to never expire.
     idle_ttl_ms: Option<u64>,
+    /// Whether a full ledger forgets a debt rather than refuse a new key.
+    forget_debt: bool,
 }
 
 impl<K: Eq + Hash> Store<K> {
@@ -374,6 +578,7 @@ impl<K: Eq + Hash> Store<K> {
             hasher: RandomState::new(),
             per_shard_cap,
             idle_ttl_ms,
+            forget_debt: matches!(eviction.when_full(), WhenFull::ForgetDebt),
         }
     }
 
@@ -430,8 +635,21 @@ impl<K: Eq + Hash> Store<K> {
             entry.touch(now_ms, track_idle);
             return Ok(op(&entry.bucket));
         }
-        self.make_room(&mut map, now, now_ms)?;
+        // A key forgotten while limited comes back in its debt. Take the debt
+        // first, so the key's own ledger slot is free for the room it needs.
+        let owed = map.ledger.take(hash);
+        if let Err(wait) = self.make_room(&mut map, now, now_ms) {
+            if let Some(settles_at) = owed {
+                let _kept = map
+                    .ledger
+                    .record(Debt { hash, settles_at }, now, usize::MAX, false);
+            }
+            return Err(wait);
+        }
         let entry = Entry::new(BucketCore::new(config, now), now_ms);
+        if let Some(settles_at) = owed {
+            restore_debt(&entry.bucket, config, now, settles_at);
+        }
         let result = op(&entry.bucket);
         map.insert(hash, key.clone(), entry);
         Ok(result)
@@ -447,25 +665,39 @@ impl<K: Eq + Hash> Store<K> {
     }
 
     /// Makes room in a shard about to receive a new key: an incremental idle
-    /// sweep, then one eviction if the shard is still full. Bounded work.
+    /// sweep (and ledger sweep), then one eviction if the shard is still full.
+    /// Bounded work.
     fn make_room(&self, map: &mut ShardMap<K>, now: Duration, now_ms: u64) -> Result<(), Duration> {
         if let Some(ttl_ms) = self.idle_ttl_ms {
-            let _reclaimed = map.sweep_idle(now_ms, ttl_ms, TTL_SWEEP);
+            let _reclaimed = map.sweep_idle(now, now_ms, ttl_ms, TTL_SWEEP);
         }
+        map.ledger.sweep(now, LEDGER_SCAN);
         if map.slots.len() >= self.per_shard_cap {
-            map.evict_one(now, now_ms, self.idle_ttl_ms)?;
+            map.evict_one(now, self.per_shard_cap, self.forget_debt)?;
         }
         Ok(())
     }
 
-    /// Forgets `key`. Returns whether it had state.
+    /// Forgets `key` and any debt it left in the ledger. Returns whether it
+    /// had state.
     pub(crate) fn remove(&self, key: &K) -> bool {
         let hash = self.hasher.hash_one(key);
         let mut map = write(&self.shard(hash).map);
+        let debt = map.ledger.take(hash).is_some();
         match map.position(hash, key) {
-            Some(pos) => map.remove_at(pos).is_some(),
-            None => false,
+            Some(pos) => map.remove_at(pos).is_some() || debt,
+            None => debt,
         }
+    }
+
+    /// The number of forgotten limited keys whose debt is still remembered
+    /// (test support).
+    #[cfg(test)]
+    pub(crate) fn ledger_len(&self) -> usize {
+        self.shards
+            .iter()
+            .map(|shard| read(&shard.map).ledger.debts.len())
+            .sum()
     }
 
     /// Forgets every key.
@@ -660,14 +892,115 @@ mod tests {
         for key in 0..cap as u64 {
             assert!(take(&store, key, ms(0), 1), "touch every key");
         }
-        // Every key is still limited: the newcomer is refused (bounded work,
-        // nothing evicted) with the wait until one recovers.
+        // Every key is still limited: newcomers move limited keys' debts to the
+        // ledger, until the ledger is full too.
+        for key in 10_000..10_000 + cap as u64 {
+            assert!(take(&store, key, ms(0), 1), "room through the ledger");
+        }
+        assert_eq!(store.len(), cap);
+        assert_eq!(store.ledger_len(), cap);
+        // Now the newcomer is refused (bounded work, nothing evicted) with the
+        // wait until a key or a debt recovers.
         let refused = store.with_or_insert(&9_999, ms(0), config(10), |_| ());
-        assert_eq!(refused, Err(Duration::from_millis(200)));
+        assert_eq!(refused, Err(Duration::from_millis(100)));
         assert_eq!(store.len(), cap);
         // Once they have recovered, the newcomer gets a slot.
         assert!(take(&store, 9_999, ms(200), 1));
         assert_eq!(store.len(), cap);
+    }
+
+    #[test]
+    fn test_a_forgotten_limited_key_comes_back_in_debt() {
+        let store = Store::new(1, Eviction::capacity(1), Duration::ZERO);
+        assert!(take(&store, 1, ms(0), 10)); // drained: full again at 1s
+        assert!(take(&store, 2, ms(0), 1)); // evicts key 1 into the ledger
+        assert_eq!(store.with_existing(&1, |_| ()), None);
+        assert_eq!(store.ledger_len(), 1);
+        // Back at 500ms: it owes what it would have owed had it been kept.
+        assert!(take(&store, 1, ms(500), 5));
+        assert!(!take(&store, 1, ms(500), 1), "no fresh allowance");
+        // Key 2 had recovered by then, so it went without a trace.
+        assert_eq!(store.ledger_len(), 0);
+    }
+
+    #[test]
+    fn test_debt_beyond_empty_is_restored_as_a_reservation() {
+        let store = Store::new(1, Eviction::capacity(1), Duration::ZERO);
+        // Drain key 1 and queue 20 more tokens behind it: full again at 3s.
+        assert!(take(&store, 1, ms(0), 10));
+        let reserved = store
+            .with_or_insert(&1, ms(0), config(10), |b| {
+                (
+                    b.reserve_at(10, Duration::MAX, ms(0)),
+                    b.reserve_at(10, Duration::MAX, ms(0)),
+                )
+            })
+            .unwrap();
+        assert_eq!(reserved, (Some(ms(1_000)), Some(ms(2_000))));
+        assert!(take(&store, 2, ms(1_100), 1)); // forgets key 1 (in debt)
+        // At 1.1s the original key would have nothing until its reservations
+        // were paid off at 2s; the restored one agrees.
+        assert!(!take(&store, 1, ms(1_100), 1));
+        let wait = store
+            .with_existing(&1, |b| b.time_until_at(1, ms(1_100)))
+            .flatten();
+        assert!(wait >= Some(ms(900)), "{wait:?}");
+    }
+
+    #[test]
+    fn test_forget_debt_policy_never_refuses() {
+        let store = Store::new(
+            1,
+            Eviction::capacity(4).with_when_full(crate::eviction::WhenFull::ForgetDebt),
+            Duration::ZERO,
+        );
+        for key in 0..100u64 {
+            assert!(take(&store, key, ms(0), 10), "admitted {key}");
+        }
+        assert_eq!(store.len(), 4);
+        assert_eq!(store.ledger_len(), 4);
+    }
+
+    #[test]
+    fn test_settled_debts_are_swept_and_removal_clears_a_debt() {
+        let store = Store::new(1, Eviction::capacity(1), Duration::ZERO);
+        assert!(take(&store, 1, ms(0), 10));
+        assert!(take(&store, 2, ms(0), 10)); // key 1's debt to the ledger
+        assert_eq!(store.ledger_len(), 1);
+        assert!(store.remove(&1), "the remembered debt counts as state");
+        assert_eq!(store.ledger_len(), 0);
+        assert!(take(&store, 3, ms(0), 10)); // key 2's debt to the ledger
+        assert_eq!(store.ledger_len(), 1);
+        assert!(take(&store, 4, ms(5_000), 1)); // key 2 settled long ago
+        assert_eq!(store.ledger_len(), 0, "settled debts are dropped");
+    }
+
+    /// TN2-007: an idle key whose bucket is still in reservation debt is not
+    /// reclaimed by the TTL sweep (the 1.1 candidate recreated it full).
+    #[test]
+    fn test_ttl_never_reclaims_a_key_in_debt() {
+        let store = Store::new(
+            1,
+            Eviction::new(16, Duration::from_millis(1)),
+            Duration::from_secs(1),
+        );
+        assert!(take(&store, 0, ms(0), 10));
+        let _ = store.with_or_insert(&0, ms(0), config(10), |b| {
+            (
+                b.reserve_at(10, Duration::MAX, ms(0)),
+                b.reserve_at(10, Duration::MAX, ms(0)),
+            )
+        });
+        // Idle past the (raised) TTL, but its reservations run until 2s.
+        assert!(take(&store, 1, ms(1_100), 1));
+        assert!(
+            store.with_existing(&0, |_| ()).is_some(),
+            "kept while in debt"
+        );
+        assert!(!take(&store, 0, ms(1_100), 1));
+        // Once recovered and idle, it goes.
+        assert!(take(&store, 2, ms(10_000), 1));
+        assert!(store.with_existing(&0, |_| ()).is_none());
     }
 
     #[test]
@@ -680,8 +1013,11 @@ mod tests {
         for key in 1..10_000u64 {
             let _ = take(&store, key, ms(0), 10);
         }
-        assert_eq!(store.with_existing(&0, |b| b.available_at(ms(0))), Some(0));
         assert!(store.len() <= 8);
+        assert!(store.ledger_len() <= 8);
+        // Whether key 0 kept its slot or only its debt, it is still limited.
+        assert!(!take(&store, 0, ms(0), 1));
+        assert!(!take(&store, 0, ms(500), 6));
     }
 
     #[test]

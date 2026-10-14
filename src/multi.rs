@@ -76,11 +76,13 @@ impl Table {
 /// names charge one budget — for a provider that meters input and output
 /// tokens against one combined limit.
 ///
-/// A name that matches no dimension or alias is ignored by default, which
-/// makes a typo charge nothing. A **strict** limiter
-/// ([`MultiLimiterBuilder::strict`]) refuses such calls instead —
-/// [`Decision::Impossible`] from the non-waiting methods and
-/// [`ThrottleError::UnknownDimension`] from the waiting ones. Prefer strict.
+/// A name that matches no dimension or alias is refused by default — a typo
+/// must not charge nothing and admit the call: [`Decision::Impossible`] from
+/// the non-waiting methods and [`ThrottleError::UnknownDimension`] from the
+/// waiting ones. A **lenient** limiter
+/// ([`MultiLimiterBuilder::strict`]`(false)`, the 1.x default) ignores unknown
+/// names instead, for callers that deliberately pass one cost list to
+/// limiters with different dimensions.
 ///
 /// Build one with [`MultiLimiter::builder`].
 ///
@@ -95,7 +97,6 @@ impl Table {
 ///     .dimension("requests", Throttle::per_minute(60))
 ///     .dimension("input_tokens", Throttle::per_minute(100_000))
 ///     .dimension("output_tokens", Throttle::per_minute(20_000))
-///     .strict(true)
 ///     .build();
 ///
 /// // A call billed at 1 request, 1500 input tokens, 200 output tokens.
@@ -332,10 +333,12 @@ impl MultiLimiter {
             let reserved = self.table.cost_for(&dimension.name, estimated);
             let used = self.table.cost_for(&dimension.name, actual);
             let limiter = dimension.limiter.as_ref();
-            if used < reserved {
-                limiter.refund(reserved - used);
-            } else if used > reserved {
-                charge(limiter, used - reserved);
+            match used.cmp(&reserved) {
+                core::cmp::Ordering::Less => limiter.refund(reserved - used),
+                core::cmp::Ordering::Greater => {
+                    let _uncharged = limiter.charge(used - reserved);
+                }
+                core::cmp::Ordering::Equal => {}
             }
         }
     }
@@ -352,6 +355,25 @@ impl MultiLimiter {
         for dimension in &*self.table.dimensions {
             dimension.limiter.pause_for(duration);
         }
+    }
+
+    /// Lifts every dimension's pause (see [`Limiter::resume`]).
+    pub fn resume(&self) {
+        for dimension in &*self.table.dimensions {
+            dimension.limiter.resume();
+        }
+    }
+
+    /// The longest remaining pause among the dimensions (`Duration::ZERO` when
+    /// none is paused).
+    #[must_use]
+    pub fn paused_for(&self) -> Duration {
+        self.table
+            .dimensions
+            .iter()
+            .map(|d| d.limiter.paused_for())
+            .max()
+            .unwrap_or(Duration::ZERO)
     }
 
     /// Takes units from `dimension` until at most `remaining` are available,
@@ -476,13 +498,16 @@ impl MultiLimiter {
         costs: &[(&str, u32)],
         timeout: Option<Duration>,
     ) -> Result<(), ThrottleError> {
-        use crate::wait::{Refusal, wait_for};
+        use crate::limiter::{Progress, paused_all, release_all, step_all};
+        use crate::wait::{Refusal, wait_with};
         let timer = obs::Timer::start();
         let result = match self.unknown(costs) {
             Some(index) => Err(ThrottleError::UnknownDimension { index }),
-            None => wait_for(
-                |budget| crate::limiter::step_all(self.pairs(costs), budget),
-                || refund_all(self.pairs(costs)),
+            None => wait_with(
+                Progress::new(),
+                |progress, budget| step_all(self.pairs(costs), budget, progress),
+                |progress| release_all(self.pairs(costs), progress),
+                || paused_all(self.pairs(costs)),
                 timeout,
             )
             .await
@@ -493,28 +518,6 @@ impl MultiLimiter {
         };
         obs::waited(KIND, &self.label, &timer, 1, obs::Waited::of(&result));
         result
-    }
-}
-
-/// Charges `units` that were already spent, whether or not they fit: as debt
-/// (capacity-sized reservations with no wait limit) where the limiter
-/// supports it, otherwise by draining what is available.
-fn charge(limiter: &dyn Limiter, units: u32) {
-    let capacity = limiter.capacity();
-    if capacity == 0 {
-        return;
-    }
-    let mut left = units;
-    while left > 0 {
-        let chunk = left.min(capacity);
-        if limiter.reserve(chunk, Duration::MAX).is_none() {
-            let available = limiter.available();
-            if available > 0 {
-                let _drained = limiter.acquire_cost(available.min(left));
-            }
-            return;
-        }
-        left -= chunk;
     }
 }
 
@@ -545,9 +548,9 @@ impl core::fmt::Debug for MultiLimiter {
 /// Builder for a [`MultiLimiter`].
 ///
 /// Name each dimension with [`dimension`](Self::dimension), optionally add
-/// [aliases](Self::alias) and turn on [strict](Self::strict) name checking,
-/// then [`build`](Self::build) (lenient about mistakes) or
-/// [`try_build`](Self::try_build) (reports them).
+/// [aliases](Self::alias) or relax [strict](Self::strict) name checking (on by
+/// default), then [`build`](Self::build) (lenient about configuration
+/// mistakes) or [`try_build`](Self::try_build) (reports them).
 ///
 /// # Examples
 ///
@@ -560,20 +563,30 @@ impl core::fmt::Debug for MultiLimiter {
 ///     .dimension("tokens", Throttle::per_minute(30_000))
 ///     .alias("input_tokens", "tokens")
 ///     .alias("output_tokens", "tokens")
-///     .strict(true)
 ///     .try_build()?;
 ///
 /// assert!(limiter.try_acquire_costs(&[("requests", 1), ("input_tokens", 1000), ("output_tokens", 500)]));
 /// assert_eq!(limiter.available("tokens"), Some(28_500));
 /// # Ok::<(), throttle_net::ThrottleError>(())
 /// ```
-#[derive(Default)]
 #[must_use]
 pub struct MultiLimiterBuilder {
     dimensions: Vec<Dimension>,
     aliases: Vec<Alias>,
     strict: bool,
     label: Label,
+}
+
+impl Default for MultiLimiterBuilder {
+    /// No dimensions, strict about unknown names, unnamed.
+    fn default() -> Self {
+        Self {
+            dimensions: Vec::new(),
+            aliases: Vec::new(),
+            strict: true,
+            label: Label::none(),
+        }
+    }
 }
 
 impl MultiLimiterBuilder {
@@ -604,7 +617,8 @@ impl MultiLimiterBuilder {
         self
     }
 
-    /// Refuses calls naming an unknown dimension (see [`MultiLimiter`]).
+    /// Whether calls naming an unknown dimension are refused (`true`, the
+    /// default) or the unknown names ignored (`false`). See [`MultiLimiter`].
     pub fn strict(mut self, strict: bool) -> Self {
         self.strict = strict;
         self
@@ -733,6 +747,7 @@ mod tests {
     fn test_unknown_dimension_name_is_ignored_when_lenient() {
         let limiter = MultiLimiter::builder()
             .dimension("requests", Throttle::per_second(1))
+            .strict(false)
             .build();
         assert!(!limiter.is_strict());
         assert!(limiter.try_acquire_costs(&[("requests", 1), ("nonexistent", 999)]));
@@ -743,8 +758,8 @@ mod tests {
         // Regression (TN-016): a typo charged nothing and admitted the call.
         let limiter = MultiLimiter::builder()
             .dimension("input_tokens", Throttle::per_second(100))
-            .strict(true)
             .build();
+        assert!(limiter.is_strict(), "strict by default since 2.0");
         assert_eq!(
             limiter.peek_costs(&[("input_token", 5)]),
             Decision::Impossible

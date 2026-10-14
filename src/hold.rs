@@ -54,9 +54,15 @@ impl Hold {
         let _previous = self.until_ns.fetch_max(until, Ordering::Relaxed);
     }
 
-    /// Lifts the hold immediately.
+    /// Lifts the hold immediately, waking any waiter sleeping it out.
     pub(crate) fn clear(&self) {
-        self.until_ns.store(0, Ordering::Relaxed);
+        let previous = self.until_ns.swap(0, Ordering::AcqRel);
+        #[cfg(feature = "runtime")]
+        if previous != 0 {
+            crate::rt::announce_resume();
+        }
+        #[cfg(not(feature = "runtime"))]
+        let _ = previous;
     }
 }
 

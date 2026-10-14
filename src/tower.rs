@@ -11,9 +11,32 @@
 //! - [`AdaptiveLayer`] caps in-flight calls with an [`AdaptiveLimiter`] and
 //!   feeds each call's outcome and latency back to it (`adaptive` feature).
 //!
-//! Each service waits inside the future it returns from `call`, after taking
-//! the inner service (which `poll_ready` made ready) and leaving a clone in its
-//! place — so the inner service must be `Clone`, as most tower stacks are.
+//! # Readiness and backpressure
+//!
+//! Each service waits in **`poll_ready`**, the way tower's own `RateLimit` and
+//! `ConcurrencyLimit` do: it acquires its admission (the limiter's units, the
+//! breaker's or adaptive limiter's permit) first, then polls the inner
+//! service's readiness, and reports ready only when both are held. `call`
+//! spends the admission it holds. So:
+//!
+//! - **Backpressure works.** A throttled service reports `Pending` while it
+//!   waits, so `tower::load_shed` sheds, `tower::buffer` queues, and a
+//!   balancer routes elsewhere — instead of seeing "ready" and then sleeping
+//!   inside every call.
+//! - **The inner service's readiness is not held during the wait.** Layers
+//!   whose readiness reserves capacity (a `ConcurrencyLimit` permit, a
+//!   `Buffer` slot, a pooled connection) are polled only once the admission is
+//!   in hand.
+//! - **Nothing leaks.** A service dropped (or cloned — a clone starts unready)
+//!   while it holds an admission gives it back: units are refunded, permits are
+//!   cancelled without counting an outcome.
+//!
+//! Each layer has a `with_timeout` option: `poll_ready` then fails with a boxed
+//! [`ThrottleError`] if the admission cannot be had in time, instead of
+//! waiting indefinitely. A service called without first being ready (a breach
+//! of the `Service` contract) does not send the request; it fails with
+//! [`ThrottleError::NotReady`].
+//!
 //! Errors are boxed (`BoxError`), the tower convention, so layers stack; a
 //! limiter's refusal surfaces as a boxed [`ThrottleError`].
 //!
@@ -22,15 +45,16 @@
 use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
+use core::time::Duration;
 use std::sync::Arc;
 
 use tower_layer::Layer;
 use tower_service::Service;
 
 #[cfg(feature = "adaptive")]
-use crate::adaptive::{AdaptiveLimiter, AdaptiveStrategy};
+use crate::adaptive::{AdaptiveLimiter, AdaptiveStrategy, OwnedAdaptivePermit};
 #[cfg(feature = "circuit-breaker")]
-use crate::circuit::CircuitBreaker;
+use crate::circuit::{CircuitBreaker, OwnedPermit};
 use crate::error::ThrottleError;
 use crate::limiter::Limiter;
 
@@ -40,11 +64,80 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 /// The boxed future every service in this module returns.
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = Result<T, BoxError>> + Send>>;
 
-/// Takes the ready inner service, leaving a clone in its place (the standard
-/// tower pattern for using a service inside a `'static` future).
-fn take_ready<S: Clone>(inner: &mut S) -> S {
-    let clone = inner.clone();
-    core::mem::replace(inner, clone)
+/// An admission being acquired in `poll_ready`. `Sync` so the services stay
+/// `Sync`, as frameworks such as axum require.
+type Acquiring<T> = Pin<Box<dyn Future<Output = Result<T, ThrottleError>> + Send + Sync>>;
+
+/// A service's admission for its next call: none yet, being acquired, or held.
+enum Admission<T> {
+    Idle,
+    Acquiring(Acquiring<T>),
+    Held(T),
+}
+
+impl<T> Admission<T> {
+    /// Drives the admission to `Held`, starting an acquisition with `start` if
+    /// none is in progress. An acquisition that fails resets to `Idle`.
+    fn poll_acquire(
+        &mut self,
+        cx: &mut Context<'_>,
+        start: impl FnOnce() -> Acquiring<T>,
+    ) -> Poll<Result<(), ThrottleError>> {
+        let mut start = Some(start);
+        loop {
+            match self {
+                Self::Held(_) => return Poll::Ready(Ok(())),
+                Self::Idle => {
+                    let Some(start) = start.take() else {
+                        return Poll::Ready(Err(ThrottleError::NotReady));
+                    };
+                    *self = Self::Acquiring(start());
+                }
+                Self::Acquiring(acquiring) => match acquiring.as_mut().poll(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Ok(held)) => *self = Self::Held(held),
+                    Poll::Ready(Err(error)) => {
+                        *self = Self::Idle;
+                        return Poll::Ready(Err(error));
+                    }
+                },
+            }
+        }
+    }
+
+    /// Takes the held admission for a call, leaving `Idle`.
+    fn take(&mut self) -> Option<T> {
+        match core::mem::replace(self, Self::Idle) {
+            Self::Held(held) => Some(held),
+            other => {
+                *self = other;
+                None
+            }
+        }
+    }
+}
+
+/// Units taken from a limiter for a call that has not been made yet: refunded
+/// if dropped unused.
+struct Units {
+    limiter: Arc<dyn Limiter>,
+    cost: u32,
+    spent: bool,
+}
+
+impl Units {
+    /// The call went out: the units stay taken.
+    fn spend(mut self) {
+        self.spent = true;
+    }
+}
+
+impl Drop for Units {
+    fn drop(&mut self) {
+        if !self.spent {
+            self.limiter.refund(self.cost);
+        }
+    }
 }
 
 /// A [`Layer`] that paces every call through a [`Limiter`].
@@ -71,6 +164,7 @@ fn take_ready<S: Clone>(inner: &mut S) -> S {
 pub struct ThrottleLayer {
     limiter: Arc<dyn Limiter>,
     cost: u32,
+    timeout: Option<Duration>,
 }
 
 impl ThrottleLayer {
@@ -84,13 +178,26 @@ impl ThrottleLayer {
     /// same [`Throttle`](crate::Throttle) across several clients).
     #[must_use]
     pub fn shared(limiter: Arc<dyn Limiter>) -> Self {
-        Self { limiter, cost: 1 }
+        Self {
+            limiter,
+            cost: 1,
+            timeout: None,
+        }
     }
 
     /// Charges `cost` units per call instead of one.
     #[must_use]
     pub fn with_cost(mut self, cost: u32) -> Self {
         self.cost = cost;
+        self
+    }
+
+    /// Waits at most `timeout` in `poll_ready` for the units; past it,
+    /// `poll_ready` fails with a boxed [`ThrottleError::DeadlineExceeded`]
+    /// (at once, if the units are known not to come in time).
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
         self
     }
 }
@@ -103,6 +210,8 @@ impl<S> Layer<S> for ThrottleLayer {
             inner,
             limiter: Arc::clone(&self.limiter),
             cost: self.cost,
+            timeout: self.timeout,
+            admission: Admission::Idle,
         }
     }
 }
@@ -112,41 +221,72 @@ impl core::fmt::Debug for ThrottleLayer {
         f.debug_struct("ThrottleLayer")
             .field("capacity", &self.limiter.capacity())
             .field("cost", &self.cost)
+            .field("timeout", &self.timeout)
             .finish()
     }
 }
 
 /// The service [`ThrottleLayer`] produces.
-#[derive(Clone)]
 pub struct Throttled<S> {
     inner: S,
     limiter: Arc<dyn Limiter>,
     cost: u32,
+    timeout: Option<Duration>,
+    admission: Admission<Units>,
+}
+
+impl<S: Clone> Clone for Throttled<S> {
+    /// The clone shares the limiter but holds no admission: it must be polled
+    /// ready itself.
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            limiter: Arc::clone(&self.limiter),
+            cost: self.cost,
+            timeout: self.timeout,
+            admission: Admission::Idle,
+        }
+    }
 }
 
 impl<S, Request> Service<Request> for Throttled<S>
 where
-    S: Service<Request> + Clone + Send + 'static,
-    S::Future: Send,
+    S: Service<Request>,
+    S::Future: Send + 'static,
     S::Error: Into<BoxError>,
-    Request: Send + 'static,
 {
     type Response = S::Response;
     type Error = BoxError;
     type Future = BoxFuture<S::Response>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        let limiter = &self.limiter;
+        let (cost, timeout) = (self.cost, self.timeout);
+        match self.admission.poll_acquire(cx, || {
+            let limiter = Arc::clone(limiter);
+            Box::pin(async move {
+                wait(limiter.as_ref(), cost, timeout).await?;
+                Ok(Units {
+                    limiter,
+                    cost,
+                    spent: false,
+                })
+            })
+        }) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Err(error)) => return Poll::Ready(Err(error.into())),
+            Poll::Ready(Ok(())) => {}
+        }
         self.inner.poll_ready(cx).map_err(Into::into)
     }
 
     fn call(&mut self, request: Request) -> Self::Future {
-        let mut inner = take_ready(&mut self.inner);
-        let limiter = Arc::clone(&self.limiter);
-        let cost = self.cost;
-        Box::pin(async move {
-            wait(limiter.as_ref(), cost).await?;
-            inner.call(request).await.map_err(Into::into)
-        })
+        let Some(units) = self.admission.take() else {
+            return Box::pin(async { Err(ThrottleError::NotReady.into()) });
+        };
+        let response = self.inner.call(request);
+        units.spend();
+        Box::pin(async move { response.await.map_err(Into::into) })
     }
 }
 
@@ -154,18 +294,27 @@ impl<S> core::fmt::Debug for Throttled<S> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Throttled")
             .field("cost", &self.cost)
+            .field("ready", &matches!(self.admission, Admission::Held(_)))
             .finish_non_exhaustive()
     }
 }
 
-/// Waits on a dynamically typed limiter (reserving where it can, cancel-safe).
-async fn wait(limiter: &dyn Limiter, cost: u32) -> Result<(), ThrottleError> {
-    use crate::wait::{Refusal, wait_for};
+/// Waits on a dynamically typed limiter (queueing on its bottleneck,
+/// cancel-safe).
+async fn wait(
+    limiter: &dyn Limiter,
+    cost: u32,
+    timeout: Option<Duration>,
+) -> Result<(), ThrottleError> {
+    use crate::limiter::{Progress, paused_all, release_all, step_all};
+    use crate::wait::{Refusal, wait_with};
     let item = || core::iter::once((limiter, cost));
-    wait_for(
-        |budget| crate::limiter::step_all(item(), budget),
-        || limiter.refund(cost),
-        None,
+    wait_with(
+        Progress::new(),
+        |progress, budget| step_all(item(), budget, progress),
+        |progress| release_all(item(), progress),
+        || paused_all(item()),
+        timeout,
     )
     .await
     .map_err(|refusal| match refusal {
@@ -181,6 +330,9 @@ async fn wait(limiter: &dyn Limiter, cost: u32) -> Result<(), ThrottleError> {
 /// (with a boxed [`ThrottleError::CircuitOpen`]) while it is open, paced by its
 /// wrapped limiter otherwise, and each call's permit is settled from its result
 /// — `Ok` as a success, `Err` as a failure.
+///
+/// The permit is taken in `poll_ready`, so an open breaker fails `poll_ready`
+/// itself (a `tower::load_shed` or retry layer above sees it there).
 ///
 /// # Examples
 ///
@@ -210,6 +362,7 @@ where
     C: clock_lib::Clock,
 {
     breaker: Arc<CircuitBreaker<L, C>>,
+    timeout: Option<Duration>,
 }
 
 #[cfg(feature = "circuit-breaker")]
@@ -220,7 +373,19 @@ where
     /// Guards calls with `breaker`, shared with any other code that holds it.
     #[must_use]
     pub fn new(breaker: Arc<CircuitBreaker<L, C>>) -> Self {
-        Self { breaker }
+        Self {
+            breaker,
+            timeout: None,
+        }
+    }
+
+    /// Waits at most `timeout` in `poll_ready` on the breaker's wrapped
+    /// limiter; past it, `poll_ready` fails with a boxed
+    /// [`ThrottleError::DeadlineExceeded`].
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
     }
 }
 
@@ -232,6 +397,7 @@ where
     fn clone(&self) -> Self {
         Self {
             breaker: Arc::clone(&self.breaker),
+            timeout: self.timeout,
         }
     }
 }
@@ -239,6 +405,7 @@ where
 #[cfg(feature = "circuit-breaker")]
 impl<S, L, C> Layer<S> for CircuitBreakerLayer<L, C>
 where
+    L: Limiter,
     C: clock_lib::Clock,
 {
     type Service = Guarded<S, L, C>;
@@ -247,6 +414,8 @@ where
         Guarded {
             inner,
             breaker: Arc::clone(&self.breaker),
+            timeout: self.timeout,
+            admission: Admission::Idle,
         }
     }
 }
@@ -260,7 +429,29 @@ where
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("CircuitBreakerLayer")
             .field("breaker", &self.breaker)
+            .field("timeout", &self.timeout)
             .finish()
+    }
+}
+
+/// A breaker permit taken in `poll_ready` and not yet used: cancelled (no
+/// outcome recorded) if dropped.
+#[cfg(feature = "circuit-breaker")]
+struct HeldPermit<L, C>(Option<OwnedPermit<L, C>>)
+where
+    L: Limiter,
+    C: clock_lib::Clock;
+
+#[cfg(feature = "circuit-breaker")]
+impl<L, C> Drop for HeldPermit<L, C>
+where
+    L: Limiter,
+    C: clock_lib::Clock,
+{
+    fn drop(&mut self) {
+        if let Some(permit) = self.0.take() {
+            permit.cancel();
+        }
     }
 }
 
@@ -269,21 +460,28 @@ where
 #[cfg_attr(docsrs, doc(cfg(feature = "circuit-breaker")))]
 pub struct Guarded<S, L, C = clock_lib::SystemClock>
 where
+    L: Limiter,
     C: clock_lib::Clock,
 {
     inner: S,
     breaker: Arc<CircuitBreaker<L, C>>,
+    timeout: Option<Duration>,
+    admission: Admission<HeldPermit<L, C>>,
 }
 
 #[cfg(feature = "circuit-breaker")]
 impl<S: Clone, L, C> Clone for Guarded<S, L, C>
 where
+    L: Limiter,
     C: clock_lib::Clock,
 {
+    /// The clone shares the breaker but holds no permit.
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
             breaker: Arc::clone(&self.breaker),
+            timeout: self.timeout,
+            admission: Admission::Idle,
         }
     }
 }
@@ -291,27 +489,43 @@ where
 #[cfg(feature = "circuit-breaker")]
 impl<S, L, C, Request> Service<Request> for Guarded<S, L, C>
 where
-    S: Service<Request> + Clone + Send + 'static,
-    S::Future: Send,
+    S: Service<Request>,
+    S::Future: Send + 'static,
     S::Error: Into<BoxError>,
     L: Limiter + 'static,
     C: clock_lib::Clock + 'static,
-    Request: Send + 'static,
 {
     type Response = S::Response;
     type Error = BoxError;
     type Future = BoxFuture<S::Response>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        let breaker = &self.breaker;
+        let timeout = self.timeout;
+        match self.admission.poll_acquire(cx, || {
+            let breaker = Arc::clone(breaker);
+            Box::pin(async move {
+                let permit = match timeout {
+                    None => breaker.acquire_owned().await?,
+                    Some(timeout) => breaker.acquire_owned_timeout(timeout).await?,
+                };
+                Ok(HeldPermit(Some(permit)))
+            })
+        }) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Err(error)) => return Poll::Ready(Err(error.into())),
+            Poll::Ready(Ok(())) => {}
+        }
         self.inner.poll_ready(cx).map_err(Into::into)
     }
 
     fn call(&mut self, request: Request) -> Self::Future {
-        let mut inner = take_ready(&mut self.inner);
-        let breaker = Arc::clone(&self.breaker);
+        let Some(permit) = self.admission.take().and_then(|mut held| held.0.take()) else {
+            return Box::pin(async { Err(ThrottleError::NotReady.into()) });
+        };
+        let response = self.inner.call(request);
         Box::pin(async move {
-            let permit = breaker.acquire_owned().await?;
-            match inner.call(request).await {
+            match response.await {
                 Ok(response) => {
                     permit.success();
                     Ok(response)
@@ -334,13 +548,15 @@ where
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Guarded")
             .field("breaker", &self.breaker)
+            .field("ready", &matches!(self.admission, Admission::Held(_)))
             .finish_non_exhaustive()
     }
 }
 
 /// A [`Layer`] that caps in-flight calls with an [`AdaptiveLimiter`], waiting
-/// for a slot, and feeds each call's outcome (with its latency) back to it —
-/// `Ok` as a success, `Err` as a failure.
+/// (in `poll_ready`) for a slot, and feeds each call's outcome (with its
+/// latency, measured from `call`) back to it — `Ok` as a success, `Err` as a
+/// failure.
 ///
 /// # Examples
 ///
@@ -367,6 +583,7 @@ where
     C: clock_lib::Clock,
 {
     limiter: Arc<AdaptiveLimiter<St, C>>,
+    timeout: Option<Duration>,
 }
 
 #[cfg(feature = "adaptive")]
@@ -377,7 +594,18 @@ where
     /// Caps calls with `limiter`, shared with any other code that holds it.
     #[must_use]
     pub fn new(limiter: Arc<AdaptiveLimiter<St, C>>) -> Self {
-        Self { limiter }
+        Self {
+            limiter,
+            timeout: None,
+        }
+    }
+
+    /// Waits at most `timeout` in `poll_ready` for a slot; past it,
+    /// `poll_ready` fails with a boxed [`ThrottleError::DeadlineExceeded`].
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
     }
 }
 
@@ -389,6 +617,7 @@ where
     fn clone(&self) -> Self {
         Self {
             limiter: Arc::clone(&self.limiter),
+            timeout: self.timeout,
         }
     }
 }
@@ -396,6 +625,7 @@ where
 #[cfg(feature = "adaptive")]
 impl<S, St, C> Layer<S> for AdaptiveLayer<St, C>
 where
+    St: AdaptiveStrategy,
     C: clock_lib::Clock,
 {
     type Service = Adaptive<S, St, C>;
@@ -404,6 +634,8 @@ where
         Adaptive {
             inner,
             limiter: Arc::clone(&self.limiter),
+            timeout: self.timeout,
+            admission: Admission::Idle,
         }
     }
 }
@@ -416,7 +648,29 @@ where
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("AdaptiveLayer")
             .field("limiter", &self.limiter)
+            .field("timeout", &self.timeout)
             .finish()
+    }
+}
+
+/// An adaptive slot taken in `poll_ready` and not yet used: freed without an
+/// outcome if dropped.
+#[cfg(feature = "adaptive")]
+struct HeldSlot<St, C>(Option<OwnedAdaptivePermit<St, C>>)
+where
+    St: AdaptiveStrategy,
+    C: clock_lib::Clock;
+
+#[cfg(feature = "adaptive")]
+impl<St, C> Drop for HeldSlot<St, C>
+where
+    St: AdaptiveStrategy,
+    C: clock_lib::Clock,
+{
+    fn drop(&mut self) {
+        if let Some(permit) = self.0.take() {
+            permit.cancel();
+        }
     }
 }
 
@@ -425,21 +679,28 @@ where
 #[cfg_attr(docsrs, doc(cfg(feature = "adaptive")))]
 pub struct Adaptive<S, St, C = clock_lib::SystemClock>
 where
+    St: AdaptiveStrategy,
     C: clock_lib::Clock,
 {
     inner: S,
     limiter: Arc<AdaptiveLimiter<St, C>>,
+    timeout: Option<Duration>,
+    admission: Admission<HeldSlot<St, C>>,
 }
 
 #[cfg(feature = "adaptive")]
 impl<S: Clone, St, C> Clone for Adaptive<S, St, C>
 where
+    St: AdaptiveStrategy,
     C: clock_lib::Clock,
 {
+    /// The clone shares the limiter but holds no slot.
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
             limiter: Arc::clone(&self.limiter),
+            timeout: self.timeout,
+            admission: Admission::Idle,
         }
     }
 }
@@ -447,27 +708,45 @@ where
 #[cfg(feature = "adaptive")]
 impl<S, St, C, Request> Service<Request> for Adaptive<S, St, C>
 where
-    S: Service<Request> + Clone + Send + 'static,
-    S::Future: Send,
+    S: Service<Request>,
+    S::Future: Send + 'static,
     S::Error: Into<BoxError>,
     St: AdaptiveStrategy + 'static,
     C: clock_lib::Clock + 'static,
-    Request: Send + 'static,
 {
     type Response = S::Response;
     type Error = BoxError;
     type Future = BoxFuture<S::Response>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        let limiter = &self.limiter;
+        let timeout = self.timeout;
+        match self.admission.poll_acquire(cx, || {
+            let limiter = Arc::clone(limiter);
+            Box::pin(async move {
+                let permit = match timeout {
+                    None => limiter.acquire_owned().await,
+                    Some(timeout) => limiter.acquire_owned_timeout(timeout).await?,
+                };
+                Ok(HeldSlot(Some(permit)))
+            })
+        }) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Err(error)) => return Poll::Ready(Err(error.into())),
+            Poll::Ready(Ok(())) => {}
+        }
         self.inner.poll_ready(cx).map_err(Into::into)
     }
 
     fn call(&mut self, request: Request) -> Self::Future {
-        let mut inner = take_ready(&mut self.inner);
-        let limiter = Arc::clone(&self.limiter);
+        let Some(mut permit) = self.admission.take().and_then(|mut held| held.0.take()) else {
+            return Box::pin(async { Err(ThrottleError::NotReady.into()) });
+        };
+        // Latency is the call's, not the time the slot sat ready.
+        permit.restart();
+        let response = self.inner.call(request);
         Box::pin(async move {
-            let permit = limiter.acquire_owned().await;
-            match inner.call(request).await {
+            match response.await {
                 Ok(response) => {
                     permit.success();
                     Ok(response)
@@ -484,11 +763,13 @@ where
 #[cfg(feature = "adaptive")]
 impl<S, St, C> core::fmt::Debug for Adaptive<S, St, C>
 where
+    St: AdaptiveStrategy,
     C: clock_lib::Clock,
 {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Adaptive")
             .field("limiter", &self.limiter)
+            .field("ready", &matches!(self.admission, Admission::Held(_)))
             .finish_non_exhaustive()
     }
 }

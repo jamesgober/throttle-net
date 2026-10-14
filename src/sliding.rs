@@ -447,9 +447,33 @@ where
         log.hold_until_ns = log.hold_until_ns.max(until);
     }
 
-    /// Lifts any pause immediately.
+    /// Lifts any pause immediately, waking waiters that were sleeping it out.
     pub fn resume(&self) {
-        self.lock().hold_until_ns = 0;
+        let previous = core::mem::take(&mut self.lock().hold_until_ns);
+        #[cfg(feature = "runtime")]
+        if previous != 0 {
+            crate::rt::announce_resume();
+        }
+        #[cfg(not(feature = "runtime"))]
+        let _ = previous;
+    }
+
+    /// Records `cost` units that were already spent, whether or not they fit
+    /// and even while paused: they occupy the window like any grant, so the
+    /// log can run over its limit until they age out.
+    fn charge_spent(&self, cost: u32) {
+        if cost == 0 {
+            return;
+        }
+        let now_ns = self.now_ns();
+        let mut log = self.lock();
+        self.prune(&mut log, now_ns);
+        let at_ns = log
+            .grants
+            .back()
+            .map_or(now_ns, |last| now_ns.max(last.at_ns));
+        log.used = log.used.saturating_add(u64::from(cost));
+        log.grants.push_back(Grant { at_ns, count: cost });
     }
 
     /// How much longer the limiter stays paused (`Duration::ZERO` when it is
@@ -545,7 +569,8 @@ where
                 Decision::Retry { after } => Step::Retry(after),
                 _ => Step::Never,
             },
-            || {},
+            || self.refund(cost),
+            || self.paused_for(),
             timeout,
         )
         .await
@@ -591,6 +616,21 @@ where
 
     fn pause_for(&self, duration: Duration) {
         SlidingWindowLog::pause_for(self, duration);
+    }
+
+    fn paused_for(&self) -> Duration {
+        SlidingWindowLog::paused_for(self)
+    }
+
+    fn resume(&self) {
+        SlidingWindowLog::resume(self);
+    }
+
+    /// Records the units in the window even if they exceed the limit or the
+    /// log is paused; later grants wait until they age out.
+    fn charge(&self, cost: u32) -> u32 {
+        self.charge_spent(cost);
+        0
     }
 }
 

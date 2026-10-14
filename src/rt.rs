@@ -29,6 +29,51 @@ pub(crate) async fn sleep(duration: Duration) {
     let _fired_at = smol::Timer::after(duration).await;
 }
 
+/// The runtime's notion of "now" for waiting deadlines: tokio's (pausable)
+/// instant under the `tokio` feature, the OS monotonic clock under smol.
+#[cfg(feature = "tokio")]
+pub(crate) use tokio::time::Instant;
+
+/// The runtime's notion of "now" for waiting deadlines.
+#[cfg(all(feature = "smol", not(feature = "tokio")))]
+pub(crate) use std::time::Instant;
+
+/// Woken whenever any limiter's pause is lifted, so waiters sleeping out a
+/// pause re-check at once (TN2-010). One process-wide event keeps every pause
+/// a single atomic word; a resume is rare, so the occasional spurious wake-up
+/// of an unrelated waiter (it simply re-checks and sleeps again) is cheap.
+static RESUMED: event_listener::Event = event_listener::Event::new();
+
+/// Bumped on every resume, so a waiter that read it before deciding to sleep
+/// can tell that a resume happened before it started listening.
+static RESUME_EPOCH: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// The current resume epoch: read it *before* checking a pause.
+#[inline]
+pub(crate) fn resume_epoch() -> usize {
+    RESUME_EPOCH.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Announces that a pause was lifted: wakes every waiter sleeping on one.
+pub(crate) fn announce_resume() {
+    let _previous = RESUME_EPOCH.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+    let _woken = RESUMED.notify(usize::MAX);
+}
+
+/// Sleeps for `duration`, or until a pause is lifted after `epoch` was read,
+/// whichever comes first. Very short naps are not worth a listener.
+pub(crate) async fn sleep_unless_resumed(duration: Duration, epoch: usize) {
+    if duration <= Duration::from_millis(1) {
+        sleep(duration).await;
+        return;
+    }
+    let listener = RESUMED.listen();
+    if resume_epoch() != epoch {
+        return;
+    }
+    futures_lite::future::or(sleep(duration), listener).await;
+}
+
 /// A [`Clock`](clock_lib::Clock) that reads tokio's time.
 ///
 /// In production tokio's clock is the OS monotonic clock, so this behaves like

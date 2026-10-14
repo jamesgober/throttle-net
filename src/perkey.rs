@@ -630,6 +630,7 @@ where
         let result = wait_for(
             |budget| self.step(key, cost, budget),
             || self.refund(key, cost),
+            || Duration::ZERO,
             timeout,
         )
         .await
@@ -1081,8 +1082,12 @@ mod tests {
             .with_shards(1);
         assert!(limiter.try_acquire(&"a"));
         assert!(limiter.try_acquire(&"b"));
-        // Both keys are drained; evicting either would reset its limit, so the
-        // newcomer is refused and told when room is expected.
+        // Both keys are drained: newcomers move their debts to the ledger...
+        assert!(limiter.try_acquire(&"x"));
+        assert!(limiter.try_acquire(&"y"));
+        // ...and the forgotten keys are still limited when they return.
+        // With the ledger full too, evicting either would reset a limit, so
+        // the newcomer is refused and told when room is expected.
         assert!(!limiter.try_acquire(&"c"));
         let keyed: &dyn KeyedLimiter<&str> = &limiter;
         assert_eq!(

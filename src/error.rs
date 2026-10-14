@@ -5,7 +5,8 @@
 //! granted or returns a [`ThrottleError`] naming why it never will (or not in
 //! time): a cost larger than the limiter can ever hold, a tripped circuit
 //! breaker, a full queue or bulkhead, a passed deadline, an invalid
-//! configuration, or an unknown dimension name in strict mode.
+//! configuration, an unknown dimension name in strict mode, or a tower service
+//! called before it was ready.
 //!
 //! [`ThrottleError`] implements [`error_forge::ForgeError`], so it carries the
 //! same kind/retryability metadata as every other domain error in the portfolio
@@ -85,6 +86,11 @@ pub enum ThrottleError {
         /// The index of the unknown name in the costs slice.
         index: usize,
     },
+    /// A [`tower`](crate::tower) service was called without `poll_ready`
+    /// having first reported it ready, so it held no admission for the request
+    /// and did not send it. This breaks the `tower::Service` contract — a
+    /// programming error — so it is **not** retryable.
+    NotReady,
 }
 
 impl fmt::Display for ThrottleError {
@@ -110,6 +116,9 @@ impl fmt::Display for ThrottleError {
                 f,
                 "cost entry {index} names a dimension this strict multi-limiter does not have"
             ),
+            Self::NotReady => f.write_str(
+                "service called before poll_ready reported it ready; the request was not sent",
+            ),
         }
     }
 }
@@ -126,6 +135,7 @@ impl ForgeError for ThrottleError {
             Self::BulkheadFull => "BulkheadFull",
             Self::InvalidConfig { .. } => "InvalidConfig",
             Self::UnknownDimension { .. } => "UnknownDimension",
+            Self::NotReady => "NotReady",
         }
     }
 
@@ -142,7 +152,8 @@ impl ForgeError for ThrottleError {
             Self::CostExceedsCapacity { .. }
             | Self::DeadlineExceeded
             | Self::InvalidConfig { .. }
-            | Self::UnknownDimension { .. } => false,
+            | Self::UnknownDimension { .. }
+            | Self::NotReady => false,
         }
     }
 }
@@ -153,7 +164,7 @@ mod tests {
     use core::time::Duration;
     use error_forge::ForgeError;
 
-    fn all() -> [ThrottleError; 7] {
+    fn all() -> [ThrottleError; 8] {
         [
             ThrottleError::CostExceedsCapacity {
                 cost: 9,
@@ -169,6 +180,7 @@ mod tests {
                 reason: "rate must be non-zero",
             },
             ThrottleError::UnknownDimension { index: 2 },
+            ThrottleError::NotReady,
         ]
     }
 
@@ -214,6 +226,7 @@ mod tests {
                 "BulkheadFull",
                 "InvalidConfig",
                 "UnknownDimension",
+                "NotReady",
             ]
         );
         assert!(
@@ -226,7 +239,10 @@ mod tests {
     #[test]
     fn test_retryability_by_variant() {
         let retryable: Vec<bool> = all().iter().map(ForgeError::is_retryable).collect();
-        assert_eq!(retryable, [false, true, true, false, true, false, false]);
+        assert_eq!(
+            retryable,
+            [false, true, true, false, true, false, false, false]
+        );
     }
 
     #[test]

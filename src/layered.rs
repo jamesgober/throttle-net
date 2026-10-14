@@ -159,42 +159,12 @@ where
         Decision::Acquired
     }
 
-    /// Reserves `cost` in every scope within `max_wait`, or nothing at all.
-    #[cfg(feature = "runtime")]
-    fn reserve_scopes(
-        &self,
-        key: &K,
-        endpoint: &E,
-        cost: u32,
-        max_wait: Duration,
-    ) -> Option<Duration> {
-        let mut longest = Duration::ZERO;
-        if let Some(scope) = &self.global {
-            longest = longest.max(scope.reserve(cost, max_wait)?);
-        }
-        if let Some(scope) = &self.per_key {
-            let Some(wait) = scope.reserve(key, cost, max_wait) else {
-                self.refund_scopes(key, endpoint, cost, 1);
-                return None;
-            };
-            longest = longest.max(wait);
-        }
-        if let Some(scope) = &self.per_endpoint {
-            let Some(wait) = scope.reserve(endpoint, cost, max_wait) else {
-                self.refund_scopes(key, endpoint, cost, 2);
-                return None;
-            };
-            longest = longest.max(wait);
-        }
-        Some(longest)
-    }
-
     /// The binding capacity across configured scopes: the smallest, since that is
     /// the first ceiling a request hits. No scopes means unbounded ([`u32::MAX`]).
     #[must_use]
     pub fn capacity(&self) -> u32 {
         let caps = [
-            self.global.as_ref().map(|g| g.capacity()),
+            self.global.as_ref().map(Limiter::capacity),
             self.per_key.as_ref().map(|pk| pk.capacity()),
             self.per_endpoint.as_ref().map(|pe| pe.capacity()),
         ];
@@ -255,6 +225,22 @@ where
             scope.pause_for(duration);
         }
     }
+
+    /// Lifts the global scope's pause (see [`Limiter::resume`]).
+    pub fn resume(&self) {
+        if let Some(scope) = &self.global {
+            scope.resume();
+        }
+    }
+
+    /// How much longer the global scope stays paused (`Duration::ZERO` when it
+    /// is not, or there is no global scope).
+    #[must_use]
+    pub fn paused_for(&self) -> Duration {
+        self.global
+            .as_ref()
+            .map_or(Duration::ZERO, Limiter::paused_for)
+    }
 }
 
 #[cfg(feature = "runtime")]
@@ -275,9 +261,15 @@ where
     }
 
     /// Admits a request of weight `cost` for `(key, endpoint)`, waiting until
-    /// every scope can. Each attempt reserves in every scope at once (rolling
-    /// back if any cannot). **Cancel-safe:** dropping the future returns its
-    /// reservations.
+    /// every scope can.
+    ///
+    /// The waiter queues on its *bottleneck* scope — usually its own per-key
+    /// budget — and charges the other scopes only when that wait is over. So a
+    /// tenant with a deep backlog on its own key never drains the shared global
+    /// scope ahead of time: other tenants are not starved by it. While the
+    /// global scope is [paused](Self::pause_for) the waiter sleeps the pause
+    /// out, and [`resume`](Self::resume) wakes it. **Cancel-safe:** dropping
+    /// the future returns whatever it held.
     ///
     /// # Errors
     ///
@@ -334,18 +326,25 @@ where
         cost: u32,
         timeout: Option<Duration>,
     ) -> Result<(), ThrottleError> {
-        use crate::wait::{Refusal, Step, wait_for};
+        use crate::limiter::{KeyScope, Progress, paused_all, release_all, step_all};
+        use crate::wait::{Refusal, wait_with};
         let timer = obs::Timer::start();
-        let result = wait_for(
-            |budget| match self.reserve_scopes(key, endpoint, cost, budget) {
-                Some(wait) => Step::Granted(wait),
-                None => match self.peek_scopes(key, endpoint, cost) {
-                    Decision::Impossible => Step::Never,
-                    Decision::Retry { after } => Step::Retry(after),
-                    _ => Step::Retry(Duration::ZERO),
-                },
-            },
-            || self.refund(key, endpoint, cost),
+        let per_key = self.per_key.as_deref().map(|scope| KeyScope { scope, key });
+        let per_endpoint = self.per_endpoint.as_deref().map(|scope| KeyScope {
+            scope,
+            key: endpoint,
+        });
+        let scopes: [Option<(&dyn Limiter, u32)>; 3] = [
+            self.global.as_deref().map(|g| (g, cost)),
+            per_key.as_ref().map(|s| (s as &dyn Limiter, cost)),
+            per_endpoint.as_ref().map(|s| (s as &dyn Limiter, cost)),
+        ];
+        let items = || scopes.iter().flatten().copied();
+        let result = wait_with(
+            Progress::new(),
+            |progress, budget| step_all(items(), budget, progress),
+            |progress| release_all(items(), progress),
+            || paused_all(items()),
             timeout,
         )
         .await
@@ -588,22 +587,30 @@ mod tests {
             .pause_for(Duration::from_secs(1));
     }
 
-    #[cfg(feature = "runtime")]
-    #[test]
-    fn test_reserve_scopes_rolls_back_when_a_later_scope_cannot() {
-        let global: Arc<dyn Limiter> = Arc::new(Throttle::per_second(10));
-        let layered = Layered::<&str>::builder()
-            .shared_global(global.clone())
-            .per_key(PerKey::per_second(1))
-            .build();
-        assert!(layered.try_acquire(&"k", &"/"));
-        assert_eq!(layered.reserve_scopes(&"k", &"/", 1, Duration::ZERO), None);
-        assert_eq!(global.available(), 9, "the global reservation was refunded");
-        assert!(
-            layered
-                .reserve_scopes(&"k", &"/", 1, Duration::from_secs(2))
-                .is_some()
+    #[cfg(feature = "tokio")]
+    #[tokio::test(start_paused = true)]
+    async fn test_waiter_charges_the_global_scope_only_when_it_can_go() {
+        use crate::rt::TokioClock;
+        let global: Arc<dyn Limiter> = Arc::new(Throttle::per_second(10).with_clock(TokioClock));
+        let layered = Arc::new(
+            Layered::<&str>::builder()
+                .shared_global(global.clone())
+                .per_key(PerKey::builder().per_second(1).clock(TokioClock).build())
+                .build(),
         );
+        assert!(layered.try_acquire(&"k", &"/"));
+        let start = tokio::time::Instant::now();
+        let l = Arc::clone(&layered);
+        let waiter = tokio::spawn(async move { l.acquire(&"k", &"/").await });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            global.available(),
+            10,
+            "the queued waiter holds nothing in the shared scope"
+        );
+        assert!(waiter.await.unwrap().is_ok());
+        assert_eq!(start.elapsed(), Duration::from_secs(1));
+        assert_eq!(global.available(), 9, "charged once, when it went");
     }
 
     #[cfg(feature = "runtime")]

@@ -78,14 +78,14 @@ pub enum RetryAction {
 /// assert_eq!(result, Err("transient")); // gave up after 4 attempts
 /// # }
 /// ```
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct Retry {
     backoff: Backoff,
     max_attempts: u32,
     respect_retry_after: bool,
     max_retry_after: Duration,
     max_elapsed: Option<Duration>,
-    name: Option<&'static str>,
+    name: crate::obs::Label,
 }
 
 impl Retry {
@@ -108,7 +108,7 @@ impl Retry {
             respect_retry_after: true,
             max_retry_after: DEFAULT_MAX_RETRY_AFTER,
             max_elapsed: None,
-            name: None,
+            name: crate::obs::Label::none(),
         }
     }
 
@@ -170,8 +170,8 @@ impl Retry {
 
     /// Names the policy for metrics and events (`throttle_retries_total`).
     #[must_use]
-    pub fn name(mut self, name: &'static str) -> Self {
-        self.name = Some(name);
+    pub fn name(mut self, name: impl Into<std::borrow::Cow<'static, str>>) -> Self {
+        self.name = crate::obs::Label::new(name);
         self
     }
 
@@ -314,9 +314,7 @@ impl Retry {
         C: Fn(&E) -> RetryAction,
         B: Clock,
     {
-        let label = self
-            .name
-            .map_or_else(crate::obs::Label::none, crate::obs::Label::new);
+        let label = &self.name;
         let mut delays = self.backoff.iter();
         let mut attempt = 1u32;
         let mut elapsed = Duration::ZERO;
@@ -356,11 +354,11 @@ impl Retry {
             }
             if let Some(budget) = budget {
                 if !budget.try_withdraw() {
-                    crate::obs::retry_budget_exhausted(&label);
+                    crate::obs::retry_budget_exhausted(label);
                     return Err(error);
                 }
             }
-            crate::obs::retried(&label, attempt, delay);
+            crate::obs::retried(label, attempt, delay);
             crate::rt::sleep(delay).await;
             elapsed = elapsed.saturating_add(delay);
             attempt += 1;

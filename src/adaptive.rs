@@ -462,14 +462,12 @@ where
         if !(is_failure && epoch < self.epoch()) {
             self.adjust_limit(in_flight, outcome, is_failure);
         }
-        let _released = self
-            .in_flight
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                Some(n.saturating_sub(1))
-            });
-        // A slot freed (and the limit may have grown): wake one waiter. If it
-        // was cancelled meanwhile, event-listener passes the wake-up on.
-        let _woken = self.notify.notify(1);
+        let _released = crate::sync::saturating_sub(&self.in_flight, 1);
+        // A slot freed: wake one *additional* waiter. `notify(1)` is not
+        // additive — two settles before the first woken waiter runs would wake
+        // only one (TN2-001). A waiter cancelled after being notified passes
+        // the wake-up on.
+        let _woken = self.notify.notify_additional(1);
     }
 
     /// Moves the limit by the strategy with a CAS loop, so concurrent outcomes
@@ -497,7 +495,7 @@ where
                     obs::adaptive_limit(&self.label, current, new);
                     if new > current {
                         // More slots: wake as many waiters as were added.
-                        let _woken = self.notify.notify((new - current) as usize);
+                        let _woken = self.notify.notify_additional((new - current) as usize);
                     }
                     return;
                 }
@@ -642,6 +640,25 @@ where
         self.wait_for_slot().await;
         OwnedAdaptivePermit::new(Arc::clone(self))
     }
+
+    /// Like [`acquire_timeout`](Self::acquire_timeout), returning an
+    /// [`OwnedAdaptivePermit`].
+    ///
+    /// # Errors
+    ///
+    /// [`ThrottleError::DeadlineExceeded`] if no slot frees within `timeout`.
+    pub async fn acquire_owned_timeout(
+        self: &Arc<Self>,
+        timeout: Duration,
+    ) -> Result<OwnedAdaptivePermit<S, C>, ThrottleError> {
+        let timer = obs::Timer::start();
+        let result = crate::resilience::timeout(timeout, self.wait_for_slot())
+            .await
+            .map(|()| OwnedAdaptivePermit::new(Arc::clone(self)))
+            .map_err(ThrottleError::from);
+        obs::waited(KIND, &self.label, &timer, 1, obs::Waited::of(&result));
+        result
+    }
 }
 
 impl<S, C> Limiter for AdaptiveLimiter<S, C>
@@ -687,12 +704,8 @@ where
 
     /// Releases `cost` slots without feeding an outcome to the strategy.
     fn refund(&self, cost: u32) {
-        let _released = self
-            .in_flight
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                Some(n.saturating_sub(cost))
-            });
-        let _woken = self.notify.notify(cost as usize);
+        let _released = crate::sync::saturating_sub(&self.in_flight, cost);
+        let _woken = self.notify.notify_additional(cost as usize);
     }
 }
 
@@ -752,6 +765,14 @@ where
     pub fn failure(mut self) {
         self.settled = true;
         self.limiter.settle(Outcome::Failure, self.epoch);
+    }
+
+    /// Frees the slot **without an outcome**: the request was never sent (or
+    /// was abandoned before it reached the downstream), so the strategy learns
+    /// nothing from it.
+    pub fn cancel(mut self) {
+        self.settled = true;
+        Limiter::refund(self.limiter, 1);
     }
 }
 
@@ -820,6 +841,19 @@ where
         self.settled = true;
         self.limiter.settle(Outcome::Failure, self.epoch);
     }
+
+    /// Frees the slot without an outcome. See [`AdaptivePermit::cancel`].
+    pub fn cancel(mut self) {
+        self.settled = true;
+        Limiter::refund(self.limiter.as_ref(), 1);
+    }
+
+    /// Restarts the round-trip clock: the request is about to be sent now (a
+    /// permit taken ahead of the call, as the tower layer does).
+    #[cfg(feature = "tower")]
+    pub(crate) fn restart(&mut self) {
+        self.started = self.limiter.now();
+    }
 }
 
 impl<S, C> Drop for OwnedAdaptivePermit<S, C>
@@ -862,15 +896,13 @@ where
 /// assert_eq!(limiter.current_limit(), 8);
 /// assert_eq!(limiter.name(), Some("search"));
 /// ```
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 #[must_use]
 pub struct AdaptiveLimiterBuilder {
     floor: u32,
     ceiling: u32,
     initial: Option<u32>,
-    /// A static name, so the builder stays `Copy`; name an instance with an
-    /// owned string through its `with_name`.
-    label: Option<&'static str>,
+    label: Label,
 }
 
 impl Default for AdaptiveLimiterBuilder {
@@ -886,7 +918,7 @@ impl AdaptiveLimiterBuilder {
             floor: 1,
             ceiling: 100,
             initial: None,
-            label: None,
+            label: Label::none(),
         }
     }
 
@@ -911,8 +943,8 @@ impl AdaptiveLimiterBuilder {
     }
 
     /// Names the limiter for metrics and events.
-    pub fn name(mut self, name: &'static str) -> Self {
-        self.label = Some(name);
+    pub fn name(mut self, name: impl Into<Cow<'static, str>>) -> Self {
+        self.label = Label::new(name);
         self
     }
 
@@ -930,7 +962,7 @@ impl AdaptiveLimiterBuilder {
             self.ceiling,
             initial,
             SystemClock::new(),
-            self.label.map_or_else(Label::none, Label::new),
+            self.label,
         )
     }
 }

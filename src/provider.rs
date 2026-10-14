@@ -20,6 +20,15 @@
 //!
 //! Reconciliation only ever *reduces* the local budget, so it can never raise a
 //! limiter above its configured capacity.
+//!
+//! # Server-driven pauses are capped
+//!
+//! A reset or `Retry-After` comes from the server, so it is untrusted input: a
+//! malformed or hostile `Retry-After: 999999999` would otherwise pause a client
+//! for decades. Every pause reconciliation sets is clamped to
+//! [`DEFAULT_MAX_PAUSE`] (five minutes, the same ceiling
+//! [`Retry`](crate::Retry) puts on a `Retry-After`); the `*_capped` variants take
+//! a ceiling of your choosing.
 
 use core::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -28,6 +37,24 @@ use crate::limiter::Limiter;
 use crate::multi::MultiLimiter;
 use crate::retry_after::parse_retry_after_at;
 use crate::timeutil::civil_to_unix;
+
+/// The longest pause reconciliation sets from a server's reset or
+/// `Retry-After`: five minutes. A longer server value is clamped to it.
+///
+/// # Examples
+///
+/// ```
+/// use std::time::Duration;
+/// use throttle_net::Throttle;
+/// use throttle_net::provider::{DEFAULT_MAX_PAUSE, HeaderProfile};
+///
+/// let throttle = Throttle::per_second(10);
+/// let info = HeaderProfile::STRIPE.parse(&[("Retry-After", "999999999")]);
+/// info.sync_requests(&throttle);
+/// assert!(throttle.paused_for() <= DEFAULT_MAX_PAUSE);
+/// assert_eq!(DEFAULT_MAX_PAUSE, Duration::from_secs(300));
+/// ```
+pub const DEFAULT_MAX_PAUSE: Duration = Duration::from_secs(300);
 
 /// One metered dimension's reported window: its ceiling, what is left, and how
 /// long until it refills. Any field may be absent if the server did not send it.
@@ -44,8 +71,8 @@ pub struct Window {
 impl Window {
     /// Reconciles `limiter` with this window: takes units until at most
     /// `remaining` are available locally and, if the server reports nothing
-    /// remaining and a reset time, pauses the limiter until that reset. Returns
-    /// the units drained.
+    /// remaining and a reset time, pauses the limiter until that reset (at most
+    /// [`DEFAULT_MAX_PAUSE`]). Returns the units drained.
     ///
     /// Never adds units. A `remaining` larger than the limiter can hold, or a
     /// window without `remaining`, drains nothing.
@@ -68,16 +95,47 @@ impl Window {
     /// assert_eq!(throttle.paused_for(), Duration::from_secs(20)); // held until the reset
     /// ```
     pub fn apply<L: Limiter + ?Sized>(&self, limiter: &L) -> u32 {
+        self.apply_capped(limiter, DEFAULT_MAX_PAUSE)
+    }
+
+    /// [`apply`](Self::apply) with a pause of at most `max_pause` (a longer
+    /// reset is clamped to it; `Duration::ZERO` never pauses).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use throttle_net::Throttle;
+    /// use throttle_net::provider::Window;
+    ///
+    /// let throttle = Throttle::per_minute(100);
+    /// let window = Window {
+    ///     remaining: Some(0),
+    ///     reset: Some(Duration::from_secs(3600)),
+    ///     ..Window::default()
+    /// };
+    /// window.apply_capped(&throttle, Duration::from_secs(60));
+    /// assert!(throttle.paused_for() <= Duration::from_secs(60));
+    /// ```
+    pub fn apply_capped<L: Limiter + ?Sized>(&self, limiter: &L, max_pause: Duration) -> u32 {
         let Some(remaining) = self.remaining else {
             return 0;
         };
         let drained = drain(limiter, remaining);
         if remaining == 0 {
             if let Some(reset) = self.reset {
-                limiter.pause_for(reset);
+                pause(limiter, reset, max_pause);
             }
         }
         drained
+    }
+}
+
+/// Pauses `limiter` for the server's `duration`, clamped to `max_pause`.
+fn pause<L: Limiter + ?Sized>(limiter: &L, duration: Duration, max_pause: Duration) {
+    let duration = duration.min(max_pause);
+    if !duration.is_zero() {
+        limiter.pause_for(duration);
     }
 }
 
@@ -107,7 +165,9 @@ impl RateLimitInfo {
     /// Reconciles `limiter` with the server's request window and `Retry-After`:
     /// drains it to the reported requests-remaining, pauses it until the reset
     /// when that is zero (see [`Window::apply`]), and pauses it for the
-    /// `Retry-After`, if any. Returns the units drained.
+    /// `Retry-After`, if any. Every pause is clamped to [`DEFAULT_MAX_PAUSE`];
+    /// use [`sync_requests_capped`](Self::sync_requests_capped) to choose the
+    /// ceiling. Returns the units drained.
     ///
     /// This only ever *reduces* the local budget — it never adds units — so it
     /// corrects client/server drift without ever raising the limiter above its
@@ -131,20 +191,54 @@ impl RateLimitInfo {
     /// assert_eq!(throttle.available(), 10); // now matches the server
     /// ```
     pub fn sync_requests<L: Limiter + ?Sized>(&self, limiter: &L) -> u32 {
-        self.sync_window(limiter, self.requests)
+        self.sync_window(limiter, self.requests, DEFAULT_MAX_PAUSE)
+    }
+
+    /// [`sync_requests`](Self::sync_requests) with every pause clamped to
+    /// `max_pause` (`Duration::ZERO`: drain only, never pause).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use throttle_net::Throttle;
+    /// use throttle_net::provider::HeaderProfile;
+    ///
+    /// let throttle = Throttle::per_second(10);
+    /// let info = HeaderProfile::STRIPE.parse(&[("Retry-After", "120")]);
+    /// info.sync_requests_capped(&throttle, Duration::from_secs(30));
+    /// assert!(throttle.paused_for() <= Duration::from_secs(30));
+    /// ```
+    pub fn sync_requests_capped<L: Limiter + ?Sized>(
+        &self,
+        limiter: &L,
+        max_pause: Duration,
+    ) -> u32 {
+        self.sync_window(limiter, self.requests, max_pause)
     }
 
     /// Reconciles `limiter` with the server's token window (and `Retry-After`),
     /// the same way as [`sync_requests`](Self::sync_requests). Returns the units
     /// drained.
     pub fn sync_tokens<L: Limiter + ?Sized>(&self, limiter: &L) -> u32 {
-        self.sync_window(limiter, self.tokens)
+        self.sync_window(limiter, self.tokens, DEFAULT_MAX_PAUSE)
     }
 
-    fn sync_window<L: Limiter + ?Sized>(&self, limiter: &L, window: Option<Window>) -> u32 {
-        let drained = window.map_or(0, |window| window.apply(limiter));
+    /// [`sync_tokens`](Self::sync_tokens) with every pause clamped to
+    /// `max_pause`.
+    pub fn sync_tokens_capped<L: Limiter + ?Sized>(&self, limiter: &L, max_pause: Duration) -> u32 {
+        self.sync_window(limiter, self.tokens, max_pause)
+    }
+
+    fn sync_window<L: Limiter + ?Sized>(
+        &self,
+        limiter: &L,
+        window: Option<Window>,
+        max_pause: Duration,
+    ) -> u32 {
+        let drained = window.map_or(0, |window| window.apply_capped(limiter, max_pause));
         if let Some(after) = self.retry_after {
-            limiter.pause_for(after);
+            pause(limiter, after, max_pause);
         }
         drained
     }
@@ -183,23 +277,34 @@ impl RateLimitInfo {
     // Callers usually reconcile for the side effect; the count is informative.
     #[allow(clippy::must_use_candidate)]
     pub fn sync_multi(&self, limiter: &MultiLimiter) -> u32 {
+        self.sync_multi_capped(limiter, DEFAULT_MAX_PAUSE)
+    }
+
+    /// [`sync_multi`](Self::sync_multi) with every pause clamped to
+    /// `max_pause`.
+    // Callers usually reconcile for the side effect; the count is informative.
+    #[allow(clippy::must_use_candidate)]
+    pub fn sync_multi_capped(&self, limiter: &MultiLimiter, max_pause: Duration) -> u32 {
         let mut drained = 0u32;
         if let (Some(window), Some(dimension)) = (self.requests, limiter.dimension("requests")) {
-            drained = drained.saturating_add(window.apply(dimension));
+            drained = drained.saturating_add(window.apply_capped(dimension, max_pause));
         }
         if let Some(window) = self.tokens {
             if let Some(dimension) = limiter.dimension("tokens") {
-                drained = drained.saturating_add(window.apply(dimension));
+                drained = drained.saturating_add(window.apply_capped(dimension, max_pause));
             } else {
                 for name in ["input_tokens", "output_tokens"] {
                     if let Some(dimension) = limiter.dimension(name) {
-                        drained = drained.saturating_add(window.apply(dimension));
+                        drained = drained.saturating_add(window.apply_capped(dimension, max_pause));
                     }
                 }
             }
         }
         if let Some(after) = self.retry_after {
-            limiter.pause_for(after);
+            let after = after.min(max_pause);
+            if !after.is_zero() {
+                limiter.pause_for(after);
+            }
         }
         drained
     }

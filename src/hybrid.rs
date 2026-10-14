@@ -143,6 +143,24 @@ impl Hybrid {
             limiter.pause_for(duration);
         }
     }
+
+    /// Lifts every constituent's pause (see [`Limiter::resume`]).
+    pub fn resume(&self) {
+        for limiter in self.constituents.iter() {
+            limiter.resume();
+        }
+    }
+
+    /// The longest remaining pause among the constituents (`Duration::ZERO`
+    /// when none is paused).
+    #[must_use]
+    pub fn paused_for(&self) -> Duration {
+        self.constituents
+            .iter()
+            .map(Limiter::paused_for)
+            .max()
+            .unwrap_or(Duration::ZERO)
+    }
 }
 
 #[cfg(feature = "runtime")]
@@ -172,10 +190,13 @@ impl Hybrid {
 
     /// Takes `cost` units from every constituent, waiting until all are free.
     ///
-    /// Each attempt reserves on every constituent at once; if any cannot
-    /// reserve, the others are refunded and the waiter sleeps for the longest
-    /// constituent wait. **Cancel-safe:** dropping the future returns any
-    /// reservation it held.
+    /// The waiter queues on the *bottleneck* — the constituent with the longest
+    /// wait — and takes the others only when that reservation matures, so a
+    /// fast constituent (perhaps shared with other callers) is never charged
+    /// long before the request can go. While any constituent is
+    /// [paused](Self::pause_for), the waiter sleeps the pause out, and a
+    /// [`resume`](Self::resume) wakes it. **Cancel-safe:** dropping the future
+    /// returns whatever it held.
     ///
     /// # Errors
     ///
@@ -214,11 +235,14 @@ impl Hybrid {
     }
 
     async fn wait(&self, cost: u32, timeout: Option<Duration>) -> Result<(), ThrottleError> {
-        use crate::wait::{Refusal, wait_for};
+        use crate::limiter::{Progress, paused_all, release_all, step_all};
+        use crate::wait::{Refusal, wait_with};
         let timer = obs::Timer::start();
-        let result = wait_for(
-            |budget| crate::limiter::step_all(self.pairs(cost), budget),
-            || refund_all(self.pairs(cost)),
+        let result = wait_with(
+            Progress::new(),
+            |progress, budget| step_all(self.pairs(cost), budget, progress),
+            |progress| release_all(self.pairs(cost), progress),
+            || paused_all(self.pairs(cost)),
             timeout,
         )
         .await
@@ -251,7 +275,7 @@ impl Limiter for Hybrid {
     fn available(&self) -> u32 {
         self.constituents
             .iter()
-            .map(|l| l.available())
+            .map(Limiter::available)
             .min()
             .unwrap_or(u32::MAX)
     }
@@ -263,7 +287,7 @@ impl Limiter for Hybrid {
     fn capacity(&self) -> u32 {
         self.constituents
             .iter()
-            .map(|l| l.capacity())
+            .map(Limiter::capacity)
             .min()
             .unwrap_or(u32::MAX)
     }
@@ -278,6 +302,14 @@ impl Limiter for Hybrid {
 
     fn pause_for(&self, duration: Duration) {
         Hybrid::pause_for(self, duration);
+    }
+
+    fn paused_for(&self) -> Duration {
+        Hybrid::paused_for(self)
+    }
+
+    fn resume(&self) {
+        Hybrid::resume(self);
     }
 }
 

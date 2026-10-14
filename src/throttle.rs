@@ -696,6 +696,7 @@ impl<C: Clock> Throttle<C> {
         let result = crate::wait::wait_for(
             |budget| self.step(cost, budget),
             || self.bucket.refund(cost),
+            || self.paused_for(),
             timeout,
         )
         .await
@@ -742,6 +743,34 @@ impl<C: Clock> Limiter for Throttle<C> {
 
     fn pause_for(&self, duration: Duration) {
         Throttle::pause_for(self, duration);
+    }
+
+    fn paused_for(&self) -> Duration {
+        Throttle::paused_for(self)
+    }
+
+    fn resume(&self) {
+        Throttle::resume(self);
+    }
+
+    /// Records the units as debt, even while paused: they were spent
+    /// downstream, so later callers wait behind them. Only a closed throttle
+    /// (capacity `0`) leaves units uncharged.
+    fn charge(&self, cost: u32) -> u32 {
+        let capacity = self.capacity();
+        if capacity == 0 {
+            return cost;
+        }
+        let now = self.now();
+        let mut left = cost;
+        while left > 0 {
+            let chunk = left.min(capacity);
+            if self.bucket.reserve_at(chunk, Duration::MAX, now).is_none() {
+                return left;
+            }
+            left -= chunk;
+        }
+        0
     }
 }
 

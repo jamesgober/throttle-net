@@ -141,6 +141,11 @@ struct Shared {
     failure_times: VecDeque<u64>,
     /// Trial requests in flight while half-open.
     half_open_inflight: u32,
+    /// How many of those trials were admitted through the [`Limiter`] trait
+    /// (`acquire_cost` / `reserve`), which issues no permit: a trait
+    /// [`refund`](Limiter::refund) or a manual `record_*` releases one of them
+    /// (TN2-003, TN2-015).
+    trait_probes: u32,
     /// Successful trials accumulated while half-open.
     half_open_successes: u32,
     /// Milliseconds (breaker epoch) at which an open breaker may go half-open.
@@ -156,6 +161,7 @@ impl Shared {
             outcomes: VecDeque::new(),
             failure_times: VecDeque::new(),
             half_open_inflight: 0,
+            trait_probes: 0,
             half_open_successes: 0,
             open_until_ms: 0,
         }
@@ -167,6 +173,7 @@ impl Shared {
         self.outcomes.clear();
         self.failure_times.clear();
         self.half_open_inflight = 0;
+        self.trait_probes = 0;
         self.half_open_successes = 0;
     }
 }
@@ -353,16 +360,32 @@ where
     /// Decides admission and performs any transition the clock has earned
     /// (open → half-open). Reserves a half-open trial slot when it admits one.
     fn admit(&self) -> Result<Ticket, Duration> {
+        self.admit_as(false)
+    }
+
+    /// [`admit`](Self::admit), counting a half-open trial taken through the
+    /// [`Limiter`] trait (which issues no permit) when `via_trait` is set.
+    fn admit_as(&self, via_trait: bool) -> Result<Ticket, Duration> {
         let now_ms = self.now_ms();
         let mut shared = self.lock();
+        let ticket = self.admit_locked(&mut shared, now_ms)?;
+        if ticket.probe && via_trait {
+            shared.trait_probes = shared.trait_probes.saturating_add(1);
+        }
+        Ok(ticket)
+    }
+
+    /// The admission decision, under the lock.
+    fn admit_locked(&self, shared: &mut Shared, now_ms: u64) -> Result<Ticket, Duration> {
         match shared.state {
             BreakerState::Closed => Ok(Ticket {
                 generation: shared.generation,
                 probe: false,
             }),
             BreakerState::Open if now_ms >= shared.open_until_ms => {
-                self.transition(&mut shared, BreakerState::Open, BreakerState::HalfOpen);
+                self.transition(shared, BreakerState::Open, BreakerState::HalfOpen);
                 shared.half_open_inflight = 1;
+                shared.trait_probes = 0;
                 shared.half_open_successes = 0;
                 Ok(Ticket {
                     generation: shared.generation,
@@ -394,13 +417,49 @@ where
     /// Releases a half-open trial slot that never reached the downstream (the
     /// wrapped limiter refused, or the waiting acquire was cancelled).
     fn abort(&self, ticket: Ticket) {
+        self.abort_as(ticket, false);
+    }
+
+    /// [`abort`](Self::abort) for a trial admitted through the [`Limiter`]
+    /// trait when `via_trait` is set.
+    fn abort_as(&self, ticket: Ticket, via_trait: bool) {
         if !ticket.probe {
             return;
         }
         let mut shared = self.lock();
         if shared.generation == ticket.generation && shared.state == BreakerState::HalfOpen {
             shared.half_open_inflight = shared.half_open_inflight.saturating_sub(1);
+            if via_trait {
+                shared.trait_probes = shared.trait_probes.saturating_sub(1);
+            }
         }
+    }
+
+    /// Releases one half-open trial taken through the [`Limiter`] trait whose
+    /// request never happened (a composite rolled back or was cancelled).
+    fn release_trait_probe(&self) {
+        let mut shared = self.lock();
+        if shared.state == BreakerState::HalfOpen && shared.trait_probes > 0 {
+            shared.trait_probes -= 1;
+            shared.half_open_inflight = shared.half_open_inflight.saturating_sub(1);
+        }
+    }
+
+    /// Whether a waiter admitted with `ticket` may still go after its wait: not
+    /// if the breaker has since moved to a state that would shed it (TN2-013).
+    #[cfg(feature = "runtime")]
+    fn still_admits(&self, ticket: Ticket) -> Result<(), Duration> {
+        let now_ms = self.now_ms();
+        let shared = self.lock();
+        if shared.generation == ticket.generation || shared.state == BreakerState::Closed {
+            return Ok(());
+        }
+        Err(match shared.state {
+            BreakerState::Open => {
+                Duration::from_millis(shared.open_until_ms.saturating_sub(now_ms))
+            }
+            _ => Duration::ZERO,
+        })
     }
 
     /// Records the outcome of a settled permit.
@@ -454,6 +513,7 @@ where
         shared.open_until_ms = now_ms
             .saturating_add(u64::try_from(self.config.cooldown.as_millis()).unwrap_or(u64::MAX));
         shared.half_open_inflight = 0;
+        shared.trait_probes = 0;
         shared.half_open_successes = 0;
         self.transition(shared, from, BreakerState::Open);
     }
@@ -461,8 +521,9 @@ where
     /// Reports a successful protected call made without a permit (for example
     /// through the [`Limiter`] trait). Prefer settling a [`Permit`].
     ///
-    /// While half-open, the outcome counts as a trial result and frees a trial
-    /// slot.
+    /// While half-open, the outcome counts as a trial result. It frees a trial
+    /// slot only if one is held by a trial admitted through the [`Limiter`]
+    /// trait: a call that never held a slot cannot free another's.
     pub fn record_success(&self) {
         self.record_manual(true);
     }
@@ -487,7 +548,11 @@ where
     fn record_manual(&self, success: bool) {
         let now_ms = self.now_ms();
         let mut shared = self.lock();
-        self.apply(&mut shared, success, now_ms, true);
+        let probe = shared.state == BreakerState::HalfOpen && shared.trait_probes > 0;
+        if probe {
+            shared.trait_probes -= 1;
+        }
+        self.apply(&mut shared, success, now_ms, probe);
     }
 
     /// Attempts to admit a request without waiting, returning a [`Permit`] on
@@ -678,16 +743,31 @@ where
                 },
             },
             || self.inner.refund(1),
+            || self.inner.paused_for(),
             timeout,
         )
         .await
-        .map(|()| slot.disarm())
         .map_err(|refusal| match refusal {
             Refusal::Never => ThrottleError::CostExceedsCapacity {
                 cost: 1,
                 capacity: self.inner.capacity(),
             },
             Refusal::TimedOut => ThrottleError::DeadlineExceeded,
+        })
+        .and_then(|()| {
+            // A long (queued) wait may outlive the state it was admitted in:
+            // if the breaker has opened meanwhile, shed instead of sending to
+            // the downstream it opened on (TN2-013).
+            let ticket = slot.disarm();
+            match self.still_admits(ticket) {
+                Ok(()) => Ok(ticket),
+                Err(retry_after) => {
+                    self.inner.refund(1);
+                    self.abort(ticket);
+                    obs::shed(KIND, &self.label);
+                    Err(ThrottleError::CircuitOpen { retry_after })
+                }
+            }
         });
         obs::waited(KIND, &self.label, &timer, 1, obs::Waited::of(&result));
         result
@@ -726,6 +806,20 @@ where
     /// ```
     pub async fn acquire_owned(self: &Arc<Self>) -> Result<OwnedPermit<L, C>, ThrottleError> {
         let ticket = self.admit_waiting(None).await?;
+        Ok(OwnedPermit::new(Arc::clone(self), ticket))
+    }
+
+    /// Like [`acquire_timeout`](Self::acquire_timeout), returning an
+    /// [`OwnedPermit`].
+    ///
+    /// # Errors
+    ///
+    /// As [`acquire_timeout`](Self::acquire_timeout).
+    pub async fn acquire_owned_timeout(
+        self: &Arc<Self>,
+        timeout: Duration,
+    ) -> Result<OwnedPermit<L, C>, ThrottleError> {
+        let ticket = self.admit_waiting(Some(timeout)).await?;
         Ok(OwnedPermit::new(Arc::clone(self), ticket))
     }
 }
@@ -891,6 +985,16 @@ where
         self.settled = true;
         self.breaker.settle(self.ticket, false);
     }
+
+    /// Gives the admission back **without an outcome**: the call was never
+    /// made, or was abandoned before it reached the downstream (a hedge that
+    /// lost, a request cancelled before sending). Frees a half-open trial slot
+    /// and refunds the wrapped limiter's unit; the breaker records nothing.
+    pub fn cancel(mut self) {
+        self.settled = true;
+        self.breaker.abort(self.ticket);
+        self.breaker.inner.refund(1);
+    }
 }
 
 impl<L, C> Drop for Permit<'_, L, C>
@@ -955,6 +1059,13 @@ where
         self.settled = true;
         self.breaker.settle(self.ticket, false);
     }
+
+    /// Gives the admission back without an outcome. See [`Permit::cancel`].
+    pub fn cancel(mut self) {
+        self.settled = true;
+        self.breaker.abort(self.ticket);
+        self.breaker.inner.refund(1);
+    }
 }
 
 impl<L, C> Drop for OwnedPermit<L, C>
@@ -1017,7 +1128,7 @@ where
     /// [`record_success`](CircuitBreaker::record_success) /
     /// [`record_failure`](CircuitBreaker::record_failure).
     fn acquire_cost(&self, cost: u32) -> Decision {
-        let ticket = match self.admit() {
+        let ticket = match self.admit_as(true) {
             Ok(ticket) => ticket,
             Err(after) => {
                 obs::shed(KIND, &self.label);
@@ -1026,7 +1137,7 @@ where
         };
         let decision = self.inner.acquire_cost(cost);
         if !decision.is_acquired() {
-            self.abort(ticket);
+            self.abort_as(ticket, true);
         }
         decision
     }
@@ -1044,21 +1155,39 @@ where
         self.inner.capacity()
     }
 
+    /// Returns the units to the wrapped limiter and, while half-open, frees
+    /// the trial slot the trait admission took: the request never happened (a
+    /// composite rolled back, or its waiting acquire was cancelled), so it must
+    /// not hold the breaker half-open (TN2-003).
     fn refund(&self, cost: u32) {
         self.inner.refund(cost);
+        self.release_trait_probe();
     }
 
     fn reserve(&self, cost: u32, max_wait: Duration) -> Option<Duration> {
-        let ticket = self.admit().ok()?;
+        let ticket = self.admit_as(true).ok()?;
         let reserved = self.inner.reserve(cost, max_wait);
         if reserved.is_none() {
-            self.abort(ticket);
+            self.abort_as(ticket, true);
         }
         reserved
     }
 
     fn pause_for(&self, duration: Duration) {
         self.inner.pause_for(duration);
+    }
+
+    fn paused_for(&self) -> Duration {
+        self.inner.paused_for()
+    }
+
+    fn resume(&self) {
+        self.inner.resume();
+    }
+
+    /// Charges the wrapped limiter; the breaker itself has nothing to charge.
+    fn charge(&self, cost: u32) -> u32 {
+        self.inner.charge(cost)
     }
 }
 
@@ -1093,16 +1222,14 @@ where
 ///     .build(Throttle::per_second(50));
 /// assert_eq!(breaker.name(), Some("payments"));
 /// ```
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 #[must_use]
 pub struct CircuitBreakerBuilder {
     trip: Trip,
     cooldown: Duration,
     half_open_trials: u32,
     half_open_required: u32,
-    /// A static name, so the builder stays `Copy`; name an instance with an
-    /// owned string through its `with_name`.
-    label: Option<&'static str>,
+    label: Label,
 }
 
 impl Default for CircuitBreakerBuilder {
@@ -1120,7 +1247,7 @@ impl CircuitBreakerBuilder {
             cooldown: Duration::from_secs(30),
             half_open_trials: 1,
             half_open_required: 1,
-            label: None,
+            label: Label::none(),
         }
     }
 
@@ -1146,8 +1273,8 @@ impl CircuitBreakerBuilder {
     }
 
     /// Names the breaker for metrics and events.
-    pub fn name(mut self, name: &'static str) -> Self {
-        self.label = Some(name);
+    pub fn name(mut self, name: impl Into<Cow<'static, str>>) -> Self {
+        self.label = Label::new(name);
         self
     }
 
@@ -1166,7 +1293,7 @@ impl CircuitBreakerBuilder {
                 half_open_required: self.half_open_required,
             },
             SystemClock::new(),
-            self.label.map_or_else(Label::none, Label::new),
+            self.label,
         )
     }
 }

@@ -18,3 +18,25 @@
 pub(crate) use core::sync::atomic::AtomicU32;
 #[cfg(throttle_loom)]
 pub(crate) use loom::sync::atomic::AtomicU32;
+
+/// Subtracts `n` from `atomic`, stopping at zero, and returns the previous
+/// value.
+///
+/// A compare-exchange loop rather than `fetch_update`, which newer toolchains
+/// deprecate in favour of `try_update` — a method the 1.85 MSRV lacks.
+#[inline]
+pub(crate) fn saturating_sub(atomic: &AtomicU32, n: u32) -> u32 {
+    use core::sync::atomic::Ordering;
+    let mut current = atomic.load(Ordering::Acquire);
+    loop {
+        match atomic.compare_exchange_weak(
+            current,
+            current.saturating_sub(n),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(previous) => return previous,
+            Err(actual) => current = actual,
+        }
+    }
+}
