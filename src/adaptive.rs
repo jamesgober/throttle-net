@@ -862,13 +862,15 @@ where
 /// assert_eq!(limiter.current_limit(), 8);
 /// assert_eq!(limiter.name(), Some("search"));
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 #[must_use]
 pub struct AdaptiveLimiterBuilder {
     floor: u32,
     ceiling: u32,
     initial: Option<u32>,
-    label: Label,
+    /// A static name, so the builder stays `Copy`; name an instance with an
+    /// owned string through its `with_name`.
+    label: Option<&'static str>,
 }
 
 impl Default for AdaptiveLimiterBuilder {
@@ -884,7 +886,7 @@ impl AdaptiveLimiterBuilder {
             floor: 1,
             ceiling: 100,
             initial: None,
-            label: Label::none(),
+            label: None,
         }
     }
 
@@ -909,8 +911,8 @@ impl AdaptiveLimiterBuilder {
     }
 
     /// Names the limiter for metrics and events.
-    pub fn name(mut self, name: impl Into<Cow<'static, str>>) -> Self {
-        self.label = Label::new(name);
+    pub fn name(mut self, name: &'static str) -> Self {
+        self.label = Some(name);
         self
     }
 
@@ -928,7 +930,7 @@ impl AdaptiveLimiterBuilder {
             self.ceiling,
             initial,
             SystemClock::new(),
-            self.label,
+            self.label.map_or_else(Label::none, Label::new),
         )
     }
 }

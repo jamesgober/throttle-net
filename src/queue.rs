@@ -427,6 +427,27 @@ where
         Queue::new(self.inner, self.capacity, self.overflow, clock, self.label)
     }
 
+    /// Names this instance for metrics and events (an owned name; the builder's
+    /// [`name`](QueueBuilder::name) takes a static one).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use throttle_net::{Queue, Throttle};
+    ///
+    /// let tenant = String::from("tenant-7");
+    /// let queue: Queue<Throttle> = Queue::builder()
+    ///     .build(Throttle::per_second(5))
+    ///     .with_name(format!("queue-{tenant}"));
+    /// assert_eq!(queue.name(), Some("queue-tenant-7"));
+    /// ```
+    #[must_use]
+    pub fn with_name(mut self, name: impl Into<Cow<'static, str>>) -> Self {
+        self.label = Label::new(name);
+        obs::queue_depth(&self.label, self.len());
+        self
+    }
+
     /// The number of waiters currently enqueued (a momentary snapshot).
     #[must_use]
     pub fn len(&self) -> usize {
@@ -693,12 +714,14 @@ where
 /// assert_eq!(queue.overflow(), Overflow::DropLowestPriority);
 /// assert_eq!(queue.name(), Some("crawler"));
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 #[must_use]
 pub struct QueueBuilder {
     capacity: usize,
     overflow: Overflow,
-    label: Label,
+    /// A static name, so the builder stays `Copy`; name an instance with an
+    /// owned string through its `with_name`.
+    label: Option<&'static str>,
 }
 
 impl Default for QueueBuilder {
@@ -714,7 +737,7 @@ impl QueueBuilder {
         Self {
             capacity: 1024,
             overflow: Overflow::Reject,
-            label: Label::none(),
+            label: None,
         }
     }
 
@@ -731,8 +754,8 @@ impl QueueBuilder {
     }
 
     /// Names the queue for metrics and events.
-    pub fn name(mut self, name: impl Into<Cow<'static, str>>) -> Self {
-        self.label = Label::new(name);
+    pub fn name(mut self, name: &'static str) -> Self {
+        self.label = Some(name);
         self
     }
 
@@ -748,7 +771,7 @@ impl QueueBuilder {
             self.capacity,
             self.overflow,
             SystemClock::new(),
-            self.label,
+            self.label.map_or_else(Label::none, Label::new),
         )
     }
 }

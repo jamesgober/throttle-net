@@ -1093,14 +1093,16 @@ where
 ///     .build(Throttle::per_second(50));
 /// assert_eq!(breaker.name(), Some("payments"));
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 #[must_use]
 pub struct CircuitBreakerBuilder {
     trip: Trip,
     cooldown: Duration,
     half_open_trials: u32,
     half_open_required: u32,
-    label: Label,
+    /// A static name, so the builder stays `Copy`; name an instance with an
+    /// owned string through its `with_name`.
+    label: Option<&'static str>,
 }
 
 impl Default for CircuitBreakerBuilder {
@@ -1118,7 +1120,7 @@ impl CircuitBreakerBuilder {
             cooldown: Duration::from_secs(30),
             half_open_trials: 1,
             half_open_required: 1,
-            label: Label::none(),
+            label: None,
         }
     }
 
@@ -1144,8 +1146,8 @@ impl CircuitBreakerBuilder {
     }
 
     /// Names the breaker for metrics and events.
-    pub fn name(mut self, name: impl Into<Cow<'static, str>>) -> Self {
-        self.label = Label::new(name);
+    pub fn name(mut self, name: &'static str) -> Self {
+        self.label = Some(name);
         self
     }
 
@@ -1164,7 +1166,7 @@ impl CircuitBreakerBuilder {
                 half_open_required: self.half_open_required,
             },
             SystemClock::new(),
-            self.label,
+            self.label.map_or_else(Label::none, Label::new),
         )
     }
 }
