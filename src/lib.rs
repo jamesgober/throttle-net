@@ -179,6 +179,9 @@ mod sync;
 mod throttle;
 #[cfg(feature = "std")]
 mod timeutil;
+#[cfg(feature = "tower")]
+#[cfg_attr(docsrs, doc(cfg(feature = "tower")))]
+pub mod tower;
 #[cfg(feature = "runtime")]
 mod wait;
 
