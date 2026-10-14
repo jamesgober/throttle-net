@@ -176,7 +176,7 @@ where
         let nap = if after.is_zero() {
             zero_waits = zero_waits.saturating_add(1);
             if zero_waits <= RACE_YIELDS {
-                futures_lite::future::yield_now().await;
+                crate::rt::yield_now().await;
                 continue;
             }
             let left = deadline.remaining();
@@ -191,7 +191,18 @@ where
             zero_waits = 0;
             after
         };
-        crate::rt::sleep_unless_resumed(nap, epoch).await;
+        // Only a waiter whose limiter is paused listens for a resume; one
+        // sleeping for a refill just sleeps. A resume that landed after the
+        // step (it moved the epoch) means "look again now".
+        let pause = paused();
+        if crate::rt::resume_epoch() != epoch {
+            continue;
+        }
+        if pause.is_zero() {
+            crate::rt::sleep(nap).await;
+        } else {
+            crate::rt::sleep_unless_resumed(nap, epoch).await;
+        }
     }
 }
 
@@ -445,5 +456,104 @@ mod tests {
         assert_eq!(result, Err(Refusal::TimedOut));
         assert_eq!(releases.load(Ordering::Relaxed), 1);
         assert_eq!(start.elapsed(), Duration::from_secs(1));
+    }
+
+    /// A resume wakes a waiter sleeping out a pause, but not one sleeping
+    /// for a refill (D3-01).
+    #[tokio::test(start_paused = true)]
+    #[allow(clippy::unwrap_used)]
+    async fn test_resume_wakes_only_paused_waiters() {
+        let refill_steps = Arc::new(AtomicU32::new(0));
+        let paused_steps = Arc::new(AtomicU32::new(0));
+        let paused_flag = Arc::new(std::sync::atomic::AtomicBool::new(true));
+
+        let r = Arc::clone(&refill_steps);
+        let refill = tokio::spawn(async move {
+            wait_for(
+                |_| {
+                    let n = r.fetch_add(1, Ordering::Relaxed);
+                    if n == 0 {
+                        Step::Retry(Duration::from_secs(10))
+                    } else {
+                        Step::Granted(Duration::ZERO)
+                    }
+                },
+                || {},
+                unpaused,
+                None,
+            )
+            .await
+        });
+        let p = Arc::clone(&paused_steps);
+        let flag = Arc::clone(&paused_flag);
+        let paused = tokio::spawn(async move {
+            wait_for(
+                |_| {
+                    let _ = p.fetch_add(1, Ordering::Relaxed);
+                    if flag.load(Ordering::Relaxed) {
+                        Step::Retry(Duration::from_secs(3600))
+                    } else {
+                        Step::Granted(Duration::ZERO)
+                    }
+                },
+                || {},
+                || {
+                    if flag.load(Ordering::Relaxed) {
+                        Duration::from_secs(3600)
+                    } else {
+                        Duration::ZERO
+                    }
+                },
+                None,
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let flag = Arc::clone(&paused_flag);
+        crate::rt::resume(move || {
+            flag.store(false, Ordering::Relaxed);
+            true
+        });
+        assert_eq!(paused.await.unwrap(), Ok(()));
+        let start = tokio::time::Instant::now();
+        assert_eq!(
+            refill_steps.load(Ordering::Relaxed),
+            1,
+            "not woken by the resume"
+        );
+        assert_eq!(refill.await.unwrap(), Ok(()));
+        assert!(start.elapsed() >= Duration::from_secs(8));
+        assert_eq!(paused_steps.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_a_resume_after_the_step_is_seen_without_sleeping() {
+        // The epoch moves between the step and the nap: the waiter looks
+        // again at once instead of sleeping the hour it was told.
+        let steps = AtomicU32::new(0);
+        let start = tokio::time::Instant::now();
+        let result = wait_for(
+            |_| {
+                let n = steps.fetch_add(1, Ordering::Relaxed);
+                if n == 0 {
+                    crate::rt::resume(|| false);
+                    Step::Retry(Duration::from_secs(3600))
+                } else {
+                    Step::Granted(Duration::ZERO)
+                }
+            },
+            || {},
+            || {
+                if steps.load(Ordering::Relaxed) <= 1 {
+                    Duration::from_secs(3600)
+                } else {
+                    Duration::ZERO
+                }
+            },
+            None,
+        )
+        .await;
+        assert_eq!(result, Ok(()));
+        assert_eq!(start.elapsed(), Duration::ZERO);
     }
 }

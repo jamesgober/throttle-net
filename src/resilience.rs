@@ -79,7 +79,7 @@ where
     };
     // `or` polls `work` first, so a future that is ready when the timer fires
     // still wins.
-    futures_lite::future::or(work, alarm).await
+    crate::rt::or(work, alarm).await
 }
 
 /// Runs `primary`; if it fails, runs `fallback` with the error and returns its

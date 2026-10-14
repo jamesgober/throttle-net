@@ -777,3 +777,62 @@ fn tn2_020_cancelled_permit_records_no_outcome() {
     assert_eq!(breaker.state(), BreakerState::Closed);
     assert_eq!(breaker.inner().available(), 10, "the unit was refunded");
 }
+
+// R-03 (final verification): `peek` and `available` of a key evicted while
+// limited reflect the debt it left behind.
+#[test]
+fn r03_peek_and_available_see_a_forgotten_keys_debt() {
+    use throttle_net::{Decision, Eviction, ManualClock, PerKey};
+
+    let clock = Arc::new(ManualClock::new());
+    let limiter: PerKey<u32, _> = PerKey::builder()
+        .per_second(10)
+        .eviction(Eviction::capacity(1))
+        .shards(1)
+        .clock(clock.clone())
+        .build();
+    assert!(limiter.try_acquire_with_cost(&1, 10)); // drained
+    assert!(limiter.try_acquire(&2)); // evicts key 1 into the debt ledger
+    assert_eq!(limiter.available(&1), 0);
+    assert!(matches!(limiter.peek(&1, 1), Decision::Retry { .. }));
+    clock.advance(Duration::from_millis(500));
+    assert_eq!(limiter.available(&1), 5);
+    limiter.refund(&1, 2);
+    assert_eq!(limiter.available(&1), 7);
+}
+
+#[cfg(all(feature = "circuit-breaker", feature = "tokio"))]
+#[tokio::test(start_paused = true)]
+async fn r07_breaker_call_timeout_bounds_admission() {
+    use throttle_net::{CallError, CircuitBreaker, Throttle, ThrottleError, TokioClock};
+
+    let breaker = CircuitBreaker::builder()
+        .build(Throttle::per_duration(1, Duration::from_secs(60)).with_clock(TokioClock::new()));
+    let ran = std::sync::atomic::AtomicU32::new(0);
+    let first: Result<(), CallError<()>> = breaker
+        .call_timeout(Duration::from_millis(10), || async {
+            let _ = ran.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        })
+        .await;
+    assert!(first.is_ok());
+    let second: Result<(), CallError<()>> = breaker
+        .call_timeout(Duration::from_millis(10), || async {
+            let _ = ran.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        })
+        .await;
+    assert!(matches!(
+        second,
+        Err(CallError::Rejected(ThrottleError::DeadlineExceeded))
+    ));
+    assert_eq!(
+        ran.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "the second never ran"
+    );
+    let later: Result<(), CallError<()>> = breaker
+        .call_timeout(Duration::from_secs(61), || async { Ok(()) })
+        .await;
+    assert!(later.is_ok());
+}

@@ -449,13 +449,12 @@ where
 
     /// Lifts any pause immediately, waking waiters that were sleeping it out.
     pub fn resume(&self) {
-        let previous = core::mem::take(&mut self.lock().hold_until_ns);
         #[cfg(feature = "runtime")]
-        if previous != 0 {
-            crate::rt::announce_resume();
-        }
+        crate::rt::resume(|| core::mem::take(&mut self.lock().hold_until_ns) != 0);
         #[cfg(not(feature = "runtime"))]
-        let _ = previous;
+        {
+            self.lock().hold_until_ns = 0;
+        }
     }
 
     /// Records `cost` units that were already spent, whether or not they fit

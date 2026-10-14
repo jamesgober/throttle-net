@@ -43,14 +43,15 @@ fn accrued(amount: u32, period_ms: u32, micros: u128) -> u128 {
 }
 
 /// The bound's tolerance in tokens. better-bucket's clock may run up to one
-/// unit ahead of exact; a unit is at most one token below ~4.3 × 10^9 tokens
-/// per second, and above that rate it counts in power-of-two multi-token units
-/// (the clock stays at or below 4.3 units per nanosecond), where a full bucket
-/// may also round up by part of a unit. Two units plus one covers both.
+/// unit ahead of exact, and a unit is at most one token below ~4.3 × 10^9
+/// tokens per second: one token of slack. Above that rate it counts in
+/// power-of-two multi-token units (the clock stays at or below 4.3 units per
+/// nanosecond), where a full bucket may also round up by part of a unit: two
+/// units plus one there.
 fn tolerance(amount: u32, period_ms: u32) -> u128 {
     let tokens_per_ns_x10 = (u128::from(amount) * 10).div_ceil(u128::from(period_ms) * 1_000_000);
     let unit = tokens_per_ns_x10.div_ceil(43).max(1).next_power_of_two();
-    2 * unit + 1
+    if unit == 1 { 1 } else { 2 * unit + 1 }
 }
 
 fuzz_target!(|input: Input| {

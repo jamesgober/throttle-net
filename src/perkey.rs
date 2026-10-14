@@ -5,7 +5,7 @@ use core::marker::PhantomData;
 use core::time::Duration;
 use std::borrow::Cow;
 
-use better_bucket::{BucketConfig, BucketCore, Decision as BucketDecision};
+use better_bucket::{BucketConfig, Decision as BucketDecision};
 use clock_lib::{Clock, Monotonic, SystemClock};
 
 use crate::decision::Decision;
@@ -367,8 +367,7 @@ where
         let now = self.now();
         let wait = self
             .store
-            .with_existing(key, |bucket| bucket.time_until_at(cost, now))
-            .unwrap_or_else(|| BucketCore::new(config, now).time_until_at(cost, now));
+            .view(key, now, config, |bucket| bucket.time_until_at(cost, now));
         match wait {
             None => Decision::Impossible,
             Some(wait) if wait.is_zero() => Decision::Acquired,
@@ -378,7 +377,8 @@ where
 
     /// Current tokens available for `key`. An unseen key reports the configured
     /// initial fill (the full capacity by default), since acquiring would
-    /// create a fresh bucket.
+    /// create a fresh bucket; a key evicted while limited reports what its
+    /// remembered debt leaves.
     ///
     /// # Examples
     ///
@@ -397,8 +397,7 @@ where
         };
         let now = self.now();
         self.store
-            .with_existing(key, |bucket| bucket.available_at(now))
-            .unwrap_or_else(|| config.initial())
+            .view(key, now, config, |bucket| bucket.available_at(now))
     }
 
     /// Reserves `cost` tokens for `key` (see [`Throttle::reserve`]): takes them
@@ -436,7 +435,8 @@ where
     }
 
     /// Returns `cost` tokens granted to `key` for work that never used them.
-    /// A key with no state (never seen, or evicted since) is left alone.
+    /// A key evicted while limited has the refund taken off its remembered
+    /// debt; a key with no state at all is left alone.
     ///
     /// # Examples
     ///
@@ -449,7 +449,9 @@ where
     /// assert_eq!(limiter.available(&"k"), 4);
     /// ```
     pub fn refund(&self, key: &K, cost: u32) {
-        let _known = self.store.with_existing(key, |bucket| bucket.refund(cost));
+        if let Some(config) = self.config {
+            let _known = self.store.refund(key, cost, config);
+        }
     }
 
     /// Forgets `key`'s state. Its next acquire starts from a fresh bucket.

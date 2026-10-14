@@ -263,7 +263,7 @@ immediately. `Hybrid`, `MultiLimiter`, and `Layered` gained `resume()` and
 answers. A token bucket still fails at once when the wait is known to be too
 long. 2.0 adds timeouts where 1.0 had none:
 `acquire_owned_timeout` on `CircuitBreaker`, `AdaptiveLimiter`, and `Bulkhead`,
-and `Bulkhead::call_timeout`.
+and `call_timeout` on `Bulkhead` and `CircuitBreaker`.
 
 **Migration.** None; replace an outer `tokio::time::timeout` with the built-in
 variant where you like.

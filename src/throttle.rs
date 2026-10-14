@@ -857,8 +857,11 @@ impl<C: Clock> ThrottleBuilder<C> {
     ///
     /// Rates above about 4.3 × 10^9 tokens per second (only reachable with a
     /// sub-second period) are effectively unlimited, and better-bucket counts
-    /// them in multi-token units: a grant is rounded up to a whole unit, and a
-    /// bucket may hand out up to one unit more than its exact bound.
+    /// them in power-of-two multi-token units: a grant is rounded up to a whole
+    /// unit, and a bucket may hand out less than two units more than its exact
+    /// bound (its clock runs under one unit ahead, and a full bucket rounds up
+    /// by under one unit) — at the fastest rate, about a nanosecond of refill.
+    /// At ordinary rates a unit is at most one token.
     pub fn rate(mut self, amount: u32, period: Duration) -> Self {
         self.amount = amount;
         self.period = period;

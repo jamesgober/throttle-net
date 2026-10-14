@@ -162,8 +162,8 @@ work ships here.)
 - **Fair, cancel-safe waiting with real deadlines.** `*_timeout` methods on
   `Throttle`, `SlidingWindowLog`, `Hybrid`, `MultiLimiter`, `PerKey`, `Layered`,
   `CircuitBreaker`, `AdaptiveLimiter`, and `Bulkhead`, plus
-  `acquire_owned_timeout` on the breaker, adaptive limiter, and bulkhead and
-  `Bulkhead::call_timeout`.
+  `acquire_owned_timeout` on the breaker, adaptive limiter, and bulkhead, and
+  `call_timeout` on the bulkhead and the breaker.
 - **`Limiter`:** provided `refund`, `reserve`, `pause_for`, `paused_for`,
   `resume`, `charge`; blanket impls for `&L`, `Box<L>`, `Arc<L>`.
 - **Pauses:** `resume` / `paused_for` on `Hybrid`, `MultiLimiter`, and

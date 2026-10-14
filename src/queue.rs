@@ -636,7 +636,7 @@ where
             };
 
             let sleep_for = cap_to_deadline(wait, now_ms, deadline_ms);
-            futures_lite::future::or(listener, crate::rt::sleep(sleep_for)).await;
+            crate::rt::or(listener, crate::rt::sleep(sleep_for)).await;
         }
     }
 }

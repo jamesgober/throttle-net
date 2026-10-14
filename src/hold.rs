@@ -29,13 +29,13 @@ impl Hold {
     /// that lets the acquire path skip computing `now` in nanoseconds.
     #[inline]
     pub(crate) fn is_set(&self) -> bool {
-        self.until_ns.load(Ordering::Relaxed) != 0
+        self.until_ns.load(Ordering::SeqCst) != 0
     }
 
     /// How long the hold still applies at `now_ns` (`ZERO` when it does not).
     #[inline]
     pub(crate) fn remaining(&self, now_ns: u64) -> Duration {
-        let until = self.until_ns.load(Ordering::Relaxed);
+        let until = self.until_ns.load(Ordering::SeqCst);
         Duration::from_nanos(until.saturating_sub(now_ns))
     }
 
@@ -56,13 +56,10 @@ impl Hold {
 
     /// Lifts the hold immediately, waking any waiter sleeping it out.
     pub(crate) fn clear(&self) {
-        let previous = self.until_ns.swap(0, Ordering::AcqRel);
         #[cfg(feature = "runtime")]
-        if previous != 0 {
-            crate::rt::announce_resume();
-        }
+        crate::rt::resume(|| self.until_ns.swap(0, Ordering::SeqCst) != 0);
         #[cfg(not(feature = "runtime"))]
-        let _ = previous;
+        self.until_ns.store(0, Ordering::SeqCst);
     }
 }
 

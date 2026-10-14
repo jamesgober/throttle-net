@@ -23,7 +23,8 @@ pub const DEFAULT_MAX_KEYS: usize = 1 << 20;
 ///   key is evicted but its **debt** — when its bucket will be full again — is
 ///   kept in a compact per-shard ledger (16 bytes, keyed by the key's hash),
 ///   and a key that comes back while its debt is there is re-created in that
-///   debt. So eviction never hands a limited key a fresh allowance. Only when
+///   debt. So eviction never hands a limited key a fresh allowance; `peek`,
+///   `available`, and `refund` see the remembered debt too. Only when
 ///   the ledger is full of unsettled debts too does [`WhenFull`] decide what
 ///   gives: by default the *new* key waits or is refused
 ///   ([`WhenFull::RefuseNew`]).

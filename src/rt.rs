@@ -1,10 +1,11 @@
 //! Runtime abstraction: one async `sleep` over the selected backend, and a
 //! clock that follows tokio's time.
 //!
-//! Notifications use `event-listener` and races use `futures-lite`, both
-//! runtime-agnostic, so the only runtime-specific operation is the timer. The
-//! `tokio` (default) or `smol` feature provides it; if both are enabled, tokio's
-//! timer is used. The rest of the waiting surface is identical on either, and the
+//! Notifications use `event-listener` (runtime-agnostic) and the few
+//! combinators the waits need are defined here, so the only runtime-specific
+//! operation is the timer. The `tokio` (default) or `smol` feature provides it
+//! (smol's timer is `async_io::Timer`); if both are enabled, tokio's timer is
+//! used. The rest of the waiting surface is identical on either, and the
 //! same async code runs on whichever executor the application drives it with.
 
 use core::time::Duration;
@@ -26,7 +27,7 @@ pub(crate) async fn sleep(duration: Duration) {
 #[inline]
 pub(crate) async fn sleep(duration: Duration) {
     // The timer resolves to the instant it fired, which nothing here needs.
-    let _fired_at = smol::Timer::after(duration).await;
+    let _fired_at = async_io::Timer::after(duration).await;
 }
 
 /// The runtime's notion of "now" for waiting deadlines: tokio's (pausable)
@@ -38,26 +39,33 @@ pub(crate) use tokio::time::Instant;
 #[cfg(all(feature = "smol", not(feature = "tokio")))]
 pub(crate) use std::time::Instant;
 
-/// Woken whenever any limiter's pause is lifted, so waiters sleeping out a
-/// pause re-check at once (TN2-010). One process-wide event keeps every pause
-/// a single atomic word; a resume is rare, so the occasional spurious wake-up
-/// of an unrelated waiter (it simply re-checks and sleeps again) is cheap.
+/// Woken whenever a pause is lifted (TN2-010). Only waiters whose own limiter
+/// is paused listen on it — a waiter sleeping for a refill never registers —
+/// so a `resume` wakes exactly the waiters that are sleeping out a pause (on
+/// any limiter: one whose own limiter is still paused re-checks and sleeps
+/// again). One process-wide event keeps every pause a single atomic word.
 static RESUMED: event_listener::Event = event_listener::Event::new();
 
-/// Bumped on every resume, so a waiter that read it before deciding to sleep
-/// can tell that a resume happened before it started listening.
+/// Bumped on every resume, before the pause is cleared, so a waiter that read
+/// it before deciding how to sleep can tell that a resume happened since.
 static RESUME_EPOCH: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 /// The current resume epoch: read it *before* checking a pause.
 #[inline]
 pub(crate) fn resume_epoch() -> usize {
-    RESUME_EPOCH.load(core::sync::atomic::Ordering::Acquire)
+    RESUME_EPOCH.load(core::sync::atomic::Ordering::SeqCst)
 }
 
-/// Announces that a pause was lifted: wakes every waiter sleeping on one.
-pub(crate) fn announce_resume() {
-    let _previous = RESUME_EPOCH.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
-    let _woken = RESUMED.notify(usize::MAX);
+/// Lifts a pause: bumps the epoch, runs `lift` (which clears the pause and
+/// reports whether one was set), and wakes the waiters sleeping one out.
+///
+/// The epoch moves first, so a waiter that sees the pause gone also sees the
+/// new epoch and never sleeps through the resume.
+pub(crate) fn resume(lift: impl FnOnce() -> bool) {
+    let _previous = RESUME_EPOCH.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    if lift() {
+        let _woken = RESUMED.notify(usize::MAX);
+    }
 }
 
 /// Sleeps for `duration`, or until a pause is lifted after `epoch` was read,
@@ -71,7 +79,40 @@ pub(crate) async fn sleep_unless_resumed(duration: Duration, epoch: usize) {
     if resume_epoch() != epoch {
         return;
     }
-    futures_lite::future::or(sleep(duration), listener).await;
+    or(sleep(duration), listener).await;
+}
+
+/// Runs two futures to completion side by side and resolves with whichever
+/// finishes first (polling `a` first); the other is dropped.
+pub(crate) async fn or<T, A, B>(a: A, b: B) -> T
+where
+    A: core::future::Future<Output = T>,
+    B: core::future::Future<Output = T>,
+{
+    let mut a = core::pin::pin!(a);
+    let mut b = core::pin::pin!(b);
+    core::future::poll_fn(move |cx| {
+        if let core::task::Poll::Ready(value) = a.as_mut().poll(cx) {
+            return core::task::Poll::Ready(value);
+        }
+        b.as_mut().poll(cx)
+    })
+    .await
+}
+
+/// Yields to the executor once, so other tasks run before this one resumes.
+pub(crate) async fn yield_now() {
+    let mut yielded = false;
+    core::future::poll_fn(move |cx| {
+        if yielded {
+            core::task::Poll::Ready(())
+        } else {
+            yielded = true;
+            cx.waker().wake_by_ref();
+            core::task::Poll::Pending
+        }
+    })
+    .await;
 }
 
 /// A [`Clock`](clock_lib::Clock) that reads tokio's time.

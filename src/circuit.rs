@@ -710,6 +710,63 @@ where
         Fut: core::future::Future<Output = Result<T, E>>,
     {
         let permit = self.acquire().await.map_err(CallError::Rejected)?;
+        Self::settle_call(permit, operation).await
+    }
+
+    /// Like [`call`](Self::call), but waits at most `timeout` to be admitted
+    /// (on the wrapped limiter). The operation itself is not timed: wrap it in
+    /// [`resilience::timeout`](crate::resilience::timeout) for that (a call
+    /// that times out then counts as a failure).
+    ///
+    /// # Errors
+    ///
+    /// [`CallError::Rejected`] when the breaker or the wrapped limiter refused
+    /// the call, including [`ThrottleError::DeadlineExceeded`] when it could
+    /// not be admitted within `timeout` — the operation never ran;
+    /// [`CallError::Failed`] with the operation's own error otherwise.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # async fn run() {
+    /// use std::time::Duration;
+    /// use throttle_net::{CallError, CircuitBreaker, Throttle, ThrottleError};
+    ///
+    /// let breaker = CircuitBreaker::builder().build(Throttle::per_duration(1, Duration::from_secs(60)));
+    /// let first: Result<u8, CallError<()>> =
+    ///     breaker.call_timeout(Duration::from_millis(10), || async { Ok(1) }).await;
+    /// assert!(matches!(first, Ok(1)));
+    /// // The next unit is a minute away: refused at once, unrun.
+    /// let second: Result<u8, CallError<()>> =
+    ///     breaker.call_timeout(Duration::from_millis(10), || async { Ok(2) }).await;
+    /// assert!(matches!(second, Err(CallError::Rejected(ThrottleError::DeadlineExceeded))));
+    /// # }
+    /// ```
+    pub async fn call_timeout<F, Fut, T, E>(
+        &self,
+        timeout: Duration,
+        operation: F,
+    ) -> Result<T, CallError<E>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: core::future::Future<Output = Result<T, E>>,
+    {
+        let permit = self
+            .acquire_timeout(timeout)
+            .await
+            .map_err(CallError::Rejected)?;
+        Self::settle_call(permit, operation).await
+    }
+
+    /// Runs `operation` under `permit` and settles it from the result.
+    async fn settle_call<F, Fut, T, E>(
+        permit: Permit<'_, L, C>,
+        operation: F,
+    ) -> Result<T, CallError<E>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: core::future::Future<Output = Result<T, E>>,
+    {
         match operation().await {
             Ok(value) => {
                 permit.success();
@@ -1162,6 +1219,16 @@ where
     /// the trial slot the trait admission took: the request never happened (a
     /// composite rolled back, or its waiting acquire was cancelled), so it must
     /// not hold the breaker half-open (TN2-003).
+    ///
+    /// A refund carries no identity, so the breaker frees *a* trait-admitted
+    /// trial slot of the current half-open period if one is held. A refund of
+    /// units admitted earlier, while the breaker was closed, that arrives
+    /// during a later half-open period (an estimate settled after a trip, say)
+    /// therefore frees a live trial's slot, and one more trial than
+    /// `half_open_trials` can run until that trial settles. Over-counting the
+    /// other way could wedge the breaker half-open, so the approximation errs
+    /// towards admitting. Permits ([`acquire`](CircuitBreaker::acquire)) carry
+    /// their admission and are exact.
     fn refund(&self, cost: u32) {
         self.inner.refund(cost);
         self.release_trait_probe();

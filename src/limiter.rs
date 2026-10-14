@@ -580,6 +580,13 @@ const MAX_SWITCHES: u8 = 4;
 /// charged only when the request is (nearly) ready to go, never minutes ahead:
 /// one caller queued on its own slow scope cannot drain a shared one and starve
 /// everyone else (TN2-002).
+///
+/// The fallback after [`MAX_SWITCHES`] guarantees progress when two
+/// contended constituents keep overtaking each other, at a bounded cost: that
+/// one waiter holds its matured bottleneck units (at most its own `cost`)
+/// while it waits for the rest, for at most its remaining budget. Reaching it
+/// takes four consecutive bottleneck switches, each of which already waited a
+/// full bottleneck wait.
 #[cfg(feature = "runtime")]
 pub(crate) fn step_all<'a, I>(
     items: I,
@@ -889,5 +896,309 @@ mod tests {
             Some(Duration::ZERO)
         );
         assert_eq!(a.available(), 5);
+    }
+
+    #[test]
+    fn test_default_provided_methods() {
+        let pool = Pool::new(4);
+        assert_eq!(pool.paused_for(), Duration::ZERO);
+        pool.resume(); // a no-op
+        // The default charge reserves what is there and drains the rest.
+        assert_eq!(pool.charge(3), 0);
+        assert_eq!(pool.available(), 1);
+        assert_eq!(pool.charge(5), 4, "only one more unit could be charged");
+        assert_eq!(pool.available(), 0);
+        let closed = Pool::new(0);
+        assert_eq!(closed.charge(2), 2, "a closed limiter charges nothing");
+    }
+
+    /// Calls every trait method through `L`, so the forwarding impls for
+    /// `&L`, `Box<L>`, and `Arc<L>` are exercised.
+    fn exercise<L: Limiter>(limiter: &L) {
+        assert!(limiter.peek(1).is_acquired());
+        assert!(limiter.acquire_cost(1).is_acquired());
+        assert_eq!(limiter.capacity(), 10);
+        assert_eq!(limiter.available(), 9);
+        limiter.refund(1);
+        assert_eq!(limiter.available(), 10);
+        assert_eq!(limiter.reserve(2, Duration::MAX), Some(Duration::ZERO));
+        assert_eq!(limiter.charge(2), 0);
+        limiter.pause_for(Duration::from_secs(5));
+        assert!(limiter.paused_for() > Duration::ZERO);
+        limiter.resume();
+        assert_eq!(limiter.paused_for(), Duration::ZERO);
+    }
+
+    #[test]
+    fn test_shared_limiters_forward_every_method() {
+        let throttle = Throttle::per_duration(10, Duration::from_secs(3600));
+        exercise(&&throttle);
+        exercise(&Box::new(Throttle::per_duration(
+            10,
+            Duration::from_secs(3600),
+        )));
+        exercise(&std::sync::Arc::new(Throttle::per_duration(
+            10,
+            Duration::from_secs(3600),
+        )));
+        let boxed: Box<dyn Limiter> =
+            Box::new(Throttle::per_duration(10, Duration::from_secs(3600)));
+        exercise(&boxed);
+    }
+
+    #[test]
+    fn test_reserve_all_refuses_when_a_constituent_would_be_held() {
+        let fast = Throttle::per_second(10);
+        let slow = Pool::new(1);
+        assert!(slow.acquire_cost(1).is_acquired()); // slow now waits 1s
+        let items = [(&fast as &dyn Limiter, 1), (&slow as &dyn Limiter, 1)];
+        assert_eq!(reserve_all(items.iter().copied(), Duration::MAX), None);
+        assert_eq!(fast.available(), 10, "nothing held");
+        let over_budget = [(&slow as &dyn Limiter, 1)];
+        assert_eq!(
+            reserve_all(over_budget.iter().copied(), Duration::from_millis(1)),
+            None
+        );
+        let impossible = [(&fast as &dyn Limiter, 11)];
+        assert_eq!(reserve_all(impossible.iter().copied(), Duration::MAX), None);
+    }
+
+    #[cfg(feature = "runtime")]
+    #[allow(clippy::unwrap_used)]
+    mod composite {
+        use super::super::{Limiter, Progress, release_all, step_all};
+        use crate::decision::Decision;
+        use crate::wait::Step;
+        use core::time::Duration;
+        use std::collections::VecDeque;
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        /// A limiter that answers from scripts (then grants), and counts refunds.
+        #[derive(Default)]
+        struct Scripted {
+            peeks: Mutex<VecDeque<Decision>>,
+            acquires: Mutex<VecDeque<Decision>>,
+            reserves: Mutex<VecDeque<Option<Duration>>>,
+            refunds: AtomicU32,
+        }
+
+        impl Scripted {
+            fn peeks(self, script: &[Decision]) -> Self {
+                self.peeks.lock().unwrap().extend(script.iter().copied());
+                self
+            }
+            fn acquires(self, script: &[Decision]) -> Self {
+                self.acquires.lock().unwrap().extend(script.iter().copied());
+                self
+            }
+            fn reserves(self, script: &[Option<Duration>]) -> Self {
+                self.reserves.lock().unwrap().extend(script.iter().copied());
+                self
+            }
+            fn refunds(&self) -> u32 {
+                self.refunds.load(Ordering::Relaxed)
+            }
+        }
+
+        impl Limiter for Scripted {
+            fn peek(&self, _: u32) -> Decision {
+                self.peeks
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or(Decision::Acquired)
+            }
+            fn acquire_cost(&self, _: u32) -> Decision {
+                self.acquires
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or(Decision::Acquired)
+            }
+            fn available(&self) -> u32 {
+                1
+            }
+            fn capacity(&self) -> u32 {
+                1
+            }
+            fn refund(&self, _: u32) {
+                let _ = self.refunds.fetch_add(1, Ordering::Relaxed);
+            }
+            fn reserve(&self, _: u32, _: Duration) -> Option<Duration> {
+                self.reserves
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or(Some(Duration::ZERO))
+            }
+        }
+
+        fn wait(ms: u64) -> Decision {
+            Decision::Retry {
+                after: Duration::from_millis(ms),
+            }
+        }
+
+        fn is_holding(step: &Step) -> bool {
+            matches!(step, Step::Holding(_))
+        }
+
+        #[test]
+        fn test_a_matured_bottleneck_takes_the_rest_or_keeps_trying_on_a_lost_race() {
+            let a = Scripted::default().peeks(&[wait(1000)]);
+            let b = Scripted::default().acquires(&[wait(5)]);
+            let items = [(&a as &dyn Limiter, 1), (&b as &dyn Limiter, 1)];
+            let mut progress = Progress::new();
+            // Phase 1: `a` is the bottleneck and reserves (due at once).
+            assert!(is_holding(&step_all(
+                items.iter().copied(),
+                Duration::MAX,
+                &mut progress
+            )));
+            // Phase 2: `b` peeks ready but loses the race: keep `a`, try again.
+            assert!(matches!(
+                step_all(items.iter().copied(), Duration::MAX, &mut progress),
+                Step::Holding(d) if d.is_zero()
+            ));
+            assert!(matches!(
+                step_all(items.iter().copied(), Duration::MAX, &mut progress),
+                Step::Granted(d) if d.is_zero()
+            ));
+            assert_eq!(a.refunds() + b.refunds(), 0);
+            release_all(items.iter().copied(), &mut progress);
+            assert_eq!((a.refunds(), b.refunds()), (1, 1), "everything goes back");
+        }
+
+        #[test]
+        fn test_a_short_wait_on_the_rest_is_reserved_while_holding() {
+            let a = Scripted::default().peeks(&[wait(1000)]);
+            let b = Scripted::default()
+                .peeks(&[Decision::Acquired, wait(5)])
+                .reserves(&[Some(Duration::from_millis(5))]);
+            let items = [(&a as &dyn Limiter, 1), (&b as &dyn Limiter, 1)];
+            let mut progress = Progress::new();
+            assert!(is_holding(&step_all(
+                items.iter().copied(),
+                Duration::MAX,
+                &mut progress
+            )));
+            assert!(matches!(
+                step_all(items.iter().copied(), Duration::MAX, &mut progress),
+                Step::Granted(d) if d == Duration::from_millis(5)
+            ));
+        }
+
+        #[test]
+        fn test_a_long_wait_on_the_rest_switches_the_bottleneck() {
+            // `a` matures but `b` then needs 1s: give `a` back and queue on `b`.
+            let a = Scripted::default().peeks(&[wait(1000)]);
+            let b = Scripted::default().peeks(&[Decision::Acquired, wait(1000), wait(1000)]);
+            let items = [(&a as &dyn Limiter, 1), (&b as &dyn Limiter, 1)];
+            let mut progress = Progress::new();
+            assert!(is_holding(&step_all(
+                items.iter().copied(),
+                Duration::MAX,
+                &mut progress
+            )));
+            assert!(is_holding(&step_all(
+                items.iter().copied(),
+                Duration::MAX,
+                &mut progress
+            )));
+            assert_eq!(a.refunds(), 1, "the matured units went back");
+            assert_eq!(progress.switches, 1);
+            assert_eq!(progress.held, super::super::Held::One(1), "now queued on b");
+            // Then `a` is free: take it and go.
+            assert!(matches!(
+                step_all(items.iter().copied(), Duration::MAX, &mut progress),
+                Step::Granted(_)
+            ));
+        }
+
+        #[test]
+        fn test_after_four_switches_the_rest_is_reserved_while_holding() {
+            let a = Scripted::default();
+            let b = Scripted::default().peeks(&[wait(1000)]);
+            let items = [(&a as &dyn Limiter, 1), (&b as &dyn Limiter, 1)];
+            let mut progress = Progress::new();
+            progress.switches = 4;
+            progress.held = super::super::Held::One(0);
+            assert!(matches!(
+                step_all(items.iter().copied(), Duration::MAX, &mut progress),
+                Step::Granted(_)
+            ));
+            assert_eq!(a.refunds(), 0, "held, not given back");
+        }
+
+        #[test]
+        fn test_phase_two_reports_never_and_releases() {
+            let a = Scripted::default().peeks(&[wait(1000)]);
+            let b = Scripted::default().peeks(&[Decision::Acquired, Decision::Impossible]);
+            let items = [(&a as &dyn Limiter, 1), (&b as &dyn Limiter, 1)];
+            let mut progress = Progress::new();
+            assert!(is_holding(&step_all(
+                items.iter().copied(),
+                Duration::MAX,
+                &mut progress
+            )));
+            assert!(matches!(
+                step_all(items.iter().copied(), Duration::MAX, &mut progress),
+                Step::Never
+            ));
+            assert_eq!(a.refunds(), 1);
+        }
+
+        #[test]
+        fn test_phase_one_edge_cases() {
+            // Over budget: retry without reserving.
+            let slow = Scripted::default().peeks(&[wait(1000)]);
+            let items = [(&slow as &dyn Limiter, 1)];
+            let mut progress = Progress::new();
+            assert!(matches!(
+                step_all(
+                    items.iter().copied(),
+                    Duration::from_millis(1),
+                    &mut progress
+                ),
+                Step::Retry(_)
+            ));
+            // A bottleneck that cannot reserve: retry after its wait.
+            let unreservable = Scripted::default().peeks(&[wait(10)]).reserves(&[None]);
+            let items = [(&unreservable as &dyn Limiter, 1)];
+            assert!(matches!(
+                step_all(items.iter().copied(), Duration::MAX, &mut progress),
+                Step::Retry(d) if d == Duration::from_millis(10)
+            ));
+            // Everything ready but the commit says impossible, or loses a race.
+            let impossible = Scripted::default().acquires(&[Decision::Impossible]);
+            let items = [(&impossible as &dyn Limiter, 1)];
+            assert!(matches!(
+                step_all(items.iter().copied(), Duration::MAX, &mut progress),
+                Step::Never
+            ));
+            let racing = Scripted::default().acquires(&[wait(1)]);
+            let items = [(&racing as &dyn Limiter, 1)];
+            assert!(matches!(
+                step_all(items.iter().copied(), Duration::MAX, &mut progress),
+                Step::Retry(d) if d.is_zero()
+            ));
+            // A held reservation not yet due keeps holding.
+            let due_later = Scripted::default()
+                .peeks(&[wait(1000)])
+                .reserves(&[Some(Duration::from_secs(60))]);
+            let other = Scripted::default();
+            let items = [(&due_later as &dyn Limiter, 1), (&other as &dyn Limiter, 1)];
+            let mut progress = Progress::new();
+            assert!(is_holding(&step_all(
+                items.iter().copied(),
+                Duration::MAX,
+                &mut progress
+            )));
+            assert!(matches!(
+                step_all(items.iter().copied(), Duration::MAX, &mut progress),
+                Step::Holding(d) if d > Duration::from_secs(59)
+            ));
+        }
     }
 }

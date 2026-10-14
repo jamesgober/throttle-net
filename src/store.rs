@@ -221,6 +221,21 @@ impl Ledger {
         Some(self.debts.swap_remove(pos))
     }
 
+    /// Pays `cost` tokens off the debt recorded for `hash`: it settles that
+    /// much refill time sooner (rounded down, so never more generously).
+    /// Returns whether there was a debt.
+    fn pay_down(&mut self, hash: u64, cost: u32, config: BucketConfig) -> bool {
+        let Some(debt) = self.position(hash).and_then(|pos| self.debts.get_mut(pos)) else {
+            return false;
+        };
+        let per_token =
+            config.refill_period().as_nanos() / u128::from(config.refill_amount().max(1));
+        let credit = per_token.saturating_mul(u128::from(cost));
+        let credit = Duration::from_nanos(u64::try_from(credit).unwrap_or(u64::MAX));
+        debt.settles_at = debt.settles_at.saturating_sub(credit);
+        true
+    }
+
     /// Takes the debt recorded for `hash`, if any.
     fn take(&mut self, hash: u64) -> Option<Duration> {
         let pos = self.position(hash)?;
@@ -575,7 +590,7 @@ impl<K: Eq + Hash> Store<K> {
         Self {
             shards,
             shard_mask: shard_count as u64 - 1,
-            hasher: RandomState::new(),
+            hasher: random_state(),
             per_shard_cap,
             idle_ttl_ms,
             forget_debt: matches!(eviction.when_full(), WhenFull::ForgetDebt),
@@ -664,6 +679,57 @@ impl<K: Eq + Hash> Store<K> {
         map.get(hash, key).map(|entry| op(&entry.bucket))
     }
 
+    /// Runs `op` on the bucket `key` has, or would have if it were acquired
+    /// now: its live bucket, or a fresh one from `config` carrying any debt the
+    /// key left in the ledger. Creates nothing and refreshes nothing, so a
+    /// peek at a forgotten key agrees with what its next acquire will see.
+    #[inline]
+    pub(crate) fn view<R>(
+        &self,
+        key: &K,
+        now: Duration,
+        config: BucketConfig,
+        op: impl FnOnce(&BucketCore) -> R,
+    ) -> R {
+        let hash = self.hasher.hash_one(key);
+        let map = read(&self.shard(hash).map);
+        if let Some(entry) = map.get(hash, key) {
+            return op(&entry.bucket);
+        }
+        let fresh = BucketCore::new(config, now);
+        if let Some(debt) = map
+            .ledger
+            .position(hash)
+            .and_then(|pos| map.ledger.debts.get(pos))
+        {
+            restore_debt(&fresh, config, now, debt.settles_at);
+        }
+        op(&fresh)
+    }
+
+    /// Gives `cost` tokens back to `key`: to its live bucket, or — when the
+    /// key was forgotten while limited — off the debt it left in the ledger.
+    /// Returns whether the key had state.
+    pub(crate) fn refund(&self, key: &K, cost: u32, config: BucketConfig) -> bool {
+        let hash = self.hasher.hash_one(key);
+        {
+            let map = read(&self.shard(hash).map);
+            if let Some(entry) = map.get(hash, key) {
+                entry.bucket.refund(cost);
+                return true;
+            }
+            if map.ledger.position(hash).is_none() {
+                return false;
+            }
+        }
+        let mut map = write(&self.shard(hash).map);
+        if let Some(entry) = map.get(hash, key) {
+            entry.bucket.refund(cost);
+            return true;
+        }
+        map.ledger.pay_down(hash, cost, config)
+    }
+
     /// Makes room in a shard about to receive a new key: an incremental idle
     /// sweep (and ledger sweep), then one eviction if the shard is still full.
     /// Bounded work.
@@ -734,6 +800,17 @@ impl<K: Eq + Hash> Store<K> {
     pub(crate) fn per_shard_cap(&self) -> usize {
         self.per_shard_cap
     }
+}
+
+/// A randomly keyed hasher for one store: ahash's speed, keyed from the
+/// standard library's OS-seeded `RandomState` (so no separate RNG crate), and
+/// different for every store, which keeps hostile keys from aiming at
+/// collisions.
+fn random_state() -> RandomState {
+    use std::hash::BuildHasher;
+    let os = std::hash::RandomState::new();
+    let seed = |lane: u64| os.hash_one(lane);
+    RandomState::with_seeds(seed(0), seed(1), seed(2), seed(3))
 }
 
 /// Whole milliseconds in `now`, saturating.
@@ -973,6 +1050,36 @@ mod tests {
         assert_eq!(store.ledger_len(), 1);
         assert!(take(&store, 4, ms(5_000), 1)); // key 2 settled long ago
         assert_eq!(store.ledger_len(), 0, "settled debts are dropped");
+    }
+
+    /// A forgotten key's remembered debt is what `view` sees, and a refund to
+    /// it pays the debt down (R-03).
+    #[test]
+    fn test_view_and_refund_see_a_forgotten_keys_debt() {
+        let store = Store::new(1, Eviction::capacity(1), Duration::ZERO);
+        assert!(take(&store, 1, ms(0), 10)); // drained: full again at 1s
+        assert!(take(&store, 2, ms(0), 1)); // key 1's debt to the ledger
+        assert_eq!(store.with_existing(&1, |_| ()), None);
+        let config = config(10);
+        assert_eq!(
+            store.view(&1, ms(500), config, |b| b.available_at(ms(500))),
+            5
+        );
+        assert_eq!(
+            store.view(&3, ms(500), config, |b| b.available_at(ms(500))),
+            10
+        );
+        // Refund 3 of key 1's tokens: its debt settles 300ms sooner.
+        assert!(store.refund(&1, 3, config));
+        assert_eq!(
+            store.view(&1, ms(500), config, |b| b.available_at(ms(500))),
+            8
+        );
+        // A key with no state at all is left alone.
+        assert!(!store.refund(&9, 3, config));
+        // A live key is refunded directly.
+        assert!(store.refund(&2, 1, config));
+        assert_eq!(store.with_existing(&2, |b| b.available_at(ms(0))), Some(10));
     }
 
     /// TN2-007: an idle key whose bucket is still in reservation debt is not
