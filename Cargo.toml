@@ -161,12 +161,12 @@ tokio   = { version = "1", optional = true, default-features = false, features =
 smol    = { version = "2", optional = true }
 # Metrics facade. 0.24 is the current major: one global recorder exists per
 # major version, so the facade must match the application's.
-metrics = { version = "0.24", optional = true }
+metrics = { version = "0.24.6", optional = true }
 # Structured events for acquisitions and state transitions.
-tracing = { version = "0.1", optional = true, default-features = false, features = ["std"] }
+tracing = { version = "0.1.40", optional = true, default-features = false, features = ["std"] }
 # The `tower` integration: only the two trait crates, not tower itself.
-tower-layer   = { version = "0.3", optional = true }
-tower-service = { version = "0.3", optional = true }
+tower-layer   = { version = "0.3.3", optional = true }
+tower-service = { version = "0.3.3", optional = true }
 
 
 # DEV DEPENDENCIES
