@@ -36,8 +36,9 @@ The non-blocking question is still available as `try_acquire()`.
 | `governor` | throttle-net |
 |---|---|
 | `RateLimiter::direct(Quota::per_second(n))` | `Throttle::per_second(n)` |
-| `Quota::per_second(n)` / `Quota::with_period(d)` | `Throttle::per_second(n)` / `Throttle::per_duration(amount, period)` |
-| `Quota::...burst_size(b)` | size the bucket over a longer period: `Throttle::per_duration(b, period)` |
+| `Quota::per_second(n)` / `Quota::per_minute(n)` / `Quota::with_period(d)` | `Throttle::per_second(n)` / `Throttle::per_minute(n)` / `Throttle::per_duration(amount, period)` |
+| `Quota::per_second(n).allow_burst(b)` | `Throttle::builder().per_second(n).burst(b).build()` |
+| a limiter that starts empty | `Throttle::builder().per_second(n).initial(0).build()` |
 | `limiter.check()` | `throttle.try_acquire()` (`bool`) |
 | `limiter.check_n(n)` | `throttle.try_acquire_with_cost(n)` |
 | `limiter.until_ready().await` | `throttle.acquire().await?` |
@@ -45,12 +46,20 @@ The non-blocking question is still available as `try_acquire()`.
 | `RateLimiter::keyed(quota)` | `PerKey::<K>::per_second(n)` |
 | `keyed.check_key(&k)` | `perkey.try_acquire(&k)` |
 | `keyed.until_key_ready(&k).await` | `perkey.acquire(&k).await?` |
-| `GCRA` algorithm | token bucket (default) or exact `SlidingWindowLog` |
+| GCRA, burst of one (smooth pacing) | `Throttle::smooth(amount, period)` (better-bucket's engine is the token-bucket reading of GCRA) |
+| `limiter.check_n(n)` beyond the burst (`InsufficientCapacity`) | `Decision::Impossible` / `ThrottleError::CostExceedsCapacity` |
 | keyed limiter memory growth | bounded by default via [`Eviction`](./API.md#eviction) |
 
 throttle-net has no direct equivalent to `governor`'s `Jitter` *on the limiter*
-because the limiter waits exactly as long as needed; jitter lives where it belongs,
-in [`Backoff`](./API.md#backoff) for retries.
+because the limiter waits exactly as long as needed (and waiters are served in
+reservation order); jitter lives where it belongs, in
+[`Backoff`](./API.md#backoff) for retries.
+
+One difference in cost: a `governor` limiter is a single 8-byte timestamp on a
+coarse clock, while a throttle-net `Throttle` reads the OS monotonic clock on
+every call, so its uncontended `try_acquire` is slower per call (measured in
+`benches/comparison_bench.rs`). What you get for it is exact refill, cost-aware
+reservations, pauses, and the composition layer.
 
 ## Before and after
 
