@@ -52,9 +52,9 @@
 **Waiting**
 
 - **Wait, don't reject** &mdash; `acquire().await` paces the caller; `try_acquire()` is the non-blocking answer; `peek()` consumes nothing.
-- **Fair** &mdash; token-bucket waits are reservations: later callers queue behind earlier ones, so a large request is never starved by small ones. Composites queue on their bottleneck constituent and charge the others only when the request can go. (The exact `SlidingWindowLog` cannot reserve; its waiters retry as the window frees.)
+- **Fair** &mdash; token-bucket waits are reservations: later callers queue behind earlier ones, so a large request is never starved by small ones. Composites queue on their bottleneck constituent and charge the others only when the request can go. (The exact `SlidingWindowLog` cannot reserve; its waiters retry as the window frees.) That fairness is per limiter: a composite waiter is guaranteed progress (a bounded four-switch fallback), but when every constituent is saturated by direct waiters it can wait long &mdash; measured over 20 s, 22 composite waiters on two saturated 50/s buckets got 44 grants (worst wait 9.2 s) while direct waiters took the rest.
 - **Timeouts** &mdash; every waiting `acquire` (including the owned-permit ones) has a `*_timeout` variant whose deadline bounds the whole wait; a token bucket gives up at once when the wait is known to be too long.
-- **Pauses** &mdash; `pause_for` a server's `Retry-After` holds every waiter, including those that had already reserved; `resume` wakes them at once.
+- **Pauses** &mdash; `pause_for` a server's `Retry-After` holds every waiter, including those that had already reserved; `resume` wakes them at once. (The resume signal is process-wide: any `resume()` also makes a waiter that is just between two checks look once more, which is harmless; do not call `resume` in a hot loop.)
 - **Cancel-safe** &mdash; dropping a waiting future returns what it held: reserved units, a breaker's trial slot (also when the breaker is a composite's constituent), a concurrency slot.
 
 **Resilience**

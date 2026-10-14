@@ -210,7 +210,11 @@ jobs:
       - name: Toolchain
         run: rustc -V
       - name: Resolve every dependency to its newest compatible version
-        run: cargo update
+        run: cargo update --verbose
+        env:
+          # Ignore the MSRV when resolving, so the newest releases are tried
+          # (the MSRV-aware resolver would keep MSRV-compatible versions).
+          CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS: allow
       - name: Build
         run: cargo build --all-features
       - name: Test
