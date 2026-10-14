@@ -10,16 +10,22 @@
 - [Pace outbound calls to a fixed rate](#pace-outbound-calls-to-a-fixed-rate)
 - [Allow a burst, then sustain a rate](#allow-a-burst-then-sustain-a-rate)
 - [Shed instead of wait](#shed-instead-of-wait)
+- [Give up instead of waiting too long](#give-up-instead-of-waiting-too-long)
 - [Weight requests by cost](#weight-requests-by-cost)
 - [Budget an LLM across several limits](#budget-an-llm-across-several-limits)
+- [Admit an LLM call on an estimate, then settle](#admit-an-llm-call-on-an-estimate-then-settle)
 - [Throttle per tenant](#throttle-per-tenant)
 - [Stack global, per-tenant, and per-endpoint caps](#stack-global-per-tenant-and-per-endpoint-caps)
 - [Forbid a boundary burst](#forbid-a-boundary-burst)
 - [Retry with jittered backoff and `Retry-After`](#retry-with-jittered-backoff-and-retry-after)
+- [Keep retries from becoming a storm](#keep-retries-from-becoming-a-storm)
 - [Fail fast when a downstream is unhealthy](#fail-fast-when-a-downstream-is-unhealthy)
+- [Isolate a slow dependency](#isolate-a-slow-dependency)
+- [Hedge a slow call](#hedge-a-slow-call)
 - [Find the right concurrency without configuring it](#find-the-right-concurrency-without-configuring-it)
 - [Queue with deadlines and priority](#queue-with-deadlines-and-priority)
 - [Stay in sync with a provider's headers](#stay-in-sync-with-a-providers-headers)
+- [Throttle a `tower` client](#throttle-a-tower-client)
 - [Choose a runtime, or go `no_std`](#choose-a-runtime-or-go-no_std)
 - [Test limiter logic deterministically](#test-limiter-logic-deterministically)
 - [Collect metrics and traces](#collect-metrics-and-traces)
@@ -59,19 +65,27 @@ let throttle = Throttle::per_duration(60, Duration::from_secs(60)); // 60/minute
 
 ## Allow a burst, then sustain a rate
 
-A token bucket starts full, so the capacity *is* the burst allowance, and the
-refill rate is the sustained rate. `Throttle::per_second(n)` bursts up to `n` then
-settles at `n`/second. To allow a larger burst than the per-second rate, size the
-bucket over a longer period:
+A token bucket's capacity *is* the burst allowance and its refill rate is the
+sustained rate. `Throttle::per_second(n)` bursts up to `n`; the builder sets the
+burst independently, and can start the bucket empty so a restart does not fire a
+burst at a downstream that just recovered:
 
 ```rust
-use std::time::Duration;
 use throttle_net::Throttle;
 
-// Burst up to 500 at once, then sustain 100/second (500 per 5 seconds).
-let throttle = Throttle::per_duration(500, Duration::from_secs(5));
+// Sustain 100/second, burst up to 500 at once, start with nothing banked.
+let throttle = Throttle::builder()
+    .per_second(100)
+    .burst(500)
+    .initial(0)
+    .try_build()?;
 assert_eq!(throttle.capacity(), 500);
+assert_eq!(throttle.available(), 0);
+# Ok::<(), throttle_net::ThrottleError>(())
 ```
+
+For the opposite &mdash; perfectly even spacing with no burst at all, as GCRA or a
+leaky bucket gives &mdash; use `Throttle::smooth(amount, period)`.
 
 ---
 
@@ -101,6 +115,30 @@ if throttle.peek(10).is_acquired() {
     // 10 tokens are available right now (nothing was taken)
 }
 # let _ = throttle;
+```
+
+---
+
+## Give up instead of waiting too long
+
+Every waiting acquire has a `*_timeout` variant (owned permits too:
+`acquire_owned_timeout`), and its deadline bounds the whole wait. On a token
+bucket, waits are reservations with a known end, so when the budget cannot be
+met the call fails **at once** with `DeadlineExceeded`, reserving nothing,
+rather than sleeping to the deadline; a bulkhead or adaptive limiter waits for a
+slot until the deadline. Dropping a waiting future instead (an outer
+`tokio::time::timeout`, a `select!`) is also safe: whatever it held goes back.
+
+```rust
+# async fn run() {
+use std::time::Duration;
+use throttle_net::{Throttle, ThrottleError};
+
+let throttle = Throttle::per_duration(1, Duration::from_secs(60));
+assert!(throttle.try_acquire());
+let err = throttle.acquire_timeout(Duration::from_millis(250)).await.unwrap_err();
+assert_eq!(err, ThrottleError::DeadlineExceeded);
+# }
 ```
 
 ---
@@ -156,10 +194,36 @@ See [`examples/llm_budget.rs`](../examples/llm_budget.rs) for the full flow.
 
 ---
 
+## Admit an LLM call on an estimate, then settle
+
+Output tokens are unknown until the response arrives. Admit the call on its
+`max_tokens` ceiling, then settle with the usage the provider reports: the
+unused budget is refunded, and an overspend (an under-estimated prompt) is
+charged as debt that later calls wait behind.
+
+```rust
+# async fn run() -> Result<(), throttle_net::ThrottleError> {
+use throttle_net::presets;
+
+let limiter = presets::anthropic::tier_1();
+let estimate = [("requests", 1), ("input_tokens", 1_200), ("output_tokens", 1_024)];
+limiter.acquire_costs(&estimate).await?;
+
+// ... send the request; the response says it used 230 output tokens ...
+let usage = [("requests", 1), ("input_tokens", 1_200), ("output_tokens", 230)];
+limiter.settle_costs(&estimate, &usage);
+# Ok(())
+# }
+```
+
+---
+
 ## Throttle per tenant
 
 `PerKey` keeps independent state per key, so one noisy tenant cannot spend
-another's budget. State is sharded and memory is bounded by default.
+another's budget. State is sharded and memory is bounded by default, and the
+bound never resets a limited key: a key evicted while limited leaves its debt in
+a compact ledger and comes back in that debt.
 
 ```rust
 # async fn run() -> Result<(), throttle_net::ThrottleError> {
@@ -182,13 +246,28 @@ let limiter: PerKey<String> = PerKey::per_second(100)
 # let _ = limiter;
 ```
 
+When a flood fills both the key slots and the debt ledger with limited keys, a
+new key is refused until one recovers, so every limit holds. If admitting
+newcomers matters more than exact limits for the keys closest to recovery,
+choose `WhenFull::ForgetDebt`:
+
+```rust
+use throttle_net::{Eviction, PerKey, WhenFull};
+
+let limiter: PerKey<String> = PerKey::per_minute(100)
+    .with_eviction(Eviction::capacity(50_000).with_when_full(WhenFull::ForgetDebt));
+# let _ = limiter;
+```
+
 ---
 
 ## Stack global, per-tenant, and per-endpoint caps
 
 A `Layered` limiter applies several scopes in order; a request must clear every
 one. The classic shape is a global ceiling over a per-tenant share over a
-per-endpoint cap.
+per-endpoint cap. A waiting request queues on its tightest scope and charges the
+shared global scope only when it can go, so a tenant with a deep backlog never
+drains the global budget the others need.
 
 ```rust
 # async fn run() -> Result<(), throttle_net::ThrottleError> {
@@ -264,6 +343,33 @@ To drive your own loop instead, call `Backoff::iter()` and read `next_delay()`.
 
 ---
 
+## Keep retries from becoming a storm
+
+When a downstream fails wholesale, every client retrying multiplies the load
+it is failing under. Bound each loop (`max_retry_after` caps a server's
+`Retry-After`; `max_elapsed` caps the total time), and share a `RetryBudget`
+so retries can add at most a fixed fraction to the request rate.
+
+```rust
+# async fn run() {
+use std::time::Duration;
+use throttle_net::{Backoff, Retry, RetryAction, RetryBudget};
+
+// Retries may add 10% to traffic, with a floor of one per second.
+let budget = RetryBudget::new(0.1, 1);
+let retry = Retry::new(Backoff::default())
+    .max_retry_after(Duration::from_secs(30))
+    .max_elapsed(Duration::from_secs(10));
+
+let result: Result<(), &str> = retry
+    .run_with_budget(&budget, || async { Err("503") }, |_| RetryAction::Retry)
+    .await;
+assert!(result.is_err());
+# }
+```
+
+---
+
 ## Fail fast when a downstream is unhealthy
 
 A limiter paces requests; a `CircuitBreaker` *stops* them. After enough failures
@@ -292,6 +398,55 @@ match breaker.acquire().await {
 
 Dropping a permit unsettled counts as a failure, so an early return or panic is
 treated conservatively.
+
+---
+
+## Isolate a slow dependency
+
+A `Bulkhead` caps how many calls into one dependency may be in flight, so a
+slow dependency ties up at most its own slots. `CircuitBreaker::call` settles the
+breaker from the call's result for you.
+
+```rust
+# async fn run() -> Result<(), throttle_net::ThrottleError> {
+use std::time::Duration;
+use throttle_net::resilience::timeout;
+use throttle_net::{Bulkhead, CircuitBreaker, Throttle, Trip};
+
+let bulkhead = Bulkhead::new(8);
+let breaker = CircuitBreaker::builder()
+    .trip(Trip::Consecutive(5))
+    .build(Throttle::per_second(50));
+
+let result = bulkhead
+    .call(|| breaker.call(|| async {
+        timeout(Duration::from_secs(2), async { Ok::<_, &str>("response") })
+            .await
+            .map_err(|_| "timed out")?
+    }))
+    .await?;
+assert!(result.is_ok());
+# Ok(())
+# }
+```
+
+---
+
+## Hedge a slow call
+
+For idempotent reads with a long latency tail, start a second attempt if the
+first has not answered within a delay; the first success wins and the loser is
+cancelled.
+
+```rust
+# async fn run() {
+use std::time::Duration;
+use throttle_net::resilience::hedge;
+
+let value: Result<&str, ()> = hedge(Duration::from_millis(50), || async { Ok("replica") }).await;
+assert_eq!(value, Ok("replica"));
+# }
+```
 
 ---
 
@@ -351,8 +506,10 @@ queue.acquire("tenant:1", 0, Some(Duration::from_secs(2))).await?;
 ## Stay in sync with a provider's headers
 
 Parse a response's rate-limit headers and reconcile your limiter with the server's
-view, so client and server do not drift. Start from a tier preset where one exists.
-Needs the `provider-llm` feature (or `provider-headers` for parsing alone).
+view, so client and server do not drift. When the server reports a window
+exhausted, the limiter pauses until the reported reset; a `Retry-After` on a 429
+pauses it too. Start from a tier preset where one exists. Needs the
+`provider-llm` feature (or `provider-headers` for parsing and `Window::apply`).
 
 ```rust
 # async fn run() -> Result<(), throttle_net::ThrottleError> {
@@ -367,15 +524,58 @@ let headers = [
     ("anthropic-ratelimit-tokens-remaining", "40000"),
 ];
 let info = HeaderProfile::ANTHROPIC.parse(&headers);
-let _ = info; // info.sync_requests(&throttle) drains a Throttle to the server's count
+let drained = info.sync_multi(&limiter);
+assert!(drained > 0);
+assert_eq!(limiter.available("requests"), Some(12));
 
 limiter.acquire_costs(&[("requests", 1), ("input_tokens", 1_500)]).await?;
 # Ok(())
 # }
 ```
 
-Synchronization only ever *reduces* the local budget, so it cannot raise a limiter
-above its hard limit.
+Reconciliation only ever *reduces* the local budget, so it cannot raise a limiter
+above its configured capacity. For a single `Throttle` (or an `Arc` of one), use
+`info.sync_requests(&throttle)` or `info.sync_tokens(&throttle)`.
+
+Server values are untrusted: every pause is capped at
+`provider::DEFAULT_MAX_PAUSE` (five minutes). Choose your own ceiling with the
+`*_capped` variants, or pass `Duration::ZERO` to drain without pausing:
+
+```rust
+use std::time::Duration;
+use throttle_net::Throttle;
+use throttle_net::provider::HeaderProfile;
+
+let throttle = Throttle::per_second(10);
+let info = HeaderProfile::STRIPE.parse(&[("Retry-After", "86400")]);
+info.sync_requests_capped(&throttle, Duration::from_secs(30));
+assert!(throttle.paused_for() <= Duration::from_secs(30));
+```
+
+---
+
+## Throttle a `tower` client
+
+With the `tower` feature, put a limiter, a breaker, or an adaptive concurrency
+limit in front of any `tower::Service` stack. The layers wait in `poll_ready`
+(and only then poll the inner service), so `load_shed` or `buffer` above them
+see real backpressure; `with_timeout` bounds that wait.
+
+```rust
+# async fn run() -> Result<(), throttle_net::tower::BoxError> {
+use tower::{ServiceBuilder, ServiceExt, service_fn};
+use throttle_net::Throttle;
+use throttle_net::tower::ThrottleLayer;
+
+let client = ServiceBuilder::new()
+    .layer(ThrottleLayer::new(Throttle::per_second(20)))
+    .service(service_fn(|path: &'static str| async move {
+        Ok::<_, std::convert::Infallible>(path.len())
+    }));
+assert_eq!(client.oneshot("/v1/models").await?, 10);
+# Ok(())
+# }
+```
 
 ---
 
@@ -386,17 +586,17 @@ identical. Pick the backend in `Cargo.toml`:
 
 ```toml
 # tokio (default):
-throttle-net = "0.8"
+throttle-net = "2"
 
 # smol instead:
-throttle-net = { version = "0.8", default-features = false, features = ["smol"] }
+throttle-net = { version = "2", default-features = false, features = ["smol"] }
 ```
 
 For a `no_std` build, take the pure algorithm core only &mdash; `Backoff`, `Jitter`,
 and `Decision` &mdash; with the standard library off:
 
 ```toml
-throttle-net = { version = "0.8", default-features = false }
+throttle-net = { version = "2", default-features = false }
 ```
 
 ```rust
@@ -430,26 +630,49 @@ clock.advance(Duration::from_secs(1)); // a full period refills it
 assert!(throttle.try_acquire());
 ```
 
-Do not mix a `ManualClock` with a real async sleep: the limiter would read the
-manual clock while the waiter sleeps on the runtime's, and the two desynchronize.
-Test the synchronous logic with `try_acquire`, or use real (small) durations for
-the waiting path.
+To test the *waiting* path deterministically, drive the limiter with
+`TokioClock` under tokio's paused time: the limiter then reads the same virtual
+clock its waits sleep on, and a minute of refill takes no real time.
+
+```rust
+# async fn run() -> Result<(), throttle_net::ThrottleError> {
+// In a test: #[tokio::test(start_paused = true)]
+use std::time::Duration;
+use throttle_net::{Throttle, TokioClock};
+
+let throttle = Throttle::per_minute(1).with_clock(TokioClock::new());
+throttle.acquire().await?;
+let start = tokio::time::Instant::now();
+throttle.acquire().await?; // a full minute of virtual time, instantly
+assert!(start.elapsed() >= Duration::from_secs(59));
+# Ok(())
+# }
+```
 
 ---
 
 ## Collect metrics and traces
 
-Enable the `metrics` and/or `tracing` features and install any recorder/subscriber
-in your application; the limiters emit automatically, and the instrumentation is
-zero-cost (inputs not even evaluated) when the features are off.
+Enable the `metrics` and/or `tracing` features and install any recorder or
+subscriber in your application; every limiter emits automatically, and the hooks
+compile to nothing when the features are off. Name each instance so two of a kind
+get separate series:
 
 ```toml
-throttle-net = { version = "0.8", features = ["metrics", "tracing"] }
+throttle-net = { version = "2", features = ["metrics", "tracing"] }
 ```
 
-The emitted metrics (`throttle_acquired_total`, `throttle_wait_duration`,
-`throttle_queue_depth`, `throttle_circuit_state`, `throttle_rate_current`) and
-tracing events are documented in [`API.md`](./API.md#observability).
+```rust
+use throttle_net::Throttle;
+
+let github = Throttle::per_minute(5_000).with_name("github");
+let stripe = Throttle::per_second(25).with_name("stripe");
+# let _ = (github, stripe);
+```
+
+The metrics (grants, denials, timeouts, sheds, waits, breaker state, queue
+depth, adaptive limit, retries) and tracing events are listed in
+[`API.md`](./API.md#observability).
 
 ---
 

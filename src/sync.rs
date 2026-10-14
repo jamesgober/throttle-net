@@ -1,7 +1,7 @@
 //! Atomics indirection for `loom` model checking.
 //!
-//! Under `--cfg throttle_loom` the limiter's own atomics become loom's
-//! instrumented versions, so
+//! Under `--cfg throttle_loom` the adaptive limiter's and the bulkhead's slot
+//! and limit atomics become loom's instrumented versions, so
 //! [`tests/loom_throttle.rs`](../../tests/loom_throttle.rs) can exhaustively
 //! explore their interleavings; in every normal build they are the standard
 //! library's, with zero overhead and no behavioral difference. Only throttle-net's
@@ -13,8 +13,42 @@
 //! transitive dependencies (`concurrent-queue`, …) that expect the `loom` crate in
 //! *their* graph, breaking the build. Scoping the cfg to this crate keeps the model
 //! check to throttle-net's own atomics.
+//!
+//! # Locks and the async executor
+//!
+//! The circuit breaker's state, the queue's bookkeeping, and the sliding log
+//! are each guarded by a `std::sync::Mutex`. REPS rules out `std::sync::Mutex`
+//! in async code because a guard held across an `.await` blocks the executor
+//! thread. These guards never are: each is held only for a short, bounded,
+//! synchronous critical section — no `.await`, no I/O, no user callback — and
+//! the same state is shared with the synchronous API (`try_acquire`, the
+//! [`Limiter`](crate::Limiter) trait), which an async mutex could not serve.
+//! That is the case tokio's own guidance reserves the standard mutex for; an
+//! async mutex would only add an allocation and a wake-up to every call.
 
 #[cfg(not(throttle_loom))]
 pub(crate) use core::sync::atomic::AtomicU32;
 #[cfg(throttle_loom)]
 pub(crate) use loom::sync::atomic::AtomicU32;
+
+/// Subtracts `n` from `atomic`, stopping at zero, and returns the previous
+/// value.
+///
+/// A compare-exchange loop rather than `fetch_update`, which newer toolchains
+/// deprecate in favour of `try_update` — a method the 1.85 MSRV lacks.
+#[inline]
+pub(crate) fn saturating_sub(atomic: &AtomicU32, n: u32) -> u32 {
+    use core::sync::atomic::Ordering;
+    let mut current = atomic.load(Ordering::Acquire);
+    loop {
+        match atomic.compare_exchange_weak(
+            current,
+            current.saturating_sub(n),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(previous) => return previous,
+            Err(actual) => current = actual,
+        }
+    }
+}

@@ -37,9 +37,14 @@ pub enum Jitter {
     /// Half the delay plus a uniform half: `delay/2 + rand(0, delay/2)`. Keeps a
     /// floor under each wait while still spreading.
     Equal,
-    /// `min(max, rand(base, previous * 3))`. Self-correlated growth that adapts to
-    /// observed waits; the strongest at breaking up a thundering herd, and the
-    /// default.
+    /// `min(max, rand(base, previous * 3))`, the AWS "decorrelated jitter"
+    /// recurrence: each delay is drawn relative to the previous one, so the
+    /// sequence adapts to observed waits; the strongest at breaking up a
+    /// thundering herd, and the default.
+    ///
+    /// The recurrence *replaces* the base curve: it uses only the backoff's
+    /// initial delay (`base`) and its ceiling (`max`), and ignores the curve
+    /// kind, the exponential factor, and the linear increment.
     #[default]
     Decorrelated,
 }
@@ -83,6 +88,8 @@ pub struct Backoff {
     increment: Duration,
     max: Duration,
     jitter: Jitter,
+    /// Caller-supplied entropy mixed into every [`iter`](Backoff::iter) seed.
+    seed: u64,
 }
 
 impl Backoff {
@@ -107,6 +114,7 @@ impl Backoff {
             increment: Duration::ZERO,
             max: delay,
             jitter: Jitter::None,
+            seed: 0,
         }
     }
 
@@ -133,15 +141,17 @@ impl Backoff {
             increment,
             max: DEFAULT_MAX,
             jitter: Jitter::None,
+            seed: 0,
         }
     }
 
     /// A delay that multiplies by `factor` each attempt: `initial`, `initial *
     /// factor`, `initial * factor^2`, … capped at the maximum.
     ///
-    /// A `factor` of `2.0` doubles each time. Non-finite or sub-one factors are
-    /// accepted but make the curve flat or shrinking; pair with jitter for the
-    /// usual behavior.
+    /// A `factor` of `2.0` doubles each time. Factors below one make the curve
+    /// shrink towards zero; a factor that is NaN, infinite, or negative makes
+    /// every delay after the first jump straight to the ceiling. No factor can
+    /// make the backoff panic or exceed its ceiling.
     ///
     /// # Examples
     ///
@@ -163,11 +173,26 @@ impl Backoff {
             increment: Duration::ZERO,
             max: DEFAULT_MAX,
             jitter: Jitter::None,
+            seed: 0,
         }
     }
 
     /// Returns a copy with the delay ceiling set to `max`. No delay this backoff
-    /// produces will exceed it.
+    /// produces will exceed it. `Duration::MAX` is accepted (delays are then
+    /// bounded only by `u64::MAX` nanoseconds, about 584 years).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use throttle_net::Backoff;
+    ///
+    /// let mut delays = Backoff::exponential(Duration::from_secs(1), 10.0)
+    ///     .with_max(Duration::from_secs(5))
+    ///     .iter();
+    /// assert_eq!(delays.next_delay(), Duration::from_secs(1));
+    /// assert_eq!(delays.next_delay(), Duration::from_secs(5)); // capped
+    /// ```
     #[must_use]
     pub fn with_max(mut self, max: Duration) -> Self {
         self.max = max;
@@ -175,19 +200,75 @@ impl Backoff {
     }
 
     /// Returns a copy with the jitter mode set.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use throttle_net::{Backoff, Jitter};
+    ///
+    /// let backoff = Backoff::constant(Duration::from_secs(1)).with_jitter(Jitter::Equal);
+    /// assert_eq!(backoff.jitter(), Jitter::Equal);
+    /// ```
     #[must_use]
     pub fn with_jitter(mut self, jitter: Jitter) -> Self {
         self.jitter = jitter;
         self
     }
 
+    /// Returns a copy that mixes `seed` into the seed of every
+    /// [`iter`](Self::iter).
+    ///
+    /// `iter` already gives each sequence a distinct seed within a process;
+    /// under `std` it also mixes in the wall clock, so processes differ too.
+    /// Without `std` there is no clock, so every process would start from the
+    /// same sequence and a fleet would retry in lockstep — pass something unique
+    /// per device or boot here (a serial number, a hardware RNG draw) to keep
+    /// `no_std` fleets jittering apart. It never makes sequences repeat; use
+    /// [`iter_seeded`](Self::iter_seeded) for a reproducible sequence.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use throttle_net::{Backoff, Jitter};
+    ///
+    /// let device_id = 0x5EED_u64;
+    /// let backoff = Backoff::exponential(Duration::from_millis(10), 2.0)
+    ///     .with_jitter(Jitter::Full)
+    ///     .with_seed(device_id);
+    /// assert!(backoff.iter().next_delay() <= Duration::from_millis(10));
+    /// ```
+    #[must_use]
+    pub fn with_seed(mut self, seed: u64) -> Self {
+        self.seed = seed;
+        self
+    }
+
     /// The configured delay ceiling.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use throttle_net::Backoff;
+    ///
+    /// assert_eq!(Backoff::default().max(), Duration::from_secs(30));
+    /// ```
     #[must_use]
     pub const fn max(&self) -> Duration {
         self.max
     }
 
     /// The configured jitter mode.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use throttle_net::{Backoff, Jitter};
+    ///
+    /// assert_eq!(Backoff::default().jitter(), Jitter::Decorrelated);
+    /// ```
     #[must_use]
     pub const fn jitter(&self) -> Jitter {
         self.jitter
@@ -197,12 +278,24 @@ impl Backoff {
     ///
     /// Each call returns an independent [`BackoffIter`] with its own random
     /// state, so two retry loops sharing one policy still jitter independently.
-    /// The seed mixes a per-call counter with the wall clock under `std`; under
-    /// `no_std` it is counter-only (still distinct per iterator within a run). For
-    /// a fully reproducible sequence, use [`iter_seeded`](Self::iter_seeded).
+    /// The seed mixes a per-call counter, the policy's
+    /// [`with_seed`](Self::with_seed) entropy, and (under `std`) the wall clock;
+    /// under `no_std` without a policy seed it is counter-only — distinct per
+    /// iterator within a run, but repeating across process restarts. For a fully
+    /// reproducible sequence, use [`iter_seeded`](Self::iter_seeded).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use throttle_net::Backoff;
+    ///
+    /// let mut delays = Backoff::constant(Duration::from_millis(50)).iter();
+    /// assert_eq!(delays.next_delay(), Duration::from_millis(50));
+    /// ```
     #[must_use]
     pub fn iter(&self) -> BackoffIter {
-        self.iter_seeded(entropy_seed())
+        self.iter_seeded(mix(entropy_seed() ^ self.seed.rotate_left(32)))
     }
 
     /// Starts a delay sequence with an explicit seed, for deterministic,
@@ -232,6 +325,16 @@ impl Backoff {
     }
 }
 
+impl IntoIterator for &Backoff {
+    type Item = Duration;
+    type IntoIter = BackoffIter;
+
+    /// Starts a delay sequence, as [`Backoff::iter`].
+    fn into_iter(self) -> BackoffIter {
+        self.iter()
+    }
+}
+
 impl Default for Backoff {
     /// Exponential from 100ms, doubling, capped at 30s, with decorrelated jitter
     /// — a sane production default that resists thundering herds.
@@ -258,6 +361,25 @@ pub struct BackoffIter {
 
 impl BackoffIter {
     /// Returns the delay for the next attempt and advances the sequence.
+    ///
+    /// Never panics and never exceeds the policy's ceiling, whatever the
+    /// configuration.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use throttle_net::{Backoff, Jitter};
+    ///
+    /// // An unbounded ceiling with full jitter (a panic in 1.0) is fine.
+    /// let mut delays = Backoff::exponential(Duration::from_secs(1), 2.0)
+    ///     .with_max(Duration::MAX)
+    ///     .with_jitter(Jitter::Full)
+    ///     .iter_seeded(1);
+    /// for _ in 0..100 {
+    ///     let _delay = delays.next_delay();
+    /// }
+    /// ```
     pub fn next_delay(&mut self) -> Duration {
         let max = dur_to_nanos(self.policy.max);
         let nanos = if let Jitter::Decorrelated = self.policy.jitter {
@@ -293,14 +415,24 @@ impl BackoffIter {
                 // in `no_std` (where `f64::powi` is unavailable). The exponent is
                 // clamped so the loop is bounded and the value cannot run away; the
                 // result is clamped to the cap by the caller anyway.
-                let mut scaled = base as f64;
-                for _ in 0..attempt.min(64) {
-                    scaled *= self.policy.factor;
-                }
-                if scaled.is_finite() && scaled >= 0.0 && scaled < (u64::MAX as f64) {
-                    scaled as u64
-                } else {
-                    u64::MAX
+                // Float precision is immaterial for a delay (a nanosecond in 2^53),
+                // and the result is converted back only when it is finite,
+                // non-negative, and below u64::MAX, so the cast is exact in range.
+                #[allow(
+                    clippy::cast_precision_loss,
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss
+                )]
+                {
+                    let mut scaled = base as f64;
+                    for _ in 0..attempt.min(64) {
+                        scaled *= self.policy.factor;
+                    }
+                    if scaled.is_finite() && scaled >= 0.0 && scaled < (u64::MAX as f64) {
+                        scaled as u64
+                    } else {
+                        u64::MAX
+                    }
                 }
             }
         }
@@ -364,30 +496,54 @@ impl Rng {
         if hi <= lo {
             return lo;
         }
-        let span = hi - lo + 1;
-        // Modulo bias is immaterial for jitter spread over nanosecond spans.
-        lo + (self.next_u64() % span)
+        // `hi - lo + 1` overflows only for the full `[0, u64::MAX]` range, where
+        // every value is in range (regression TN-012: 1.0 divided by zero here).
+        match (hi - lo).checked_add(1) {
+            // Modulo bias is immaterial for jitter spread over nanosecond spans.
+            Some(span) => lo + (self.next_u64() % span),
+            None => self.next_u64(),
+        }
     }
 }
 
 /// Derives a seed from a monotonically-increasing counter, mixed with the wall
 /// clock under `std`, so distinct `BackoffIter`s start from different states.
 /// `no_std` builds have no clock, so the seed is counter-only — still distinct per
-/// iterator within a run, though it repeats across process restarts.
+/// iterator within a run, though it repeats across process restarts (pass
+/// per-device entropy with [`Backoff::with_seed`]).
+///
+/// The counter is a pointer-sized atomic, so it exists on 32-bit embedded
+/// targets without 64-bit atomics; on a target with no atomic read-modify-write
+/// at all, it is absent and only the clock and the policy seed vary the start.
 fn entropy_seed() -> u64 {
-    use core::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+    #[cfg(target_has_atomic = "ptr")]
+    let counter = {
+        use core::sync::atomic::{AtomicUsize, Ordering};
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        // usize is at most 64 bits on every supported target.
+        COUNTER.fetch_add(1, Ordering::Relaxed) as u64
+    };
+    #[cfg(not(target_has_atomic = "ptr"))]
+    let counter = 0u64;
     #[cfg(feature = "std")]
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos() as u64);
+        // Only the fast-moving low bits matter for a seed; truncating is the
+        // intent.
+        .map_or(0, |d| {
+            #[allow(clippy::cast_possible_truncation)]
+            let low = d.as_nanos() as u64;
+            low
+        });
     #[cfg(not(feature = "std"))]
     let nanos = 0u64;
 
-    // Mix the sources through the SplitMix64 finalizer for avalanche.
-    let mut z = nanos ^ counter.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    mix(nanos ^ counter.wrapping_mul(0x9E37_79B9_7F4A_7C15))
+}
+
+/// The SplitMix64 finalizer: spreads every input bit across the output.
+#[inline]
+const fn mix(mut z: u64) -> u64 {
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     z ^ (z >> 31)
@@ -444,13 +600,13 @@ mod tests {
 
     #[test]
     fn test_equal_jitter_keeps_a_floor() {
-        let backoff = Backoff::constant(Duration::from_millis(1000)).with_jitter(Jitter::Equal);
+        let backoff = Backoff::constant(Duration::from_secs(1)).with_jitter(Jitter::Equal);
         let mut it = backoff.iter_seeded(42);
         for _ in 0..20 {
             let d = it.next_delay();
             // Equal jitter: at least half the base, at most the base.
             assert!(d >= Duration::from_millis(500), "{d:?} below the floor");
-            assert!(d <= Duration::from_millis(1000), "{d:?} above the cap");
+            assert!(d <= Duration::from_secs(1), "{d:?} above the cap");
         }
     }
 
@@ -486,6 +642,72 @@ mod tests {
         let backoff = Backoff::default();
         assert_eq!(backoff.jitter(), Jitter::Decorrelated);
         assert_eq!(backoff.max(), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn test_full_jitter_with_an_unbounded_ceiling_does_not_panic() {
+        // Regression (TN-012): `hi - lo + 1` overflowed to zero once the capped
+        // delay reached u64::MAX nanoseconds, and `% 0` panicked.
+        let backoff = Backoff::exponential(Duration::from_secs(1), 2.0)
+            .with_max(Duration::MAX)
+            .with_jitter(Jitter::Full);
+        let mut it = backoff.iter_seeded(3);
+        for _ in 0..200 {
+            let _delay = it.next_delay();
+        }
+        let mut decorrelated = Backoff::exponential(Duration::ZERO, 2.0)
+            .with_max(Duration::MAX)
+            .with_jitter(Jitter::Decorrelated)
+            .iter_seeded(4);
+        for _ in 0..200 {
+            let _delay = decorrelated.next_delay();
+        }
+    }
+
+    #[test]
+    fn test_full_range_draws_any_value() {
+        let mut rng = Rng::new(11);
+        let a = rng.range(0, u64::MAX);
+        let b = rng.range(0, u64::MAX);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn test_pathological_factors_stay_within_the_ceiling() {
+        for factor in [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            -2.0,
+            0.0,
+            0.5,
+            1e300,
+        ] {
+            let backoff = Backoff::exponential(Duration::from_millis(10), factor)
+                .with_max(Duration::from_secs(1));
+            let mut it = backoff.iter_seeded(1);
+            for _ in 0..80 {
+                assert!(it.next_delay() <= Duration::from_secs(1), "factor {factor}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_policy_seed_changes_the_policy_but_not_iter_seeded() {
+        let a = Backoff::exponential(Duration::from_millis(100), 2.0).with_jitter(Jitter::Full);
+        let b = a.with_seed(42);
+        assert_ne!(a, b);
+        let first = |backoff: Backoff| backoff.iter_seeded(9).next_delay();
+        assert_eq!(first(a), first(b), "iter_seeded ignores the policy seed");
+    }
+
+    #[test]
+    fn test_iterator_yields_forever() {
+        let delays: [Duration; 3] = core::array::from_fn({
+            let mut it = Backoff::constant(Duration::from_millis(1)).iter();
+            move |_| it.next().unwrap_or_default()
+        });
+        assert_eq!(delays, [Duration::from_millis(1); 3]);
     }
 
     #[test]

@@ -7,17 +7,23 @@
 //! count. [`MultiLimiter`] meters each dimension independently and admits a call
 //! only when all three can afford it.
 //!
+//! The output size is unknown until the response arrives, so each call is
+//! admitted on its `max_tokens` ceiling and then settled with the usage the
+//! provider reported: the unused output budget goes back to the limiter.
+//!
 //! Run with: `cargo run --example llm_budget`
 
 use std::time::{Duration, Instant};
 
 use throttle_net::{MultiLimiter, Throttle};
 
-/// One queued LLM call: its prompt size and the output ceiling we reserve.
+/// One queued LLM call: its prompt size, the output ceiling we reserve, and
+/// (simulated) the output it actually produced.
 struct Call {
     label: &'static str,
     input_tokens: u32,
     output_tokens: u32,
+    used_output: u32,
 }
 
 #[tokio::main]
@@ -37,21 +43,25 @@ async fn main() -> Result<(), throttle_net::ThrottleError> {
             label: "summarize",
             input_tokens: 1_800,
             output_tokens: 300,
+            used_output: 190,
         },
         Call {
             label: "translate",
             input_tokens: 1_200,
             output_tokens: 250,
+            used_output: 250,
         },
         Call {
             label: "extract",
             input_tokens: 900,
             output_tokens: 200,
+            used_output: 60,
         },
         Call {
             label: "classify",
             input_tokens: 400,
             output_tokens: 100,
+            used_output: 5,
         },
     ];
 
@@ -66,11 +76,21 @@ async fn main() -> Result<(), throttle_net::ThrottleError> {
         // Returns as soon as every budget can afford this call.
         limiter.acquire_costs(&costs).await?;
 
+        // ... send the request; the response reports the real output size ...
+        let usage = [
+            ("requests", 1),
+            ("input_tokens", call.input_tokens),
+            ("output_tokens", call.used_output),
+        ];
+        // Give back the output budget the call did not use.
+        limiter.settle_costs(&costs, &usage);
+
         println!(
-            "[{:>6.2}s] sent {:<10} (in {:>4}, out {:>3}) | remaining: req {:?}, in {:?}, out {:?}",
+            "[{:>6.2}s] sent {:<10} (in {:>4}, out {:>3} of {:>3}) | remaining: req {:?}, in {:?}, out {:?}",
             started.elapsed().as_secs_f64(),
             call.label,
             call.input_tokens,
+            call.used_output,
             call.output_tokens,
             limiter.available("requests").unwrap_or(0),
             limiter.available("input_tokens").unwrap_or(0),

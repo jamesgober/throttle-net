@@ -40,7 +40,7 @@ fn decorrelated_jitter_scatters_a_thundering_herd() {
     let min = delays.iter().min().copied().unwrap_or_default();
     let max = delays.iter().max().copied().unwrap_or_default();
     assert!(
-        max - min > Duration::from_millis(150),
+        max.saturating_sub(min) > Duration::from_millis(150),
         "spread too narrow: {min:?}..{max:?}"
     );
 

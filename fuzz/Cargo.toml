@@ -1,9 +1,12 @@
-# cargo-fuzz target crate for throttle-net's byte-facing parsers.
+# cargo-fuzz target crate for throttle-net: the byte-facing parsers and a
+# state-machine target for the throttle and backoff arithmetic.
 #
-# Run locally (needs nightly + `cargo install cargo-fuzz`):
-#   cargo +nightly fuzz run retry_after
-#   cargo +nightly fuzz run provider_headers
+# Run locally (needs nightly + cargo-fuzz):
+#   cargo +nightly fuzz run retry_after seeds/retry_after
+#   cargo +nightly fuzz run provider_headers seeds/provider_headers
+#   cargo +nightly fuzz run limiter_ops seeds/limiter_ops
 #
+# Seed inputs are committed under seeds/; the working corpus/ is not.
 # CI runs each target for a fixed time budget as a smoke check.
 [package]
 name    = "throttle-net-fuzz"
@@ -38,6 +41,13 @@ bench   = false
 [[bin]]
 name    = "provider_headers"
 path    = "fuzz_targets/provider_headers.rs"
+test    = false
+doc     = false
+bench   = false
+
+[[bin]]
+name    = "limiter_ops"
+path    = "fuzz_targets/limiter_ops.rs"
 test    = false
 doc     = false
 bench   = false

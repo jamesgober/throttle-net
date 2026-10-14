@@ -335,7 +335,9 @@ Builds MUST be reproducible. Given identical source, toolchain, and build parame
 - MUST NOT embed timestamps in compiled artifacts. Use `SOURCE_DATE_EPOCH` in build scripts to enforce a fixed reference time.
 - MUST NOT generate random seeds, UUIDs, or nonces at compile time.
 - MUST NOT have environment-dependent behavior in build scripts. All paths MUST be relative or explicitly passed as input.
-- `Cargo.lock` MUST be committed for all workspace roots. Dependency versions MUST NOT drift between environments.
+- `Cargo.lock` MUST be committed for all workspace roots. Dependency versions MUST NOT drift between environments. (A library's lockfile does not affect its dependents; they resolve from `Cargo.toml`.)
+- `rust-toolchain.toml` overrides the toolchain a CI setup action installs. Every CI job that claims to test a specific toolchain (MSRV, nightly, a floating stable) MUST select it explicitly (`RUSTUP_TOOLCHAIN` or `cargo +<toolchain>`) and print `rustc -V`.
+- Because the committed lockfile hides the versions a fresh consumer would resolve, CI MUST also run a scheduled latest-dependencies job (`cargo update`, then build, test, clippy, and `cargo audit`).
 - The complete build environment MUST be documented: Rust version, LLVM version, OS, target architecture, relevant environment variables.
 - Dockerized or scripted build environments SHOULD be provided for any project where reproducibility is a hard requirement.
 

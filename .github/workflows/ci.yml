@@ -5,10 +5,18 @@ on:
     branches: [main, dev]
   pull_request:
     branches: [main, dev]
+  schedule:
+    # Weekly, so the latest-dependencies job catches drift between releases.
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
+  # The repository toolchain (rust-toolchain.toml). Every job selects its
+  # toolchain explicitly with RUSTUP_TOOLCHAIN, because the toolchain file would
+  # otherwise override whatever a setup action installed; each prints rustc -V.
+  PINNED: "1.99.0"
 
 jobs:
   test:
@@ -18,63 +26,136 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        rust: [stable, "1.85"]
+        # The pinned repository toolchain and the MSRV.
+        rust: ["1.99.0", "1.85"]
+    env:
+      RUSTUP_TOOLCHAIN: ${{ matrix.rust }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ matrix.rust }}
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+      - name: Toolchain
+        run: rustc -V && cargo -V
       - name: Format
+        if: matrix.rust == env.PINNED
         run: cargo fmt --all -- --check
       - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: Test
-        run: cargo test --all-features
+        run: cargo test --locked --all-features
       - name: Doc
-        run: cargo doc --no-deps --all-features
+        run: cargo doc --locked --no-deps --all-features
         env:
           RUSTDOCFLAGS: "-D warnings"
 
-  runtimes:
-    name: Runtimes (smol + no_std core)
+  features:
+    name: Features (${{ matrix.features }})
     runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: "1.99.0"
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - "--no-default-features"
+          - "--no-default-features --features std"
+          - "--no-default-features --features tokio"
+          - "--no-default-features --features smol"
+          - "--no-default-features --features adaptive"
+          - "--no-default-features --features circuit-breaker"
+          - "--no-default-features --features provider-headers"
+          - "--no-default-features --features provider-llm"
+          - "--no-default-features --features metrics"
+          - "--no-default-features --features tracing"
+          - "--no-default-features --features std,metrics,tracing"
+          - "--no-default-features --features tokio,tower"
+          - "--no-default-features --features smol,adaptive,circuit-breaker,provider-llm,tower"
+          - ""
+          - "--features metrics,tracing"
+          - "--all-features"
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.99.0"
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Clippy (smol backend)
-        run: cargo clippy --no-default-features --features smol --all-targets -- -D warnings
-      - name: Test (smol backend)
-        run: cargo test --no-default-features --features smol
-      - name: Build no_std core
-        run: cargo build --no-default-features
-      - name: Clippy (no default features)
-        run: cargo clippy --no-default-features --all-targets -- -D warnings
+        with:
+          # Cache keys may not contain commas; the job index is unique per row.
+          key: features-${{ strategy.job-index }}
+      - name: Toolchain
+        run: rustc -V
+      - name: Clippy
+        run: cargo clippy --locked --all-targets ${{ matrix.features }} -- -D warnings
+      - name: Test
+        run: cargo test --locked ${{ matrix.features }}
+
+  no-std:
+    name: no_std core (thumbv7em)
+    runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: "1.99.0"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.99.0"
+          targets: thumbv7em-none-eabihf
+      - uses: Swatinem/rust-cache@v2
+      - name: Toolchain
+        run: rustc -V
+      - name: Build the no_std core for a bare-metal target
+        run: cargo build --locked --no-default-features --target thumbv7em-none-eabihf
 
   loom:
     name: Loom (concurrency model check)
     runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: "1.99.0"
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.99.0"
       - uses: Swatinem/rust-cache@v2
+      - name: Toolchain
+        run: rustc -V
       - name: Loom
-        run: cargo test --test loom_throttle --no-default-features --features adaptive --release
+        run: cargo test --locked --test loom_throttle --no-default-features --features adaptive --release
         env:
           RUSTFLAGS: "--cfg throttle_loom"
           LOOM_MAX_PREEMPTIONS: "3"
 
+  stress:
+    name: Stress (release, real clock)
+    runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: "1.99.0"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.99.0"
+      - uses: Swatinem/rust-cache@v2
+      - name: Toolchain
+        run: rustc -V
+      - name: Multi-threaded over-admission tests, optimised
+        run: cargo test --locked --release --all-features --test stress
+
   fuzz:
     name: Fuzz (smoke)
     runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: nightly
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
+      - name: Toolchain
+        run: rustc -V
       - name: Install cargo-fuzz
         uses: taiki-e/install-action@v2
         with:
@@ -83,27 +164,119 @@ jobs:
       # the workflow-wide `-D warnings` so it does not fight the fuzz build.
       # Pin the fuzz target to the gnu triple: the prebuilt cargo-fuzz binary is
       # musl-static, so it would otherwise default the fuzz target to musl, whose
-      # std/core the nightly toolchain does not ship ("can't find crate for core").
+      # std/core the nightly toolchain does not ship.
       - name: Fuzz parse_retry_after (30s)
-        run: cargo +nightly fuzz run retry_after --target x86_64-unknown-linux-gnu -- -max_total_time=30
+        run: cargo +nightly fuzz run retry_after fuzz/seeds/retry_after --target x86_64-unknown-linux-gnu -- -max_total_time=30
         env:
           RUSTFLAGS: ""
       - name: Fuzz provider headers (30s)
-        run: cargo +nightly fuzz run provider_headers --target x86_64-unknown-linux-gnu -- -max_total_time=30
+        run: cargo +nightly fuzz run provider_headers fuzz/seeds/provider_headers --target x86_64-unknown-linux-gnu -- -max_total_time=30
         env:
           RUSTFLAGS: ""
+      - name: Fuzz limiter operations (30s)
+        run: cargo +nightly fuzz run limiter_ops fuzz/seeds/limiter_ops --target x86_64-unknown-linux-gnu -- -max_total_time=30
+        env:
+          RUSTFLAGS: ""
+
+  minimal-versions:
+    name: Minimal direct dependency versions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.99.0"
+      - uses: Swatinem/rust-cache@v2
+      - name: Resolve every direct dependency to its declared floor
+        run: cargo +nightly update -Z direct-minimal-versions
+      - name: Check
+        run: rustc -V && cargo check --all-features
+        env:
+          RUSTUP_TOOLCHAIN: "1.99.0"
+
+  latest-deps:
+    name: Latest dependencies (floating stable)
+    runs-on: ubuntu-latest
+    env:
+      # Floating stable on purpose: what a fresh consumer builds with today.
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Toolchain
+        run: rustc -V
+      - name: Resolve every dependency to its newest compatible version
+        run: cargo update --verbose
+        env:
+          # Ignore the MSRV when resolving, so the newest releases are tried
+          # (the MSRV-aware resolver would keep MSRV-compatible versions).
+          CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS: allow
+      - name: Build
+        run: cargo build --all-features
+      - name: Test
+        run: cargo test --all-features
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - name: Audit the updated lockfile
+        run: cargo audit
+
+  semver:
+    name: SemVer (cargo-semver-checks)
+    runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - uses: actions/checkout@v7
+      - uses: obi1kenobi/cargo-semver-checks-action@v2
+        with:
+          feature-group: all-features
+
+  coverage:
+    name: Coverage (llvm-cov)
+    runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: "1.99.0"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.99.0"
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - name: Toolchain
+        run: rustc -V
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - name: Coverage summary
+        run: cargo llvm-cov --locked --all-features --summary-only
 
   security:
     name: Security (audit + deny)
     runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: "1.99.0"
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.99.0"
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-audit and cargo-deny
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-audit,cargo-deny
+      # Audits the committed lockfile; the latest-deps job audits a fresh
+      # resolution.
       - name: Audit
         run: cargo audit
       - name: Deny

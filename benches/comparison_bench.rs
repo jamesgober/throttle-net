@@ -3,8 +3,10 @@
 //! limiter, on the same workload.
 //!
 //! Both limiters are given an effectively infinite rate so the bucket never
-//! empties, isolating the cost of the acquire path itself — one atomic
-//! compare-and-swap. The v0.9 target is to match or beat `governor` here.
+//! empties, isolating the cost of the acquire path itself. `governor` is GCRA
+//! over a single 8-byte timestamp on a coarse clock; throttle-net reads the OS
+//! monotonic clock on every call (QPC on Windows), which dominates its cost. The
+//! comparison is reported as measured, not as a target met.
 //!
 //! The limiter surface requires `std`; with it off there is nothing to compare,
 //! so the harness compiles to an empty `main`.

@@ -12,30 +12,42 @@
 //! waiting, cost-aware, composable surface on top. It is the outbound companion
 //! to [`rate-net`](https://crates.io/crates/rate-net).
 //!
-//! ## Status
+//! ## What is here
 //!
-//! **Stable (v1.0).** The public API is frozen until 2.0. The limiter and resilience surface:
-//! the [`Limiter`] trait, the [`Throttle`] token bucket and the exact
-//! [`SlidingWindowLog`], each with a waiting cost-aware
-//! [`acquire`](Throttle::acquire); the composites — [`Hybrid`] (must pass all),
-//! [`MultiLimiter`] (multi-dimensional budgets), [`PerKey`] (independent per-key
-//! state, bounded memory), and [`Layered`] (global / per-key / per-endpoint
-//! scopes); standalone [`Retry`]/[`Backoff`] with jittered backoff and
-//! `Retry-After` parsing; the resilience layer — a `CircuitBreaker` that wraps
-//! any limiter and fails fast (`circuit-breaker` feature), and a deadline-aware,
-//! priority [`Queue`]; adaptive concurrency — an `AdaptiveLimiter` that discovers
-//! the right in-flight limit from outcome feedback (`adaptive` feature); provider
-//! integration — response-header parsers with limiter sync (`provider-headers`
-//! feature) and LLM tier `presets` (`provider-llm` feature); and observability —
-//! metrics and tracing events, feature-gated and zero-cost when off (`metrics`,
-//! `tracing` features).
-//!
-//! The waiting surface runs on either [`tokio`](crate#feature-flags) or
-//! [`smol`](crate#feature-flags) — the async code is runtime-agnostic, and you
-//! choose the timer backend by feature. With `std` off, the pure algorithm core
-//! ([`Backoff`], [`Jitter`], [`Decision`]) compiles `no_std`. Correctness is held
-//! by property tests for every limiter invariant, a `loom` model check of the
-//! lock-free slot accounting, and fuzzed parsers.
+//! - **Limiters** — the [`Throttle`] token bucket (burst, rate, and initial fill
+//!   set independently; [`Throttle::smooth`] for GCRA-style pacing) and the
+//!   exact [`SlidingWindowLog`], both behind the [`Limiter`] trait.
+//! - **Composites** — [`Hybrid`] (must pass all), [`MultiLimiter`] (named
+//!   budgets such as requests + tokens, with aliases; strict about unknown
+//!   names), [`PerKey`] (independent per-key state with bounded memory), and
+//!   [`Layered`] (global / per-key / per-endpoint scopes).
+//! - **Waiting** — every limiter has a waiting `acquire`. Token buckets
+//!   ([`Throttle`], [`PerKey`]) reserve their units and sleep exactly until
+//!   they accrue (fair: later callers queue behind them); composites queue on
+//!   their *bottleneck* constituent and take the others only when it is due,
+//!   so a scope shared with other callers is never held ahead of use; the
+//!   [`SlidingWindowLog`] cannot reserve, so its waiters retry when the window
+//!   frees. Each waiting `acquire` has a `*_timeout` variant whose deadline
+//!   bounds the whole wait (a token bucket gives up at once when the wait is
+//!   known to be too long), and every one is **cancel-safe**: dropping the
+//!   future returns what it held. A pause set while a waiter sleeps holds it
+//!   too, and `resume` wakes it.
+//! - **Resilience** — [`Retry`] with jittered [`Backoff`], a `Retry-After` cap, a
+//!   total time budget, and a shared [`RetryBudget`]; a `CircuitBreaker`
+//!   (`circuit-breaker` feature) with owned permits and
+//!   `call(future)`; a [`Bulkhead`]; a deadline-aware priority [`Queue`]; and
+//!   [`resilience`] helpers — `timeout`, `fallback`, and `hedge`.
+//! - **Adaptive concurrency** — an `AdaptiveLimiter` (`adaptive` feature) that
+//!   learns the right in-flight limit with AIMD or Vegas.
+//! - **Providers** — rate-limit header parsing for OpenAI, Anthropic, GitHub,
+//!   the IETF draft, and others, with reconciliation that drains limiters to the
+//!   server's count and pauses them until a reset (`provider-headers`), plus LLM
+//!   tier presets (`provider-llm`).
+//! - **Observability** — per-instance names on every metric and event,
+//!   grant / denial / timeout / shed counters, wait histograms, and state
+//!   gauges (`metrics`, `tracing`); zero cost when off.
+//! - **Integrations** — `tower` layers (`tower` feature) and a `TokioClock`
+//!   that follows tokio's pausable test time (`tokio` feature).
 //!
 //! ```
 //! # #[cfg(feature = "runtime")]
@@ -65,40 +77,52 @@
 //! # }
 //! ```
 //!
-//! ## Design goals
+//! ## Guarantees
 //!
-//! - **Wait by default.** The Tier-1 [`acquire`](Throttle::acquire) paces the
-//!   caller; [`try_acquire`](Throttle::try_acquire) is there when you need the
-//!   non-blocking answer.
-//! - **Cost-aware.** Not every request weighs one unit. `acquire_with_cost(n)`
-//!   takes `n` tokens at once — the basis for the multi-dimensional LLM budgets
-//!   that arrive with the rest of v0.2.
-//! - **Lock-free accounting.** Each acquire is a single atomic compare-and-swap
-//!   in `better-bucket`; no lock sits on the path.
-//! - **Runtime-free core, lazy refill.** Tokens accrue from a monotonic clock on
-//!   access; there is no background timer thread, and the synchronous core has no
-//!   async-runtime dependency.
-//! - **Composable.** Every limiter is one [`Limiter`]; composites combine them
-//!   without the call site changing.
+//! - **No over-admission under concurrency.** Every grant is one atomic
+//!   compare-and-swap in better-bucket's single-instant engine, where a stale or
+//!   backward clock reading can only deny more. Over any window, a token
+//!   bucket's grants never exceed its capacity plus what its rate accrues, under
+//!   any number of threads. Composites hold the same bound per constituent,
+//!   both for what is charged and for when requests are released: a waiter
+//!   charges each constituent when its request is (within a few milliseconds)
+//!   ready to go, except the bottleneck it queues on — exactly as a waiter on
+//!   that limiter alone would. This is checked by real-clock multi-threaded
+//!   stress tests here and loom models in better-bucket.
+//! - **Bounded memory.** Per-key state, queue bookkeeping, and sliding logs are
+//!   all bounded, with O(1) or O(log n) work per operation. Bounding per-key
+//!   state never resets a limited key's allowance; see [`Eviction`] for what a
+//!   key flood can and cannot do.
+//! - **Untrusted server input is capped.** A `Retry-After` or reset from a
+//!   response pauses a limiter for at most five minutes by default, and
+//!   [`Retry`] waits at most five minutes for a `Retry-After`.
+//! - **No panics** on any input: hostile headers, extreme durations, rates, and
+//!   costs are all handled with checked or saturating arithmetic.
 //!
 //! ## Feature flags
 //!
 //! | Feature | Default | Description |
 //! |---------|---------|-------------|
-//! | `std`   | yes | Standard library — the limiter surface. With it off the crate is `no_std` and exposes the pure algorithm core ([`Backoff`], [`Jitter`], [`Decision`]) plus [`VERSION`]. |
-//! | `tokio` | yes | tokio timer backend for the waiting [`acquire`](Throttle::acquire) surface. Implies `std`. |
-//! | `smol`  | no  | smol timer backend, as an alternative to `tokio`. (async-std is unsupported — it is discontinued.) |
-//!
-//! The `circuit-breaker`, `adaptive`, `provider-headers` / `provider-llm`, and
-//! `metrics` / `tracing` features are documented in `docs/API.md`, which carries
-//! the full feature matrix.
+//! | `std` | yes | The limiter surface. With it off the crate is `no_std` and exposes the pure algorithm core: [`Backoff`], [`BackoffIter`], [`Jitter`], [`Decision`], and [`VERSION`]. |
+//! | `tokio` | yes | tokio timer backend for every waiting `acquire`, plus `TokioClock`. Implies `std`. |
+//! | `smol` | no | smol timer backend, as an alternative to `tokio`. If both are enabled, tokio's timer is used. (async-std is unsupported: it is discontinued.) |
+//! | `circuit-breaker` | no | `CircuitBreaker`, `Permit`, `OwnedPermit`, `Trip`, `BreakerState`. |
+//! | `adaptive` | no | `AdaptiveLimiter` with the `Aimd` and `Vegas` strategies. Its waiting `acquire` also needs `tokio` or `smol`. |
+//! | `provider-headers` | no | The `provider` module: rate-limit header parsing and limiter reconciliation. |
+//! | `provider-llm` | no | The `presets` module: LLM provider tier presets. Implies `provider-headers`. |
+//! | `metrics` | no | Emit metrics through the [`metrics`](https://crates.io/crates/metrics) 0.24 facade. |
+//! | `tracing` | no | Emit [`tracing`](https://crates.io/crates/tracing) events. |
+//! | `tower` | no | The `tower` module: `tower::Layer` adapters. Needs `tokio` or `smol`. |
 
 // `no_std` for the library build when `std` is off, but always link `std` under
 // `test` so the unit-test harness and dev-dependencies have what they need.
 #![cfg_attr(all(not(feature = "std"), not(test)), no_std)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
-#![deny(missing_docs)]
 #![forbid(unsafe_code)]
+#![deny(warnings)]
+#![deny(missing_docs)]
+#![deny(missing_debug_implementations)]
+#![deny(unsafe_op_in_unsafe_fn)]
 #![deny(unused_must_use)]
 #![deny(unused_results)]
 #![deny(clippy::unwrap_used)]
@@ -110,15 +134,28 @@
 #![deny(clippy::dbg_macro)]
 #![deny(clippy::unreachable)]
 #![deny(clippy::undocumented_unsafe_blocks)]
+#![deny(clippy::missing_safety_doc)]
+// The docs cross-link the whole surface. In a build without every documented
+// feature (docs.rs builds with all of them), links to the gated items have no
+// target; the items they describe are simply absent from that build.
+#![cfg_attr(
+    not(all(
+        feature = "runtime",
+        feature = "adaptive",
+        feature = "circuit-breaker",
+        feature = "provider-llm",
+        feature = "tower"
+    )),
+    allow(rustdoc::broken_intra_doc_links)
+)]
 
-// The limiter surface requires the standard library (the clock-driven token
-// bucket and the domain error type). With `std` off the crate is `no_std` and
-// exposes only `VERSION`.
 #[cfg(feature = "adaptive")]
 mod adaptive;
-// `backoff` and `decision` are the `no_std`-capable algorithm core: pure types
-// and math, no clock or async. The rest of the surface requires `std`.
+// `backoff` and `decision` are the `no_std` algorithm core: pure types and
+// math, no clock or async. Everything else requires `std`.
 mod backoff;
+#[cfg(feature = "std")]
+mod bulkhead;
 #[cfg(feature = "circuit-breaker")]
 mod circuit;
 mod decision;
@@ -127,6 +164,8 @@ mod error;
 #[cfg(feature = "std")]
 mod eviction;
 #[cfg(feature = "std")]
+mod hold;
+#[cfg(feature = "std")]
 mod hybrid;
 #[cfg(feature = "std")]
 mod layered;
@@ -134,16 +173,21 @@ mod layered;
 mod limiter;
 #[cfg(feature = "std")]
 mod multi;
-#[cfg(any(feature = "runtime", feature = "circuit-breaker", feature = "adaptive"))]
+#[cfg(feature = "std")]
 mod obs;
 #[cfg(feature = "std")]
 mod perkey;
 #[cfg(feature = "provider-llm")]
+#[cfg_attr(docsrs, doc(cfg(feature = "provider-llm")))]
 pub mod presets;
 #[cfg(feature = "provider-headers")]
+#[cfg_attr(docsrs, doc(cfg(feature = "provider-headers")))]
 pub mod provider;
 #[cfg(feature = "runtime")]
 mod queue;
+#[cfg(feature = "runtime")]
+#[cfg_attr(docsrs, doc(cfg(feature = "runtime")))]
+pub mod resilience;
 #[cfg(feature = "std")]
 mod retry;
 #[cfg(feature = "std")]
@@ -152,26 +196,41 @@ mod retry_after;
 mod rt;
 #[cfg(feature = "std")]
 mod sliding;
-// Loom-aware atomics indirection for the adaptive limiter's slot accounting.
-#[cfg(feature = "adaptive")]
+#[cfg(feature = "std")]
+mod store;
+// Loom-aware atomics indirection for the adaptive limiter's and the bulkhead's
+// lock-free slot accounting.
+#[cfg(feature = "std")]
 mod sync;
 #[cfg(feature = "std")]
 mod throttle;
 #[cfg(feature = "std")]
 mod timeutil;
+#[cfg(feature = "tower")]
+#[cfg_attr(docsrs, doc(cfg(feature = "tower")))]
+pub mod tower;
+#[cfg(feature = "runtime")]
+mod wait;
 
 #[cfg(feature = "adaptive")]
+#[cfg_attr(docsrs, doc(cfg(feature = "adaptive")))]
 pub use crate::adaptive::{
-    AdaptiveLimiter, AdaptiveLimiterBuilder, AdaptivePermit, AdaptiveStrategy, Aimd, Outcome, Vegas,
+    AdaptiveLimiter, AdaptiveLimiterBuilder, AdaptivePermit, AdaptiveStrategy, Aimd, Outcome,
+    OwnedAdaptivePermit, Vegas,
 };
 pub use crate::backoff::{Backoff, BackoffIter, Jitter};
+#[cfg(feature = "std")]
+pub use crate::bulkhead::{Bulkhead, BulkheadPermit, OwnedBulkheadPermit};
 #[cfg(feature = "circuit-breaker")]
-pub use crate::circuit::{BreakerState, CircuitBreaker, CircuitBreakerBuilder, Permit, Trip};
+#[cfg_attr(docsrs, doc(cfg(feature = "circuit-breaker")))]
+pub use crate::circuit::{
+    BreakerState, CallError, CircuitBreaker, CircuitBreakerBuilder, OwnedPermit, Permit, Trip,
+};
 pub use crate::decision::Decision;
 #[cfg(feature = "std")]
 pub use crate::error::ThrottleError;
 #[cfg(feature = "std")]
-pub use crate::eviction::{DEFAULT_MAX_KEYS, Eviction};
+pub use crate::eviction::{DEFAULT_MAX_KEYS, Eviction, WhenFull};
 #[cfg(feature = "std")]
 pub use crate::hybrid::{Hybrid, HybridBuilder};
 #[cfg(feature = "std")]
@@ -181,21 +240,27 @@ pub use crate::limiter::Limiter;
 #[cfg(feature = "std")]
 pub use crate::multi::{MultiLimiter, MultiLimiterBuilder};
 #[cfg(feature = "std")]
-pub use crate::perkey::PerKey;
+pub use crate::perkey::{PerKey, PerKeyBuilder};
 #[cfg(feature = "runtime")]
+#[cfg_attr(docsrs, doc(cfg(feature = "runtime")))]
 pub use crate::queue::{Overflow, Queue, QueueBuilder};
 #[cfg(feature = "std")]
-pub use crate::retry::{Retry, RetryAction, retry_if_retryable};
+pub use crate::retry::{Retry, RetryAction, RetryBudget, retry_if_retryable};
 #[cfg(feature = "std")]
 pub use crate::retry_after::{parse_retry_after, parse_retry_after_at};
+#[cfg(feature = "tokio")]
+#[cfg_attr(docsrs, doc(cfg(feature = "tokio")))]
+pub use crate::rt::TokioClock;
 #[cfg(feature = "std")]
 pub use crate::sliding::SlidingWindowLog;
 #[cfg(feature = "std")]
-pub use crate::throttle::Throttle;
+pub use crate::store::MAX_SHARDS;
+#[cfg(feature = "std")]
+pub use crate::throttle::{Throttle, ThrottleBuilder};
 
-// The clock seam is part of the public API: [`Throttle::with_clock`] and the
-// per-key/composite `with_clock` methods take any [`Clock`], and tests drive a
-// [`ManualClock`]. Re-exported so callers need not depend on `clock-lib` directly.
+// The clock seam is part of the public API: `with_clock` and the builders' `clock`
+// methods take any [`Clock`], and tests drive a [`ManualClock`]. Re-exported so
+// callers need not depend on `clock-lib` directly.
 #[cfg(feature = "std")]
 pub use clock_lib::{Clock, ManualClock, SystemClock};
 
@@ -204,6 +269,59 @@ pub use clock_lib::{Clock, ManualClock, SystemClock};
 /// # Examples
 ///
 /// ```
-/// assert!(!throttle_net::VERSION.is_empty());
+/// assert!(throttle_net::VERSION.starts_with("2."));
 /// ```
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+// Compile and run the Rust examples in the README and the reference docs as
+// doctests, so the documentation cannot drift from the code. They exercise
+// every feature, so they run under `--all-features`.
+#[cfg(all(
+    doctest,
+    feature = "tokio",
+    feature = "circuit-breaker",
+    feature = "adaptive",
+    feature = "provider-llm"
+))]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
+
+#[cfg(all(
+    doctest,
+    feature = "tokio",
+    feature = "circuit-breaker",
+    feature = "adaptive",
+    feature = "provider-llm"
+))]
+#[doc = include_str!("../docs/API.md")]
+struct ApiReferenceDoctests;
+
+#[cfg(all(
+    doctest,
+    feature = "tokio",
+    feature = "circuit-breaker",
+    feature = "adaptive",
+    feature = "provider-llm"
+))]
+#[doc = include_str!("../docs/COOKBOOK.md")]
+struct CookbookDoctests;
+
+#[cfg(all(
+    doctest,
+    feature = "tokio",
+    feature = "circuit-breaker",
+    feature = "adaptive",
+    feature = "provider-llm"
+))]
+#[doc = include_str!("../docs/MIGRATING_FROM_GOVERNOR.md")]
+struct MigratingDoctests;
+
+#[cfg(all(
+    doctest,
+    feature = "tokio",
+    feature = "circuit-breaker",
+    feature = "adaptive",
+    feature = "provider-llm"
+))]
+#[doc = include_str!("../docs/MIGRATION_1_TO_2.md")]
+struct MigrationGuideDoctests;

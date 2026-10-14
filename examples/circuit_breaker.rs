@@ -3,7 +3,7 @@
 //! trial once the downstream is healthy again.
 //!
 //! The simulated downstream fails its first five calls, then succeeds. Watch the
-//! breaker move Closed → Open → HalfOpen → Closed.
+//! breaker move closed → open → half-open → closed.
 //!
 //! Run with: `cargo run --example circuit_breaker --features circuit-breaker`
 
