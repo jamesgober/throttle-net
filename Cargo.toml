@@ -227,6 +227,11 @@ harness = false
 name    = "contention_bench"
 harness = false
 
+# Adversarial per-key floods: the cost of a new key once the store is full.
+[[bench]]
+name    = "eviction_bench"
+harness = false
+
 
 # RELEASE PROFILE
 # #################################
