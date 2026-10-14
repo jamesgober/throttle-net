@@ -121,6 +121,19 @@
 #![deny(clippy::unreachable)]
 #![deny(clippy::undocumented_unsafe_blocks)]
 #![deny(clippy::missing_safety_doc)]
+// The docs cross-link the whole surface. In a build without every documented
+// feature (docs.rs builds with all of them), links to the gated items have no
+// target; the items they describe are simply absent from that build.
+#![cfg_attr(
+    not(all(
+        feature = "runtime",
+        feature = "adaptive",
+        feature = "circuit-breaker",
+        feature = "provider-llm",
+        feature = "tower"
+    )),
+    allow(rustdoc::broken_intra_doc_links)
+)]
 
 #[cfg(feature = "adaptive")]
 mod adaptive;
