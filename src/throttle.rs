@@ -755,7 +755,7 @@ impl<C: Clock> core::fmt::Debug for Throttle<C> {
             .field("refill_period", &config.refill_period())
             .field("available", &self.available())
             .field("paused_for", &self.paused_for())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -1282,7 +1282,7 @@ mod tests {
         // The reservation was refunded: a new 10-token reservation waits ~1s
         // (the original deficit), not ~2s (behind a leaked reservation).
         let wait = throttle.reserve(10, Duration::MAX).unwrap();
-        assert!(wait <= Duration::from_millis(1000), "leaked: {wait:?}");
+        assert!(wait <= Duration::from_secs(1), "leaked: {wait:?}");
     }
 
     #[cfg(feature = "tokio")]

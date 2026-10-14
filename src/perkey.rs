@@ -686,7 +686,7 @@ where
             .field("keys", &self.store.len())
             .field("shards", &self.store.shard_count())
             .field("eviction", &self.eviction)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -903,7 +903,7 @@ impl<K, C> core::fmt::Debug for PerKeyBuilder<K, C> {
             .field("eviction", &self.eviction)
             .field("shards", &self.shards)
             .field("name", &self.label)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -1112,10 +1112,10 @@ mod tests {
         let clock = Arc::new(ManualClock::new());
         let limiter = PerKey::<&str>::per_second(10)
             .with_clock(clock.clone())
-            .with_eviction(Eviction::idle(Duration::from_millis(1000)).with_capacity(1))
+            .with_eviction(Eviction::idle(Duration::from_secs(1)).with_capacity(1))
             .with_shards(1);
         assert!(limiter.try_acquire(&"idle"));
-        clock.advance(Duration::from_millis(2000));
+        clock.advance(Duration::from_secs(2));
         assert!(limiter.try_acquire(&"fresh"));
         assert_eq!(limiter.len(), 1, "the idle key should have been reclaimed");
     }

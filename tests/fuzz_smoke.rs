@@ -29,10 +29,10 @@ impl Mix {
     /// characters (digits, signs, separators, date words, control bytes).
     fn string(&mut self) -> String {
         const ALPHABET: &[u8] = b"0123456789 ,:-+.GMTawecdfijlnoprstuvy/\t\r\n\0\x7f\xff";
-        let len = (self.next() % 33) as usize;
+        let len = usize::try_from(self.next() % 33).unwrap();
         (0..len)
             .map(|_| {
-                let idx = (self.next() as usize) % ALPHABET.len();
+                let idx = usize::try_from(self.next() % ALPHABET.len() as u64).unwrap();
                 ALPHABET[idx] as char
             })
             .collect()
@@ -87,7 +87,8 @@ fn parse_retry_after_never_panics_on_random_sweep() {
     let mut mix = Mix(0x1234_5678_9ABC_DEF0);
     for _ in 0..50_000 {
         let value = mix.string();
-        let now = mix.next() as i64;
+        // Reinterpreting the bits covers negative instants too.
+        let now = i64::from_ne_bytes(mix.next().to_ne_bytes());
         let _ = parse_retry_after_at(&value, now);
     }
 }
@@ -173,7 +174,8 @@ mod provider {
             let name = mix.string();
             let value = mix.string();
             let headers = [(name.as_str(), value.as_str())];
-            let now = mix.next() as i64;
+            // Reinterpreting the bits covers negative instants too.
+            let now = i64::from_ne_bytes(mix.next().to_ne_bytes());
             for profile in PROFILES {
                 let _ = profile.parse_at(&headers, now);
             }

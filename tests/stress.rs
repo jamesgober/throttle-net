@@ -93,7 +93,7 @@ fn cost_aware_grants_never_over_admit_under_contention() {
     let granted_units = Arc::new(AtomicU64::new(0));
     let units = Arc::clone(&granted_units);
     let (_calls, elapsed) = hammer(8, move |thread| {
-        let cost = 1 + (thread as u32 % 7) * 13;
+        let cost = 1 + u32::try_from(thread % 7).unwrap() * 13;
         let ok = t.try_acquire_with_cost(cost);
         if ok {
             let _ = units.fetch_add(u64::from(cost), Ordering::Relaxed);

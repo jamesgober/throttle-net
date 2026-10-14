@@ -159,28 +159,37 @@ pub(crate) trait KeyedLimiter<K>: Send + Sync {
     fn capacity(&self) -> u32;
 }
 
-/// Folds one constituent's peek into a running "must pass all" verdict: the
-/// longest wait wins, and any `Impossible` is final.
+/// A running "must pass all" verdict over several constituents' peeks.
+#[derive(Clone, Copy)]
+pub(crate) enum Verdict {
+    /// Every constituent so far would grant now.
+    Ready,
+    /// Some constituent must wait; the longest wait so far.
+    Wait(Duration),
+    /// Some constituent can never grant.
+    Never,
+}
+
+/// Folds one constituent's peek into the verdict: the longest wait wins, and
+/// any `Impossible` is final.
 #[inline]
-pub(crate) fn fold_peek(
-    acc: Option<Option<Duration>>,
-    decision: Decision,
-) -> Option<Option<Duration>> {
-    let wait = acc?;
-    match decision {
-        D::Acquired => Some(wait),
-        D::Retry { after } => Some(Some(wait.map_or(after, |w| w.max(after)))),
-        _ => None,
+pub(crate) fn fold_peek(acc: Verdict, decision: Decision) -> Verdict {
+    match (acc, decision) {
+        (Verdict::Never, _) => Verdict::Never,
+        (acc, D::Acquired) => acc,
+        (Verdict::Ready, D::Retry { after }) => Verdict::Wait(after),
+        (Verdict::Wait(wait), D::Retry { after }) => Verdict::Wait(wait.max(after)),
+        _ => Verdict::Never,
     }
 }
 
 /// Converts a folded verdict back into a [`Decision`].
 #[inline]
-pub(crate) fn finish_peek(acc: Option<Option<Duration>>) -> Decision {
+pub(crate) fn finish_peek(acc: Verdict) -> Decision {
     match acc {
-        None => D::Impossible,
-        Some(None) => D::Acquired,
-        Some(Some(after)) => D::Retry { after },
+        Verdict::Never => D::Impossible,
+        Verdict::Ready => D::Acquired,
+        Verdict::Wait(after) => D::Retry { after },
     }
 }
 
@@ -193,10 +202,10 @@ pub(crate) fn peek_all<'a, I>(items: I) -> Decision
 where
     I: Iterator<Item = (&'a dyn Limiter, u32)>,
 {
-    let mut acc = Some(None);
+    let mut acc = Verdict::Ready;
     for (limiter, cost) in items {
         acc = fold_peek(acc, limiter.peek(cost));
-        if acc.is_none() {
+        if matches!(acc, Verdict::Never) {
             break;
         }
     }
@@ -253,13 +262,11 @@ where
 {
     let mut longest = Duration::ZERO;
     for (index, (limiter, cost)) in items.clone().enumerate() {
-        match limiter.reserve(cost, max_wait) {
-            Some(wait) => longest = longest.max(wait),
-            None => {
-                refund_first(items, index);
-                return None;
-            }
-        }
+        let Some(wait) = limiter.reserve(cost, max_wait) else {
+            refund_first(items, index);
+            return None;
+        };
+        longest = longest.max(wait);
     }
     Some(longest)
 }

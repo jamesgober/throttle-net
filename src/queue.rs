@@ -162,25 +162,22 @@ impl<K: Eq + Hash + Clone> State<K> {
     fn insert(&mut self, priority: u32, deadline_ms: Option<u64>, key: &K) -> (u64, Arc<Signal>) {
         let seq = self.next_seq;
         self.next_seq += 1;
-        let (key_id, recency) = match self.keys.get_mut(key) {
-            Some(state) => {
-                state.waiting += 1;
-                (state.id, state.recency)
-            }
-            None => {
-                let id = self.next_key_id;
-                self.next_key_id += 1;
-                let _new = self.keys.insert(
-                    key.clone(),
-                    KeyState {
-                        id,
-                        recency: self.recency_floor,
-                        waiting: 1,
-                    },
-                );
-                let _new = self.key_of.insert(id, key.clone());
-                (id, self.recency_floor)
-            }
+        let (key_id, recency) = if let Some(state) = self.keys.get_mut(key) {
+            state.waiting += 1;
+            (state.id, state.recency)
+        } else {
+            let id = self.next_key_id;
+            self.next_key_id += 1;
+            let _new = self.keys.insert(
+                key.clone(),
+                KeyState {
+                    id,
+                    recency: self.recency_floor,
+                    waiting: 1,
+                },
+            );
+            let _new = self.key_of.insert(id, key.clone());
+            (id, self.recency_floor)
         };
         let level = self.levels.entry(Reverse(priority)).or_default();
         let queue = level.by_key.entry(key_id).or_default();
@@ -514,16 +511,12 @@ where
                     .filter(|&(_, weakest)| priority > weakest)
                     .map(|(seq, _)| seq),
             };
-            match victim {
-                Some(seq) => {
-                    state.evict(seq);
-                    obs::queue_rejected(&self.label, self.overflow.as_str());
-                }
-                None => {
-                    obs::queue_rejected(&self.label, Overflow::Reject.as_str());
-                    return Err(ThrottleError::QueueFull);
-                }
-            }
+            let Some(seq) = victim else {
+                obs::queue_rejected(&self.label, Overflow::Reject.as_str());
+                return Err(ThrottleError::QueueFull);
+            };
+            state.evict(seq);
+            obs::queue_rejected(&self.label, self.overflow.as_str());
         }
         let registered = state.insert(priority, deadline_ms, key);
         state.wake_winner(now_ms);
@@ -695,7 +688,7 @@ where
             .field("waiters", &self.len())
             .field("capacity", &self.capacity)
             .field("overflow", &self.overflow)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

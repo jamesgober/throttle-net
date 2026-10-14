@@ -601,7 +601,7 @@ impl<C: Clock> core::fmt::Debug for SlidingWindowLog<C> {
             .field("limit", &self.limit)
             .field("window", &self.window)
             .field("available", &self.available())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

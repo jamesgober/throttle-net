@@ -180,6 +180,8 @@ impl RateLimitInfo {
     /// assert_eq!(limiter.available("requests"), Some(12));
     /// assert_eq!(limiter.available("tokens"), Some(4000));
     /// ```
+    // Callers usually reconcile for the side effect; the count is informative.
+    #[allow(clippy::must_use_candidate)]
     pub fn sync_multi(&self, limiter: &MultiLimiter) -> u32 {
         let mut drained = 0u32;
         if let (Some(window), Some(dimension)) = (self.requests, limiter.dimension("requests")) {
@@ -498,23 +500,23 @@ fn parse_rfc3339(value: &str) -> Option<i64> {
     // Drop any fractional-second part.
     let time = time.split('.').next()?;
 
-    let mut d = date.split('-');
-    let year = d.next()?.parse::<i64>().ok()?;
-    let month = d.next()?.parse::<u32>().ok()?;
-    let day = d.next()?.parse::<u32>().ok()?;
-    if d.next().is_some() {
+    let mut date_parts = date.split('-');
+    let year = date_parts.next()?.parse::<i64>().ok()?;
+    let month = date_parts.next()?.parse::<u32>().ok()?;
+    let day = date_parts.next()?.parse::<u32>().ok()?;
+    if date_parts.next().is_some() {
         return None;
     }
 
-    let mut t = time.split(':');
-    let h = t.next()?.parse::<u32>().ok()?;
-    let m = t.next()?.parse::<u32>().ok()?;
-    let s = t.next()?.parse::<u32>().ok()?;
-    if t.next().is_some() {
+    let mut time_parts = time.split(':');
+    let hour = time_parts.next()?.parse::<u32>().ok()?;
+    let minute = time_parts.next()?.parse::<u32>().ok()?;
+    let second = time_parts.next()?.parse::<u32>().ok()?;
+    if time_parts.next().is_some() {
         return None;
     }
 
-    civil_to_unix(year, month, day, h, m, s)?.checked_sub(offset_secs)
+    civil_to_unix(year, month, day, hour, minute, second)?.checked_sub(offset_secs)
 }
 
 /// Splits the zone off an RFC 3339 time, returning the time and the zone's

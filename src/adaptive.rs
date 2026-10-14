@@ -1044,9 +1044,9 @@ mod tests {
                     for _ in 0..EACH {
                         let permit = limiter.try_acquire().unwrap();
                         if t % 2 == 0 {
-                            permit.success()
+                            permit.success();
                         } else {
-                            permit.failure()
+                            permit.failure();
                         }
                     }
                 })

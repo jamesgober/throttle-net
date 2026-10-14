@@ -11,7 +11,7 @@ use clock_lib::Clock;
 use crate::decision::Decision;
 #[cfg(feature = "runtime")]
 use crate::error::ThrottleError;
-use crate::limiter::{KeyedLimiter, Limiter, finish_peek, fold_peek};
+use crate::limiter::{KeyedLimiter, Limiter, Verdict, finish_peek, fold_peek};
 use crate::obs::{self, Label};
 use crate::perkey::PerKey;
 
@@ -104,7 +104,7 @@ where
             self.per_key.as_ref().map(|pk| pk.peek(key, cost)),
             self.per_endpoint.as_ref().map(|pe| pe.peek(endpoint, cost)),
         ];
-        finish_peek(peeks.into_iter().flatten().fold(Some(None), fold_peek))
+        finish_peek(peeks.into_iter().flatten().fold(Verdict::Ready, fold_peek))
     }
 
     /// Gives back `cost` to the first `charged` scopes, in commit order
@@ -173,22 +173,18 @@ where
             longest = longest.max(scope.reserve(cost, max_wait)?);
         }
         if let Some(scope) = &self.per_key {
-            match scope.reserve(key, cost, max_wait) {
-                Some(wait) => longest = longest.max(wait),
-                None => {
-                    self.refund_scopes(key, endpoint, cost, 1);
-                    return None;
-                }
-            }
+            let Some(wait) = scope.reserve(key, cost, max_wait) else {
+                self.refund_scopes(key, endpoint, cost, 1);
+                return None;
+            };
+            longest = longest.max(wait);
         }
         if let Some(scope) = &self.per_endpoint {
-            match scope.reserve(endpoint, cost, max_wait) {
-                Some(wait) => longest = longest.max(wait),
-                None => {
-                    self.refund_scopes(key, endpoint, cost, 2);
-                    return None;
-                }
-            }
+            let Some(wait) = scope.reserve(endpoint, cost, max_wait) else {
+                self.refund_scopes(key, endpoint, cost, 2);
+                return None;
+            };
+            longest = longest.max(wait);
         }
         Some(longest)
     }

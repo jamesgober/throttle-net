@@ -470,7 +470,7 @@ impl<K: Eq + Hash> Store<K> {
 
     /// Forgets every key.
     pub(crate) fn clear(&self) {
-        for shard in self.shards.iter() {
+        for shard in &*self.shards {
             let mut map = write(&shard.map);
             *map = ShardMap::new();
         }

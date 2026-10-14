@@ -1,2 +1,4 @@
 avoid-breaking-exported-api = true
 msrv = "1.85"
+# Proper nouns the doc-markdown lint would otherwise want in backticks.
+doc-valid-idents = ["OpenAI", "SplitMix64", "GitHub", ".."]

@@ -36,7 +36,7 @@ async fn main() {
                 let n = attempts.fetch_add(1, Ordering::Relaxed) + 1;
                 println!("[{:>6.2}s] attempt {n}", started.elapsed().as_secs_f64());
                 match n {
-                    1 => Err(Rejected {
+                    1 | 3 => Err(Rejected {
                         status: 503,
                         retry_after: None,
                     }),
@@ -44,10 +44,6 @@ async fn main() {
                         status: 429,
                         retry_after: Some("1"),
                     }), // server says wait 1s
-                    3 => Err(Rejected {
-                        status: 503,
-                        retry_after: None,
-                    }),
                     _ => Ok("200 OK"),
                 }
             },

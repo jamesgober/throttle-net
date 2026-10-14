@@ -328,7 +328,7 @@ impl MultiLimiter {
     /// assert!(!limiter.try_acquire_costs(&[("output_tokens", 1)]), "in debt");
     /// ```
     pub fn settle_costs(&self, estimated: &[(&str, u32)], actual: &[(&str, u32)]) {
-        for dimension in self.table.dimensions.iter() {
+        for dimension in &*self.table.dimensions {
             let reserved = self.table.cost_for(&dimension.name, estimated);
             let used = self.table.cost_for(&dimension.name, actual);
             let limiter = dimension.limiter.as_ref();
@@ -349,7 +349,7 @@ impl MultiLimiter {
 
     /// Pauses every dimension for `duration` (see [`Limiter::pause_for`]).
     pub fn pause_for(&self, duration: Duration) {
-        for dimension in self.table.dimensions.iter() {
+        for dimension in &*self.table.dimensions {
             dimension.limiter.pause_for(duration);
         }
     }
@@ -370,6 +370,8 @@ impl MultiLimiter {
     /// assert_eq!(limiter.available("requests"), Some(10));
     /// assert_eq!(limiter.drain_to("nope", 0), None);
     /// ```
+    // Callers usually drain for the side effect; the count is informative.
+    #[allow(clippy::must_use_candidate)]
     pub fn drain_to(&self, dimension: &str, remaining: u32) -> Option<u32> {
         self.dimension(dimension)
             .map(|limiter| crate::limiter::drain_to(limiter, remaining))
@@ -380,7 +382,7 @@ impl MultiLimiter {
     #[cfg(feature = "runtime")]
     fn never_error(&self, costs: &[(&str, u32)]) -> ThrottleError {
         let mut fallback = None;
-        for dimension in self.table.dimensions.iter() {
+        for dimension in &*self.table.dimensions {
             let cost = self.table.cost_for(&dimension.name, costs);
             let capacity = dimension.limiter.capacity();
             if cost > capacity {
@@ -682,7 +684,7 @@ impl core::fmt::Debug for MultiLimiterBuilder {
             )
             .field("aliases", &self.aliases.len())
             .field("strict", &self.strict)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

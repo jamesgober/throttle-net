@@ -566,7 +566,7 @@ mod tests {
         assert!(format!("{:?}", layer.clone()).contains("CircuitBreakerLayer"));
         let failing = ServiceBuilder::new()
             .layer(layer.clone())
-            .service(service_fn(|_: ()| async {
+            .service(service_fn(|(): ()| async {
                 Err::<(), _>(std::io::Error::other("down"))
             }));
         assert!(format!("{failing:?}").contains("Guarded"));
@@ -599,7 +599,7 @@ mod tests {
         assert!(format!("{:?}", layer.clone()).contains("AdaptiveLayer"));
         let failing = ServiceBuilder::new()
             .layer(layer.clone())
-            .service(service_fn(|_: ()| async {
+            .service(service_fn(|(): ()| async {
                 Err::<(), _>(std::io::Error::other("overloaded"))
             }));
         assert!(format!("{failing:?}").contains("Adaptive"));

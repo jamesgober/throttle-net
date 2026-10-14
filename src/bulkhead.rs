@@ -320,7 +320,7 @@ impl core::fmt::Debug for Bulkhead {
             .field("name", &self.label)
             .field("limit", &self.limit)
             .field("in_use", &self.in_use())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

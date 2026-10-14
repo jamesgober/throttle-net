@@ -213,6 +213,13 @@ impl Retry {
     ///
     /// Cancel-safe: dropping the future mid-wait simply stops retrying.
     ///
+    /// # Errors
+    ///
+    /// The operation's last error, when it never succeeded: the attempts ran
+    /// out, the classifier gave up, a `Retry-After` exceeded
+    /// [`max_retry_after`](Self::max_retry_after), or the next wait would have
+    /// crossed [`max_elapsed`](Self::max_elapsed).
+    ///
     /// # Examples
     ///
     /// Retry on a `Retry-After` the server sent, parsed with
@@ -254,6 +261,11 @@ impl Retry {
     /// shared [`RetryBudget`]: the call deposits into the budget once, and each
     /// retry withdraws one; when the budget is empty the loop stops and returns
     /// the error instead of retrying.
+    ///
+    /// # Errors
+    ///
+    /// As [`run`](Self::run), plus the last error when the budget had no retry
+    /// to give.
     ///
     /// # Examples
     ///
