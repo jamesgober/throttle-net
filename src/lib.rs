@@ -29,7 +29,7 @@
 //! - **Resilience** — [`Retry`] with jittered [`Backoff`], a `Retry-After` cap, a
 //!   total time budget, and a shared [`RetryBudget`]; a `CircuitBreaker`
 //!   (`circuit-breaker` feature) with owned permits and
-//!   `call(future)`; a deadline-aware priority [`Queue`]; and
+//!   `call(future)`; a [`Bulkhead`]; a deadline-aware priority [`Queue`]; and
 //!   [`resilience`] helpers — `timeout`, `fallback`, and `hedge`.
 //! - **Adaptive concurrency** — an `AdaptiveLimiter` (`adaptive` feature) that
 //!   learns the right in-flight limit with AIMD or Vegas.
@@ -127,6 +127,8 @@ mod adaptive;
 // `backoff` and `decision` are the `no_std` algorithm core: pure types and
 // math, no clock or async. Everything else requires `std`.
 mod backoff;
+#[cfg(feature = "std")]
+mod bulkhead;
 #[cfg(feature = "circuit-breaker")]
 mod circuit;
 mod decision;
@@ -169,9 +171,9 @@ mod rt;
 mod sliding;
 #[cfg(feature = "std")]
 mod store;
-// Loom-aware atomics indirection for the adaptive limiter's lock-free slot
-// accounting.
-#[cfg(feature = "adaptive")]
+// Loom-aware atomics indirection for the adaptive limiter's and the bulkhead's
+// lock-free slot accounting.
+#[cfg(feature = "std")]
 mod sync;
 #[cfg(feature = "std")]
 mod throttle;
@@ -187,6 +189,8 @@ pub use crate::adaptive::{
     OwnedAdaptivePermit, Vegas,
 };
 pub use crate::backoff::{Backoff, BackoffIter, Jitter};
+#[cfg(feature = "std")]
+pub use crate::bulkhead::{Bulkhead, BulkheadPermit, OwnedBulkheadPermit};
 #[cfg(feature = "circuit-breaker")]
 #[cfg_attr(docsrs, doc(cfg(feature = "circuit-breaker")))]
 pub use crate::circuit::{

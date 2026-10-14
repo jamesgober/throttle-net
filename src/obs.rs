@@ -247,7 +247,6 @@ pub(crate) fn waited(kind: &'static str, label: &Label, timer: &Timer, cost: u32
 
 /// Records a request shed without waiting by a breaker or bulkhead
 /// (`throttle_shed_total`).
-#[cfg(feature = "circuit-breaker")]
 #[inline]
 pub(crate) fn shed(kind: &'static str, label: &Label) {
     #[cfg(feature = "metrics")]
