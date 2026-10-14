@@ -263,19 +263,35 @@ fn waiting_acquires_never_over_admit_on_a_multi_threaded_runtime() {
             .map(|_| {
                 let t = Arc::clone(&throttle);
                 tokio::spawn(async move {
+                    let mut granted_at = Vec::with_capacity(5);
                     for _ in 0..5 {
                         t.acquire().await.unwrap();
+                        granted_at.push(start.elapsed());
                     }
+                    granted_at
                 })
             })
             .collect();
+        let mut grants = Vec::with_capacity(320);
         for task in tasks {
-            task.await.unwrap();
+            grants.extend(task.await.unwrap());
+        }
+        grants.sort_unstable();
+        assert_eq!(grants.len(), 320);
+        // Every prefix of the grants, in the order they completed, fits the
+        // bucket bound for the time it took: the n-th grant by time t needs
+        // n <= capacity + rate * t (plus a little slack for the moment
+        // between a waiter's wake-up and its timestamp).
+        for (index, at) in grants.iter().enumerate() {
+            let granted = index as u64 + 1;
+            assert!(
+                granted <= bound(200, 200, *at, 5),
+                "grant {granted} at {at:?} exceeds the bound"
+            );
         }
         // 320 grants at 200/s with a burst of 200 take at least 0.6s.
         let elapsed = start.elapsed();
         assert!(elapsed >= Duration::from_millis(590), "{elapsed:?}");
-        assert!(320 <= bound(200, 200, elapsed, 0));
     });
 }
 
@@ -320,5 +336,62 @@ fn cancelled_probes_never_wedge_a_breaker_under_load() {
         };
         permit.success();
         assert_eq!(breaker.state(), BreakerState::Closed);
+    });
+}
+
+#[cfg(feature = "tokio")]
+#[test]
+fn waiting_composites_never_over_admit_any_scope_on_a_multi_threaded_runtime() {
+    // Waiters queue on their bottleneck scope and take the others when it
+    // matures: every scope must still hold its bound for every grant, and the
+    // per-key scopes must not be bypassed by the bottleneck switching.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_time()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let layered = Arc::new(
+            Layered::<u64>::builder()
+                .global(Throttle::per_second(100))
+                .per_key(PerKey::per_second(40))
+                .build(),
+        );
+        let start = Instant::now();
+        let tasks: Vec<_> = (0..32u64)
+            .map(|task| {
+                let l = Arc::clone(&layered);
+                tokio::spawn(async move {
+                    let key = task % 4;
+                    let mut granted_at = Vec::with_capacity(6);
+                    for _ in 0..6 {
+                        l.acquire(&key, &0).await.unwrap();
+                        granted_at.push((key, start.elapsed()));
+                    }
+                    granted_at
+                })
+            })
+            .collect();
+        let mut grants = Vec::with_capacity(192);
+        for task in tasks {
+            grants.extend(task.await.unwrap());
+        }
+        grants.sort_unstable_by_key(|&(_, at)| at);
+        assert_eq!(grants.len(), 192);
+        let mut per_key = [0u64; 4];
+        for (index, &(key, at)) in grants.iter().enumerate() {
+            let global = index as u64 + 1;
+            assert!(
+                global <= bound(100, 100, at, 5),
+                "global {global} at {at:?}"
+            );
+            let slot = usize::try_from(key).unwrap();
+            per_key[slot] += 1;
+            assert!(
+                per_key[slot] <= bound(40, 40, at, 3),
+                "key {key}: {} at {at:?}",
+                per_key[slot]
+            );
+        }
     });
 }
