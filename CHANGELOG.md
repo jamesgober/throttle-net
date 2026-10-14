@@ -19,12 +19,57 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
-## [1.1.0] - 2026-10-13
+## [2.0.0] - 2026-10-14
 
-A correctness and hardening release with additive features. **Upgrade from
-1.0.0 is strongly recommended**: under ordinary multi-threaded use, 1.0.0's
-token buckets admitted 25–180x their configured rate. Every 1.0 call site
-compiles; `cargo semver-checks` reports a minor release.
+A correctness and hardening release. **Upgrade from 1.0.0 is strongly
+recommended**: under ordinary multi-threaded use, 1.0.0's token buckets
+admitted 25–180x their configured rate. It is a major release because several
+documented defaults change to fail safe and a few signatures change; every
+change, with before/after code, is in
+[`docs/MIGRATION_1_TO_2.md`](docs/MIGRATION_1_TO_2.md). The MSRV stays at Rust
+1.85. (A 1.1.0 candidate was prepared and audited but never published; its
+work ships here.)
+
+### Breaking changes
+
+- **`Retry` caps an honoured `Retry-After` at 5 minutes** (`max_retry_after`).
+  A longer server delay ends the loop with the error instead of sleeping.
+  Restore 1.0 with `max_retry_after(Duration::MAX)`.
+- **A full `PerKey` store never forgets a limited key's debt.** 1.0 evicted the
+  least-recently-seen key, handing it a fresh allowance. A limited key is now
+  evicted only into a per-shard debt ledger (it returns in its debt); when keys
+  and ledger are both full of limited keys, a new key is refused until one
+  recovers (`WhenFull::RefuseNew`, the default). `WhenFull::ForgetDebt`
+  forgets the debt that settles soonest instead.
+- **`RateLimitInfo::sync_requests` / `sync_tokens` pause** the limiter for a
+  `Retry-After`, and until the reset when a window is exhausted; 1.0 only
+  drained. Every server-driven pause is clamped to
+  `provider::DEFAULT_MAX_PAUSE` (5 minutes); `sync_*_capped(.., Duration::ZERO)`
+  restores drain-only.
+- **`MultiLimiter` is strict by default:** a cost naming an unknown dimension is
+  refused (`Decision::Impossible`, `ThrottleError::UnknownDimension`) instead of
+  silently charging nothing. `.strict(false)` restores 1.0.
+- **The `tower` layers wait in `poll_ready`** and hold their admission until
+  `call`; `call` without a ready `poll_ready` fails with the new
+  `ThrottleError::NotReady`. The inner service no longer needs to be `Clone`.
+- **Waiting acquires reserve.** A waiter takes its units at once and sleeps
+  exactly until they accrue; composites queue on their bottleneck constituent.
+  `try_acquire` and `available()` therefore see queued waiters' debt, and a
+  paused limiter reports `available() == 0`.
+- **`CircuitBreakerBuilder`, `AdaptiveLimiterBuilder`, `QueueBuilder`, and
+  `Retry` are `Clone` but no longer `Copy`**, because `name` now takes an owned
+  or borrowed name (`impl Into<Cow<'static, str>>`).
+- **`Limiter` gained provided methods** (`refund`, `reserve`, `pause_for`,
+  `paused_for`, `resume`, `charge`) and blanket impls for `&L`, `Box<L>`, and
+  `Arc<L>`. A downstream blanket `impl<T: …> Limiter for T` that overlaps them
+  no longer compiles.
+- **`ThrottleError` has new variants** (`BulkheadFull`, `InvalidConfig`,
+  `UnknownDimension`, `NotReady`); it is `#[non_exhaustive]`, so a wildcard arm
+  covers them.
+- Correlated failures lower an AIMD limit once per congestion event, not once
+  each; repeated `MultiLimiter` names in one call are summed; the `PerKey`
+  shard count is raised so no shard holds more than 16,384 keys of the cap;
+  OpenAI presets meter one combined `tokens` budget.
 
 ### Security
 
@@ -34,160 +79,140 @@ compiles; `cargo semver-checks` reports a minor release.
   seconds on four threads. The floor is now better-bucket 1.1, whose
   single-instant engine can only deny more on a stale reading. Every
   bucket-backed type inherits the fix; real-clock multi-threaded stress tests
-  now guard it.
+  guard it.
 - **Unique-key flood was a CPU denial of service (TN-003).** A new key at the
   per-key cap scanned its whole shard under the write lock (~1.8 ms per key at
   the default cap), and an idle TTL made every insert O(n). Eviction is now a
-  bounded CLOCK scan plus an incremental TTL sweep: ~0.4 µs per new key at the
+  bounded CLOCK scan plus an incremental TTL sweep: ~0.36 µs per new key at the
   default 1M-key cap.
-- **Idle and capacity eviction reset limited keys (TN-011).** Forgetting a key
-  that had not recovered handed it a fresh allowance. Now only recovered keys
-  (full bucket, or idle past a TTL that is never shorter than the refill time)
-  are evicted; when a shard is full of limited keys a new key waits or is
-  refused instead (fails closed).
-- **Unbounded queue fairness map (TN-004).** Per-key fairness state is pruned
-  to stay proportional to the queue capacity.
-- **`Retry-After` stall (TN-013).** A hostile or broken `Retry-After` (31 years)
-  parked a retry loop forever. `Retry` now caps honored waits (`max_retry_after`,
-  default 5 minutes) and can bound the total time (`max_elapsed`).
+- **Eviction reset limited keys (TN-011, TN2-007).** Forgetting a key that had
+  not recovered handed it a fresh allowance — through the capacity path in 1.0,
+  and through idle-TTL reclamation of keys in reservation debt in the 1.1
+  candidate. Only recovered keys are forgotten outright now; a limited key's
+  debt survives eviction in the ledger.
+- **Key-flood lockout quantified and halved (TN2-011).** Locking newcomers out
+  now needs a flood that fills both the key slots and the ledger (2× the cap)
+  with unrecovered keys; the trade-off and its numbers are in the `Eviction`
+  docs, and `WhenFull::ForgetDebt` opts out of lockout entirely.
+- **Server-driven pauses are capped (TN2-008).** One `Retry-After: 999999999`
+  or `x-ratelimit-reset: i64::MAX` could pause a client for 31–584 years.
+- **Unbounded queue fairness map (TN-004)** and **`Retry-After` stall in
+  `Retry` (TN-013)** are bounded.
 - `event-listener` floor raised to 5.4.2 (RUSTSEC-2026-0221; throttle-net never
   used the affected API). `cargo audit` and `cargo deny` are clean.
 
 ### Fixed
 
-- **Circuit breaker stuck half-open after a cancelled probe (TN-002).** A trial
-  admitted while half-open leaked its slot if its future was dropped while
-  waiting on the limiter (a `timeout` around `acquire`), and the breaker shed
-  everything forever. Admission is now cancel-safe.
-- **Late outcomes counted against the wrong breaker state (TN-008).** Permits
-  carry the state generation they were admitted under; a slow call admitted
-  while closed no longer settles a half-open probe or frees its slot.
-- **Lost adaptive-limit updates (TN-006).** Concurrent outcomes overwrote each
-  other; the limit now moves by compare-and-swap.
-- **Adaptive collapse on correlated failures, Vegas pinned at the floor
-  (TN-007).** A failure lowers the limit only if its request started after the
-  latest decrease (one decrease per congestion event); Vegas re-probes its
-  no-load latency every 1000 samples.
-- **Sub-millisecond and zero sliding windows were unlimited (TN-009).** The log
-  tracks nanoseconds; a zero window is a per-instant limit as documented.
-- **Sliding-window overflow near `u32::MAX` (TN-019)** — accounting is `u64`.
+- **Lost wake-ups hung `Bulkhead` and `AdaptiveLimiter` waiters (TN2-001).**
+  event-listener's `notify(n)` is not additive, so two slots freed before the
+  first woken waiter ran woke only one. Every freed slot (and every slot a
+  raised adaptive limit adds) now wakes one more waiter.
+- **One tenant could starve a shared scope (TN2-002).** A composite waiter
+  reserved on every constituent at once, so a tenant queued on its slow per-key
+  scope drained the shared `Layered` global (or a `HybridBuilder::shared`
+  constituent) far ahead of use; other tenants waited ~19 s. Waiters now queue
+  on the bottleneck and charge the rest when it matures.
+- **A `CircuitBreaker` used as a `Limiter` wedged half-open (TN2-003)** when a
+  composite rolled back or a waiting composite was cancelled: `refund` now
+  frees the trial slot the trait admission took. Manual `record_*` outcomes
+  free only such slots (TN2-015).
+- **`sync_requests(&arc_throttle)` stopped compiling (TN2-004)**; `Limiter` is
+  implemented for `&L`, `Box<L>`, and `Arc<L>`.
+- **A timed acquire could wait forever (TN2-006)** while a constituent kept
+  answering "retry now"; the timeout is now a real deadline.
+- **A pause did not hold waiters that had already reserved, and `resume` woke
+  nobody (TN2-009, TN2-010).**
+- **Queued breaker waiters reached a downstream the breaker had opened on
+  (TN2-013)**; they are shed if the breaker opened during their wait.
+- **A composite charged a sliding-log constituent at reservation time
+  (TN2-014)**, measuring its window from the wrong instant.
+- **`settle_costs` dropped an overrun while a dimension was paused
+  (TN2-016)**; overruns are charged as debt even while paused.
+- **CI on Rust 1.85 failed clippy (`comparison_chain`, TN2-005)**, and Rust
+  1.99 deprecates `fetch_update`; both are clean.
+- **Circuit breaker stuck half-open after a cancelled probe (TN-002)**, and
+  late outcomes counted against a later breaker state (TN-008).
+- **Lost adaptive-limit updates (TN-006)**; AIMD collapse on correlated
+  failures and Vegas pinned at the floor (TN-007).
+- **Sub-millisecond and zero sliding windows were unlimited (TN-009)**;
+  sliding-window overflow near `u32::MAX` (TN-019).
 - **Capacities above ~4.29M tokens were silently clamped (TN-010)**, and
-  `PerKey::capacity` disagreed with its buckets (TN-021); capacities are exact
-  and derived from the bucket configuration.
+  `PerKey::capacity` disagreed with its buckets (TN-021).
 - **Very slow rates never refilled, and `peek` disagreed with `acquire`
-  (TN-020)** — `peek` now uses the grant's own arithmetic.
+  (TN-020).**
 - **Backoff divide-by-zero panic (TN-012)** on an unbounded ceiling with full
   jitter.
-- **Unknown `MultiLimiter` names silently charged nothing (TN-016)** — see the
-  new strict mode; repeated names in one call are now summed.
-- **OpenAI presets admitted up to twice the real token budget (TN-033)** — they
-  now meter one combined `tokens` budget (`input_tokens` / `output_tokens`
-  remain as aliases).
-- **Composites leaked units on a lost race (TN-022)** — the constituents
-  already charged are refunded; contended `Layered` acquires no longer spin.
-- **Large-cost waiters could starve (TN-023)** — waits are reservations served
-  in order.
+- **Unknown `MultiLimiter` names silently charged nothing (TN-016).**
+- **OpenAI presets admitted up to twice the real token budget (TN-033).**
+- **Composites leaked units on a lost race (TN-022)** and contended `Layered`
+  acquires spun; **large-cost waiters could starve (TN-023).**
 - **Provider resets were parsed but unused (TN-017)**; fractional Go durations
   (`1.5s`, TN-018) and RFC 3339 offsets were rejected.
-- **Metrics went to the wrong facade (TN-015)** — `metrics` 0.24.
-- **Gauges collided across instances and most acquire paths emitted nothing
-  (TN-014)**; the queue-depth hook evaluated its argument when metrics were off
-  (TN-030).
-- **`--no-default-features --features std` tests did not compile (TN-025).**
-- **The `no_std` core did not build on targets without 64-bit atomics** (such
-  as `thumbv7em`); its seed counter is now pointer-sized.
-- **`PerKey` read the clock twice per access (TN-029).**
-- Out-of-range `Trip::Ratio`/`Consecutive`/`Windowed` and `Aimd` parameters are
-  normalised instead of misbehaving.
+- **Metrics went to the wrong facade (TN-015)**; gauges collided across
+  instances and most acquire paths emitted nothing (TN-014); the queue-depth
+  hook evaluated its argument when metrics were off (TN-030).
+- **`--no-default-features --features std` tests did not compile (TN-025)**;
+  **the `no_std` core did not build on targets without 64-bit atomics.**
+- **`PerKey` read the clock twice per access** (part of TN-029; the
+  uncontended gap to `governor` remains and is documented).
+- Out-of-range `Trip` and `Aimd` parameters are normalised.
 
 ### Added
 
-- **Fair, cancel-safe waiting with timeouts on every waiting surface.**
-  `acquire_timeout` / `acquire_with_cost_timeout` (and equivalents on
-  `SlidingWindowLog`, `Hybrid`, `MultiLimiter`, `PerKey`, `Layered`,
-  `CircuitBreaker`, `AdaptiveLimiter`, `Bulkhead`) fail at once when the wait is
-  known to be too long. Dropping a waiting future returns its reservation.
-- **`Throttle` builder** (`Throttle::builder()`: rate, independent `burst`,
-  `initial`, `name`, `clock`; `try_build` / `build`), `per_minute`, `smooth`
-  (GCRA-style pacing), `reserve`, `refund`, `drain_to`, `pause_for` / `resume` /
-  `paused_for`, `with_name` / `name`.
-- **`Limiter` provided methods** `refund`, `reserve`, `pause_for`, with
-  conservative defaults.
+- **Fair, cancel-safe waiting with real deadlines.** `*_timeout` methods on
+  `Throttle`, `SlidingWindowLog`, `Hybrid`, `MultiLimiter`, `PerKey`, `Layered`,
+  `CircuitBreaker`, `AdaptiveLimiter`, and `Bulkhead`, plus
+  `acquire_owned_timeout` on the breaker, adaptive limiter, and bulkhead and
+  `Bulkhead::call_timeout`.
+- **`Limiter`:** provided `refund`, `reserve`, `pause_for`, `paused_for`,
+  `resume`, `charge`; blanket impls for `&L`, `Box<L>`, `Arc<L>`.
+- **Pauses:** `resume` / `paused_for` on `Hybrid`, `MultiLimiter`, and
+  `Layered`; pause-aware waiting everywhere.
+- **`Throttle`:** a builder with independent `burst` and `initial` fill,
+  `per_minute`, `smooth`, `reserve`, `refund`, `drain_to`, `pause_for` /
+  `resume` / `paused_for`, names.
 - **Retry guardrails:** `Retry::max_retry_after`, `max_elapsed`, `name`, and a
-  shared `RetryBudget` with `Retry::run_with_budget`.
-- **`MultiLimiter`:** `alias`, `strict` / `with_strict` /
-  `ThrottleError::UnknownDimension`, `try_build`, `settle_costs` (admit on an
-  estimate, settle with actual usage), `refund_costs`, `drain_to`, `pause_for`,
-  `dimension`, `dimensions`, `acquire_costs_timeout`.
-- **`PerKey`:** `PerKeyBuilder` (burst, initial, eviction, shards, name, clock),
-  `per_minute`, `reserve`, `refund`, `reset`, `remove`, `clear`, `eviction`;
-  `MAX_SHARDS`.
-- **`SlidingWindowLog`:** `per_minute`, `refund`, `pause_for`, `resume`,
-  `paused_for`, `window`, names.
-- **`CircuitBreaker`:** `OwnedPermit` (`try_acquire_owned`, `acquire_owned`),
-  `call(operation)` with `CallError`, `acquire_timeout`, `reset`, `with_name`, a
-  `Limiter` impl.
-- **`AdaptiveLimiter`:** `OwnedAdaptivePermit`, `acquire_timeout`, `release`, a
-  `Limiter` impl, `floor`, names; `Vegas::with_probe_interval`.
-- **`Bulkhead`** (fixed concurrency limit with owned permits, `call`,
-  `try_call`), **`resilience`** module (`timeout`, `fallback`, `hedge`,
-  `Elapsed`), **`TokioClock`** (a clock that follows tokio's pausable time).
-- **Provider reconciliation:** `Window::apply` (drain and pause until the
-  reset), `RateLimitInfo::sync_multi` for `MultiLimiter` and presets;
-  `sync_requests` / `sync_tokens` accept any `Limiter` and honour reset and
-  `Retry-After`.
-- **Queue:** `acquire_with_cost`, `with_name`, `overflow`; builder `name`.
-- **`tower` feature:** `ThrottleLayer`, `CircuitBreakerLayer`, `AdaptiveLayer`.
-- **Observability:** an instance `name` label on every metric; new
-  `throttle_denied_total`, `throttle_timeouts_total`, `throttle_shed_total`,
-  `throttle_queue_rejected_total`, `throttle_retries_total`,
-  `throttle_retry_budget_exhausted_total`; breaker and adaptive gauges are set
-  at construction; composites emit for themselves.
-- `ThrottleError::{BulkheadFull, InvalidConfig, UnknownDimension}`; `Hash` on
-  `ThrottleError`, `RetryAction`, `BreakerState`, `Outcome`, and
-  `provider::Window`; `PartialEq` on `HeaderProfile`; `Debug` on
-  every public type (TN-026); `Backoff::with_seed` (TN-027) and `IntoIterator`
-  for `&Backoff`.
-- Tests: real-clock multi-threaded stress tests for every limiter kind,
-  property tests over arithmetic edges and a sliding-window reference model,
-  loom models of the adaptive limit and bulkhead slots, cancellation tests,
-  per-instance metrics tests; a `limiter_ops` fuzz target, a profile-aware
-  header fuzzer, and committed seed corpora (TN-032).
+  shared `RetryBudget` with `run_with_budget`.
+- **`MultiLimiter`:** `alias`, `strict` / `with_strict`, `try_build`,
+  `settle_costs`, `refund_costs`, `drain_to`, `pause_for`, `dimension`,
+  `dimensions`, `acquire_costs_timeout`.
+- **`PerKey` and `Eviction`:** a builder, `per_minute`, `reserve`, `refund`,
+  `reset`, `remove`, `clear`, `eviction`, `MAX_SHARDS`; `WhenFull` with
+  `Eviction::with_when_full` / `when_full`.
+- **Circuit breaker:** `OwnedPermit`, `call` with `CallError`,
+  `acquire_timeout`, `reset`, names, a `Limiter` impl, and `cancel()` on
+  permits to give an admission back without recording an outcome (TN2-020).
+- **Adaptive limiter:** `OwnedAdaptivePermit`, `acquire_timeout`, `release`,
+  `cancel()` on permits, a `Limiter` impl, `Vegas::with_probe_interval`.
+- **`Bulkhead`**, the **`resilience`** module (`timeout`, `fallback`, `hedge`,
+  `Elapsed`), and **`TokioClock`**.
+- **Providers:** `Window::apply` / `apply_capped`, `RateLimitInfo::sync_multi`,
+  `*_capped` variants, `provider::DEFAULT_MAX_PAUSE`.
+- **`tower` feature:** `ThrottleLayer`, `CircuitBreakerLayer`, `AdaptiveLayer`,
+  each with `with_timeout`.
+- **Observability:** instance names on every metric; denial, timeout, shed,
+  queue-rejection, retry, and retry-budget counters; gauges set at
+  construction.
+- `ThrottleError::{BulkheadFull, InvalidConfig, UnknownDimension, NotReady}`;
+  `Hash`/`PartialEq`/`Debug` where useful; `Backoff::with_seed`;
+  `IntoIterator` for `&Backoff`.
+- Tests: a regression test for every re-audit reproduction
+  (`tests/regressions.rs`), real-clock stress tests including waiting
+  composites, property tests, loom models, cancellation tests, fuzz targets
+  with committed seeds.
 - Examples `provider_sync` and `resilience_stack`; benches for reservations,
   composites, and adversarial per-key floods.
 
 ### Changed
 
-- **Waiting acquires reserve.** A waiter takes its units at once and sleeps
-  exactly until they accrue, so waiters are served in arrival order. Under a
-  `ManualClock` a waiting acquire now returns after its (real) sleep rather
-  than looping until the clock is advanced.
-- **Behaviour you may notice:** a `Retry-After` above 5 minutes ends a `Retry`
-  loop with the error (restore 1.0 with `max_retry_after(Duration::MAX)`);
-  correlated failures halve an AIMD limit once, not once each; a full `PerKey`
-  shard of still-limited keys refuses a new key instead of evicting one; the
-  shard count is raised so no shard holds more than 16,384 keys of the cap;
-  repeated `MultiLimiter` names in one call are summed; `available()` reads 0
-  while a limiter is paused; `RateLimitInfo::sync_*` also pause on an exhausted
-  window or a `Retry-After`.
 - Dependency floors: better-bucket 1.1, clock-lib 1.1, error-forge 1.0.2,
   event-listener 5.4.2, metrics 0.24.6, tracing 0.1.40; new optional
-  `hashbrown` (per-key index) and `tower-layer` / `tower-service`.
-  Benchmark baseline `governor` 0.6 → 0.10.
-- Documentation rewritten to match the code (D-01–D-18); every Rust block in
-  the README and `docs/` runs as a doctest.
-- CI: `actions/checkout` v7, an explicit feature matrix, a `thumbv7em`
-  `no_std` build, release-mode stress tests, a third fuzz target,
-  direct-minimal-versions, `cargo-semver-checks`, coverage, and audit/deny on a
-  fresh lockfile.
-- `rustfmt.toml` drops nightly-only options; `deny.toml` allows only the
-  licenses in use.
-
-### Notes
-
-- **No breaking API changes.** `cargo semver-checks` against 1.0.0 passes as a
-  minor release (its one finding is `#[must_use]` added to builder structs).
-- **MSRV unchanged at Rust 1.85.**
+  `hashbrown` and `tower-layer` / `tower-service`.
+- `REPS.md`, `.github/`, and `.dev/` are excluded from the published package.
+- The locks that guard the breaker, queue, and sliding log stay
+  `std::sync::Mutex`: each is held for a bounded synchronous section, never
+  across an `.await`, and is shared with the synchronous API (documented in
+  `src/sync.rs`).
 
 ---
 
@@ -379,8 +404,8 @@ Initial scaffold and repository bootstrap. No throttle-net logic yet &mdash; thi
 - `deny.toml`, `clippy.toml`, `rustfmt.toml`, `.gitattributes`, `.gitignore`.
 - `.dev/` AI-editor briefing (`PROMPT.md`, `ROADMAP.md`) &mdash; gitignored.
 
-[Unreleased]: https://github.com/jamesgober/throttle-net/compare/v1.1.0...HEAD
-[1.1.0]: https://github.com/jamesgober/throttle-net/compare/v1.0.0...v1.1.0
+[Unreleased]: https://github.com/jamesgober/throttle-net/compare/v2.0.0...HEAD
+[2.0.0]: https://github.com/jamesgober/throttle-net/compare/v1.0.0...v2.0.0
 [1.0.0]: https://github.com/jamesgober/throttle-net/compare/v0.9.0...v1.0.0
 [0.9.0]: https://github.com/jamesgober/throttle-net/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/jamesgober/throttle-net/compare/v0.7.0...v0.8.0

@@ -9,7 +9,7 @@
 #╚═══════════════════════════════╝
 [package]
 name    = "throttle-net"
-version = "1.1.0"
+version = "2.0.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -48,6 +48,14 @@ documentation = "https://docs.rs/throttle-net"
 # Authors
 authors = [
     "James Gober <me@jamesgober.com>"
+]
+
+# Packaging: the engineering standard and CI configuration are repository
+# material, not part of the published crate.
+exclude = [
+    "REPS.md",
+    ".github/",
+    ".dev/",
 ]
 
 [package.metadata.docs.rs]
