@@ -87,7 +87,12 @@ async fn main() {
                 },
             ),
             |failure| async move {
-                println!("  request degraded after: {failure:?}");
+                let reason = match failure {
+                    Failure::Shed(shed) => format!("shed ({shed})"),
+                    Failure::TimedOut => "timed out".to_owned(),
+                    Failure::Downstream(err) => format!("downstream error ({err})"),
+                };
+                println!("  request degraded: {reason}");
                 0 // the cached answer
             },
         )
