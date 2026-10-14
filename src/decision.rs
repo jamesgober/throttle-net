@@ -10,8 +10,8 @@ use core::time::Duration;
 /// about an outcome before deciding whether to wait. The waiting layer maps it
 /// to either a return, a sleep, or a [`ThrottleError`](crate::ThrottleError).
 ///
-/// `#[non_exhaustive]`: later phases add outcomes (for example, a deadline or a
-/// circuit-open signal), so a `match` on it must include a wildcard arm.
+/// `#[non_exhaustive]`: a minor release may add an outcome, so a `match` on it
+/// must include a wildcard arm.
 ///
 /// # Examples
 ///
