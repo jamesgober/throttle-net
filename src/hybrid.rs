@@ -1,11 +1,17 @@
 //! A hybrid limiter: a request must clear every constituent.
 
+use core::time::Duration;
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use crate::decision::Decision;
 #[cfg(feature = "runtime")]
 use crate::error::ThrottleError;
-use crate::limiter::{Limiter, acquire_all, peek_all};
+use crate::limiter::{Limiter, acquire_all, peek_all, refund_all, reserve_all};
+use crate::obs::{self, Label};
+
+/// The limiter kind reported in metrics and events.
+const KIND: &str = "hybrid";
 
 /// Several limiters combined so a request must satisfy **all** of them.
 ///
@@ -15,9 +21,12 @@ use crate::limiter::{Limiter, acquire_all, peek_all};
 /// limiter does.
 ///
 /// Acquisition is two-phase to stay correct: every constituent is first
-/// [`peek`](Limiter::peek)ed, and tokens are only taken once all of them would
-/// grant. Without that, an early constituent could spend a token for a request a
-/// later one refuses. See [`Limiter`] for the full rationale.
+/// [`peek`](Limiter::peek)ed, and units are only taken once all of them would
+/// grant. If a concurrent caller wins a race between the peek and the commit,
+/// the constituents already charged are [refunded](Limiter::refund), so a
+/// refused request costs nothing in limiters that support refunds (every
+/// built-in one does). The waiting [`acquire`](Self::acquire) reserves on every
+/// constituent at once, so waiters queue fairly on token-bucket constituents.
 ///
 /// Build one with [`Hybrid::builder`].
 ///
@@ -38,15 +47,22 @@ use crate::limiter::{Limiter, acquire_all, peek_all};
 #[derive(Clone)]
 pub struct Hybrid {
     constituents: Arc<[Arc<dyn Limiter>]>,
+    label: Label,
 }
 
 impl Hybrid {
     /// Starts building a hybrid limiter.
-    #[must_use]
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use throttle_net::{Hybrid, Throttle};
+    ///
+    /// let hybrid = Hybrid::builder().limiter(Throttle::per_second(5)).build();
+    /// assert_eq!(hybrid.len(), 1);
+    /// ```
     pub fn builder() -> HybridBuilder {
-        HybridBuilder {
-            constituents: Vec::new(),
-        }
+        HybridBuilder::default()
     }
 
     #[inline]
@@ -54,11 +70,27 @@ impl Hybrid {
         self.constituents.iter().map(move |l| (l.as_ref(), cost))
     }
 
-    /// Attempts to take one token from every constituent without waiting,
+    /// The number of constituents.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.constituents.len()
+    }
+
+    /// Returns `true` if the hybrid has no constituents (it then admits
+    /// everything).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.constituents.is_empty()
+    }
+
+    /// The instance name, if one was set with [`HybridBuilder::name`].
+    #[must_use]
+    pub fn name(&self) -> Option<&str> {
+        self.label.get()
+    }
+
+    /// Attempts to take one unit from every constituent without waiting,
     /// returning whether all granted.
-    ///
-    /// All-or-nothing across constituents: either every one is debited or, on a
-    /// refusal, the call reports failure.
     ///
     /// # Examples
     ///
@@ -75,18 +107,48 @@ impl Hybrid {
         self.try_acquire_with_cost(1)
     }
 
-    /// Attempts to take `cost` tokens from every constituent without waiting.
+    /// Attempts to take `cost` units from every constituent without waiting.
+    /// All-or-nothing across constituents.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use throttle_net::{Hybrid, Throttle};
+    ///
+    /// let hybrid = Hybrid::builder()
+    ///     .limiter(Throttle::per_second(10))
+    ///     .limiter(Throttle::per_second(4))
+    ///     .build();
+    /// assert!(hybrid.try_acquire_with_cost(4));
+    /// assert!(!hybrid.try_acquire_with_cost(1)); // the 4/s constituent is empty
+    /// ```
     #[inline]
     #[must_use]
     pub fn try_acquire_with_cost(&self, cost: u32) -> bool {
-        acquire_all(self.pairs(cost)).is_acquired()
+        let granted = acquire_all(self.pairs(cost)).is_acquired();
+        obs::attempt(KIND, &self.label, cost, granted);
+        granted
+    }
+
+    /// Reports whether `cost` units would be granted by every constituent now,
+    /// without taking anything.
+    #[must_use]
+    pub fn peek(&self, cost: u32) -> Decision {
+        peek_all(self.pairs(cost))
+    }
+
+    /// Pauses every constituent for `duration` (see [`Limiter::pause_for`]).
+    pub fn pause_for(&self, duration: Duration) {
+        for limiter in self.constituents.iter() {
+            limiter.pause_for(duration);
+        }
     }
 }
 
 #[cfg(feature = "runtime")]
 #[cfg_attr(docsrs, doc(cfg(feature = "runtime")))]
 impl Hybrid {
-    /// Takes one token from every constituent, waiting until all are free.
+    /// Takes one unit from every constituent, waiting until all are free.
     ///
     /// # Errors
     ///
@@ -108,25 +170,67 @@ impl Hybrid {
         self.acquire_with_cost(1).await
     }
 
-    /// Takes `cost` tokens from every constituent, waiting until all are free.
+    /// Takes `cost` units from every constituent, waiting until all are free.
+    ///
+    /// Each attempt reserves on every constituent at once; if any cannot
+    /// reserve, the others are refunded and the waiter sleeps for the longest
+    /// constituent wait. **Cancel-safe:** dropping the future returns any
+    /// reservation it held.
     ///
     /// # Errors
     ///
     /// Returns [`ThrottleError::CostExceedsCapacity`] if some constituent can
     /// never grant `cost`.
     pub async fn acquire_with_cost(&self, cost: u32) -> Result<(), ThrottleError> {
-        loop {
-            match acquire_all(self.pairs(cost)) {
-                Decision::Acquired => return Ok(()),
-                Decision::Impossible => {
-                    return Err(ThrottleError::CostExceedsCapacity {
-                        cost,
-                        capacity: self.capacity(),
-                    });
-                }
-                Decision::Retry { after } => crate::rt::sleep(after).await,
-            }
-        }
+        self.wait(cost, None).await
+    }
+
+    /// Takes `cost` units from every constituent, waiting at most `timeout`.
+    ///
+    /// # Errors
+    ///
+    /// [`ThrottleError::DeadlineExceeded`] if every constituent cannot grant
+    /// within `timeout`; [`ThrottleError::CostExceedsCapacity`] if some
+    /// constituent can never grant `cost`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # async fn run() -> Result<(), throttle_net::ThrottleError> {
+    /// use std::time::Duration;
+    /// use throttle_net::{Hybrid, Throttle};
+    ///
+    /// let hybrid = Hybrid::builder().limiter(Throttle::per_second(100)).build();
+    /// hybrid.acquire_with_cost_timeout(5, Duration::from_millis(200)).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn acquire_with_cost_timeout(
+        &self,
+        cost: u32,
+        timeout: Duration,
+    ) -> Result<(), ThrottleError> {
+        self.wait(cost, Some(timeout)).await
+    }
+
+    async fn wait(&self, cost: u32, timeout: Option<Duration>) -> Result<(), ThrottleError> {
+        use crate::wait::{Refusal, wait_for};
+        let timer = obs::Timer::start();
+        let result = wait_for(
+            |budget| crate::limiter::step_all(self.pairs(cost), budget),
+            || refund_all(self.pairs(cost)),
+            timeout,
+        )
+        .await
+        .map_err(|refusal| match refusal {
+            Refusal::Never => ThrottleError::CostExceedsCapacity {
+                cost,
+                capacity: Limiter::capacity(self),
+            },
+            Refusal::TimedOut => ThrottleError::DeadlineExceeded,
+        });
+        obs::waited(KIND, &self.label, &timer, cost, obs::Waited::of(&result));
+        result
     }
 }
 
@@ -141,7 +245,7 @@ impl Limiter for Hybrid {
         acquire_all(self.pairs(cost))
     }
 
-    /// The headroom of the *binding* constituent: the fewest tokens any one of
+    /// The headroom of the *binding* constituent: the fewest units any one of
     /// them has available. An empty hybrid is unbounded ([`u32::MAX`]).
     #[inline]
     fn available(&self) -> u32 {
@@ -163,6 +267,29 @@ impl Limiter for Hybrid {
             .min()
             .unwrap_or(u32::MAX)
     }
+
+    fn refund(&self, cost: u32) {
+        refund_all(self.pairs(cost));
+    }
+
+    fn reserve(&self, cost: u32, max_wait: Duration) -> Option<Duration> {
+        reserve_all(self.pairs(cost), max_wait)
+    }
+
+    fn pause_for(&self, duration: Duration) {
+        Hybrid::pause_for(self, duration);
+    }
+}
+
+impl core::fmt::Debug for Hybrid {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Hybrid")
+            .field("name", &self.label)
+            .field("constituents", &self.constituents.len())
+            .field("capacity", &Limiter::capacity(self))
+            .field("available", &Limiter::available(self))
+            .finish()
+    }
 }
 
 /// Builder for a [`Hybrid`] limiter.
@@ -177,17 +304,19 @@ impl Limiter for Hybrid {
 ///
 /// let hybrid = Hybrid::builder()
 ///     .limiter(Throttle::per_second(5))
+///     .name("billing")
 ///     .build();
-/// # let _ = hybrid;
+/// assert_eq!(hybrid.name(), Some("billing"));
 /// ```
 #[derive(Default)]
+#[must_use]
 pub struct HybridBuilder {
     constituents: Vec<Arc<dyn Limiter>>,
+    label: Label,
 }
 
 impl HybridBuilder {
     /// Adds a constituent the hybrid must satisfy.
-    #[must_use]
     pub fn limiter(mut self, limiter: impl Limiter + 'static) -> Self {
         self.constituents.push(Arc::new(limiter));
         self
@@ -195,9 +324,14 @@ impl HybridBuilder {
 
     /// Adds an already-shared constituent (for reusing one limiter across
     /// several composites).
-    #[must_use]
     pub fn shared(mut self, limiter: Arc<dyn Limiter>) -> Self {
         self.constituents.push(limiter);
+        self
+    }
+
+    /// Names the hybrid for metrics and events.
+    pub fn name(mut self, name: impl Into<Cow<'static, str>>) -> Self {
+        self.label = Label::new(name);
         self
     }
 
@@ -206,7 +340,17 @@ impl HybridBuilder {
     pub fn build(self) -> Hybrid {
         Hybrid {
             constituents: self.constituents.into(),
+            label: self.label,
         }
+    }
+}
+
+impl core::fmt::Debug for HybridBuilder {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("HybridBuilder")
+            .field("name", &self.label)
+            .field("constituents", &self.constituents.len())
+            .finish()
     }
 }
 
@@ -215,7 +359,9 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::Hybrid;
+    use crate::decision::Decision;
     use crate::limiter::Limiter;
+    use crate::sliding::SlidingWindowLog;
     use crate::throttle::Throttle;
     use clock_lib::ManualClock;
     use core::time::Duration;
@@ -230,17 +376,13 @@ mod tests {
 
     #[test]
     fn test_request_must_clear_every_constituent() {
-        // 5 per second AND 3 per minute: the tighter (3) binds.
         let hybrid = Hybrid::builder()
             .limiter(Throttle::per_second(5))
             .limiter(Throttle::per_duration(3, Duration::from_secs(60)))
             .build();
-
         assert!(hybrid.try_acquire());
         assert!(hybrid.try_acquire());
         assert!(hybrid.try_acquire());
-        // The per-minute limiter is now empty even though the per-second one is
-        // not, so the hybrid refuses.
         assert!(!hybrid.try_acquire());
     }
 
@@ -248,28 +390,20 @@ mod tests {
     fn test_peek_does_not_consume() {
         let hybrid = Hybrid::builder().limiter(Throttle::per_second(2)).build();
         assert!(hybrid.peek(2).is_acquired());
-        // peek took nothing, so both tokens are still there.
         assert!(hybrid.try_acquire_with_cost(2));
     }
 
     #[test]
     fn test_no_token_lost_when_a_later_constituent_refuses() {
-        // First limiter has plenty; second is exhausted. The peek-then-commit
-        // contract means the first limiter must NOT lose a token to a request
-        // the second one blocks.
         let plenty: Arc<dyn Limiter> = Arc::new(Throttle::per_second(100));
         let exhausted = Throttle::per_second(1);
-        assert!(exhausted.try_acquire()); // drain it to zero
-
+        assert!(exhausted.try_acquire());
         let hybrid = Hybrid::builder()
             .shared(plenty.clone())
             .limiter(exhausted)
             .build();
-
         let before = plenty.available();
         assert!(!hybrid.try_acquire());
-        // The plentiful limiter is untouched: the hybrid peeked, saw the second
-        // constituent could not grant, and never committed to the first.
         assert_eq!(plenty.available(), before);
     }
 
@@ -281,6 +415,17 @@ mod tests {
             .build();
         assert_eq!(hybrid.capacity(), 4);
         assert_eq!(hybrid.available(), 4);
+        assert_eq!(hybrid.len(), 2);
+        assert!(!hybrid.is_empty());
+    }
+
+    #[test]
+    fn test_empty_hybrid_admits_everything() {
+        let hybrid = Hybrid::builder().build();
+        assert!(hybrid.is_empty());
+        assert!(hybrid.try_acquire_with_cost(u32::MAX));
+        assert_eq!(hybrid.capacity(), u32::MAX);
+        assert_eq!(hybrid.available(), u32::MAX);
     }
 
     #[test]
@@ -288,15 +433,43 @@ mod tests {
         let clock = Arc::new(ManualClock::new());
         let hybrid = Hybrid::builder()
             .limiter(Throttle::per_second(2).with_clock(clock.clone()))
-            .limiter(Throttle::per_second(2).with_clock(clock.clone()))
+            .limiter(SlidingWindowLog::per_second(2).with_clock(clock.clone()))
             .build();
-
         assert!(hybrid.try_acquire());
         assert!(hybrid.try_acquire());
         assert!(!hybrid.try_acquire());
-
         clock.advance(Duration::from_secs(1));
         assert!(hybrid.try_acquire());
+    }
+
+    #[test]
+    fn test_trait_reserve_refund_and_pause_reach_every_constituent() {
+        let clock = Arc::new(ManualClock::new());
+        let a = Arc::new(Throttle::per_second(10).with_clock(clock.clone()));
+        let b = Arc::new(Throttle::per_second(10).with_clock(clock.clone()));
+        let hybrid = Hybrid::builder()
+            .shared(a.clone())
+            .shared(b.clone())
+            .name("pair")
+            .build();
+        assert_eq!(
+            Limiter::reserve(&hybrid, 4, Duration::MAX),
+            Some(Duration::ZERO)
+        );
+        assert_eq!((a.available(), b.available()), (6, 6));
+        Limiter::refund(&hybrid, 4);
+        assert_eq!((a.available(), b.available()), (10, 10));
+        hybrid.pause_for(Duration::from_secs(3));
+        assert_eq!(
+            hybrid.peek(1),
+            Decision::Retry {
+                after: Duration::from_secs(3)
+            }
+        );
+        Limiter::pause_for(&hybrid, Duration::from_secs(1));
+        assert_eq!(a.paused_for(), Duration::from_secs(3));
+        assert!(format!("{hybrid:?}").contains("\"pair\""));
+        assert!(format!("{:?}", Hybrid::builder()).contains("HybridBuilder"));
     }
 
     #[cfg(feature = "runtime")]
@@ -309,12 +482,49 @@ mod tests {
             .limiter(Throttle::per_second(2))
             .build();
         let err = hybrid.acquire_with_cost(5).await.unwrap_err();
-        assert!(matches!(
+        assert_eq!(
             err,
             ThrottleError::CostExceedsCapacity {
                 cost: 5,
                 capacity: 2
             }
-        ));
+        );
+    }
+
+    #[cfg(feature = "tokio")]
+    #[tokio::test(start_paused = true)]
+    async fn test_acquire_waits_on_a_mixed_hybrid_and_times_out() {
+        use crate::error::ThrottleError;
+
+        // A token bucket (native reservations) beside a sliding log (none).
+        let hybrid = Hybrid::builder()
+            .limiter(Throttle::per_second(100))
+            .limiter(SlidingWindowLog::new(1, Duration::from_millis(50)))
+            .build();
+        assert!(hybrid.try_acquire());
+        assert!(hybrid.acquire().await.is_ok(), "waits for the log to slide");
+        let err = hybrid
+            .acquire_with_cost_timeout(1, Duration::from_millis(1))
+            .await
+            .unwrap_err();
+        assert_eq!(err, ThrottleError::DeadlineExceeded);
+    }
+
+    #[cfg(feature = "tokio")]
+    #[tokio::test(start_paused = true)]
+    async fn test_cancelled_acquire_refunds_every_constituent() {
+        let a = Arc::new(Throttle::per_second(10));
+        let b = Arc::new(Throttle::per_second(10));
+        let hybrid = Hybrid::builder()
+            .shared(a.clone())
+            .shared(b.clone())
+            .build();
+        assert!(hybrid.try_acquire_with_cost(10));
+        let cancelled =
+            tokio::time::timeout(Duration::from_millis(5), hybrid.acquire_with_cost(10)).await;
+        assert!(cancelled.is_err());
+        // Both reservations were refunded: a fresh one waits ~1s, not ~2s.
+        assert!(a.reserve(10, Duration::MAX).unwrap() <= Duration::from_secs(1));
+        assert!(b.reserve(10, Duration::MAX).unwrap() <= Duration::from_secs(1));
     }
 }

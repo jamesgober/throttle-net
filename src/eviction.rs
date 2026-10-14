@@ -16,15 +16,24 @@ pub const DEFAULT_MAX_KEYS: usize = 1 << 20;
 /// itself if that state can grow without limit: a flood of unique keys would
 /// exhaust memory. `Eviction` is the defense, and two independent bounds compose:
 ///
-/// - **Capacity** — a hard ceiling on live keys. Inserting a new key past the
-///   ceiling evicts the least-recently-seen one. This caps a unique-key flood.
-/// - **Idle TTL** — keys not seen for longer than the TTL become evictable, so
-///   long-idle state is reclaimed rather than held forever.
+/// - **Capacity** — a hard ceiling on live keys. Inserting a new key into a
+///   full shard evicts a key whose bucket has **recovered** (is full again —
+///   forgetting it loses nothing), preferring one not used recently (CLOCK,
+///   second chance). A key that is still limited is never evicted; if none of
+///   the scanned keys has recovered, the *new* key waits or is refused until one
+///   does. This caps a unique-key flood without letting it reset anyone's
+///   limit.
+/// - **Idle TTL** — keys not seen for longer than the TTL are reclaimed, so
+///   long-idle state is not held forever. The effective TTL is never shorter
+///   than a bucket's time to refill completely, so an expired key has always
+///   recovered.
 ///
-/// Eviction is **lazy and incremental**: it runs while inserting a new key,
-/// touches only the one shard being written, and never sweeps the whole store or
-/// blocks the steady-state path. The capacity is enforced per shard, so the
-/// live-key count stays within a small factor of the cap.
+/// Eviction is **lazy and bounded**: it runs only while inserting a new key,
+/// touches only the one shard being written, and does a fixed amount of work —
+/// at most 32 slots scanned for a victim and 8 for idle expiry — however large
+/// the shard. The capacity is divided evenly over the shards (rounded up, at
+/// least one key per shard), so the live-key count stays at or below the cap
+/// plus one key per shard. Size the cap above your real key cardinality.
 ///
 /// The [`Default`] is safe: a [`DEFAULT_MAX_KEYS`] cap and no TTL — bounded out
 /// of the box. Opt into unbounded growth explicitly with

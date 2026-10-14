@@ -1,7 +1,7 @@
 //! Atomics indirection for `loom` model checking.
 //!
-//! Under `--cfg throttle_loom` the limiter's own atomics become loom's
-//! instrumented versions, so
+//! Under `--cfg throttle_loom` the adaptive limiter's and the bulkhead's slot
+//! and limit atomics become loom's instrumented versions, so
 //! [`tests/loom_throttle.rs`](../../tests/loom_throttle.rs) can exhaustively
 //! explore their interleavings; in every normal build they are the standard
 //! library's, with zero overhead and no behavioral difference. Only throttle-net's
