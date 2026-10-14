@@ -77,9 +77,10 @@ unexpected_cfgs = { level = "warn", check-cfg = [
 [features]
 default = ["std", "tokio"]
 # Standard library. Gates the limiter surface: the token-bucket accounting
-# (`better-bucket`), the injectable clock (`clock-lib`), and the domain error
-# type (`error-forge`). With std off the crate is `no_std` and exposes only
-# `VERSION`.
+# (`better-bucket`), the injectable clock (`clock-lib`), the domain error type
+# (`error-forge`), and the per-key store (`ahash`, `hashbrown`). With std off the
+# crate is `no_std` and exposes the pure algorithm core: `Backoff`,
+# `BackoffIter`, `Jitter`, `Decision`, and `VERSION`.
 std = [
     "dep:better-bucket",
     "better-bucket/clock",
@@ -87,64 +88,85 @@ std = [
     "clock-lib/std",
     "dep:error-forge",
     "dep:ahash",
+    "dep:hashbrown",
 ]
-# Internal marker: an async runtime backend is selected, so the waiting `acquire`
-# surface (and the queue) is available. Enabled by `tokio` / `smol`; not meant to
-# be turned on directly. Pulls the runtime-agnostic async primitives: a
-# notification primitive (`event-listener`) and a future combinator for racing a
-# wake-up against a timeout (`futures-lite`).
+# Internal marker: an async runtime backend is selected, so the waiting
+# `acquire` surface (and the queue) is available. Enabled by `tokio` / `smol`;
+# not meant to be turned on directly. Pulls the runtime-agnostic async
+# primitives: a notification primitive (`event-listener`) and a future
+# combinator for racing a wake-up against a timeout (`futures-lite`).
 runtime = ["std", "dep:event-listener", "dep:futures-lite"]
-# Tokio async runtime integration (default): drives the waiting `acquire` timer.
+# Tokio async runtime integration (default): drives the waiting `acquire` timer
+# and provides `TokioClock`, a clock that follows tokio's (pausable) time.
 tokio = ["runtime", "dep:tokio"]
 # smol async runtime integration: an alternative timer backend for the waiting
-# `acquire` surface. (async-std is intentionally unsupported — it is discontinued,
-# RUSTSEC-2025-0052.)
+# `acquire` surface. (async-std is intentionally unsupported: it is
+# discontinued, RUSTSEC-2025-0052.)
 smol = ["runtime", "dep:smol"]
 # AIMD + latency-based adaptive limiters. The synchronous surface needs only
 # `std`; the waiting `acquire` additionally needs a runtime (`tokio` / `smol`).
 adaptive = ["std", "dep:event-listener"]
 # Circuit breaker state machine. Requires the limiter surface (std).
 circuit-breaker = ["std"]
-# HTTP rate-limit header parsing. Requires the limiter surface (std).
+# HTTP rate-limit header parsing and limiter reconciliation. Requires the
+# limiter surface (std).
 provider-headers = ["std"]
 # LLM provider presets (Anthropic, OpenAI, ...).
 provider-llm = ["provider-headers"]
-# Metrics counters/histograms.
+# Metrics counters, gauges, and histograms through the `metrics` facade.
 metrics = ["dep:metrics"]
-# Tracing spans around acquire().
+# Tracing events around acquisitions and state transitions.
 tracing = ["dep:tracing"]
+# `tower::Layer` / `Service` adapters (rate limit, circuit breaker, adaptive
+# concurrency). Needs an async runtime for the waiting acquire.
+tower = ["runtime", "dep:tower-layer", "dep:tower-service"]
 
 
 # DEPENDENCIES
 # #################################
 [dependencies]
 # Token-bucket accounting (the single source of truth; never re-implemented).
-# Its `clock` feature exposes the `Bucket` surface and the `acquire(n)` path
-# that backs cost-aware acquisition.
-better-bucket = { version = "1", default-features = false, optional = true }
-# Monotonic, mockable time: the clock the bucket reads on the acquire path,
-# injected so tests can substitute a `ManualClock`.
-clock-lib     = { version = "1", default-features = false, optional = true }
+# Its `clock` feature exposes the `Bucket` surface; `BucketCore` (caller-supplied
+# time) backs the per-key store. 1.1 is the floor: 1.0 over-granted under
+# thread contention (a stale clock reading refilled the bucket) and clamped
+# capacities above ~4.29 M tokens.
+better-bucket = { version = "1.1", default-features = false, optional = true }
+# Monotonic, mockable time: the clock every limiter reads, injected so tests can
+# substitute a `ManualClock`. 1.1 is the floor for `From<Instant> for Monotonic`
+# (behind `TokioClock`) and the `ManualClock::advance` overflow fix.
+clock-lib     = { version = "1.1", default-features = false, optional = true }
 # Domain error type metadata (kind/retryability), shared across the portfolio
-# stack instead of thiserror/anyhow in a library crate.
-error-forge   = { version = "1", optional = true }
-# Fast, DoS-resistant hashing for the per-key shard map and shard selection. Its
-# runtime-rng default seeds each store randomly, keeping it collision-attack
-# resistant against hostile keys.
+# stack instead of thiserror/anyhow in a library crate. 1.0.2 drops its unused
+# thiserror/syn build dependencies.
+error-forge   = { version = "1.0.2", optional = true }
+# Fast, DoS-resistant hashing for the per-key store. Its runtime-rng default
+# seeds each store randomly, keeping it collision-attack resistant against
+# hostile keys.
 ahash         = { version = "0.8", optional = true }
-# Runtime-agnostic notification primitive: the queue and adaptive limiter wait on
-# an `Event` rather than a tokio-specific `Notify`, so the same code runs on any
-# executor.
-event-listener = { version = "5", default-features = false, optional = true }
-# Runtime-agnostic future combinator (`future::or`) for racing a wake-up against a
-# timeout in the queue, without a runtime-specific `select!`.
+# The per-key store's index: a `HashTable` of slot positions, so each key is
+# hashed once and stored once, and eviction is an O(1) swap-remove. No default
+# features: the store brings its own (ahash) hasher.
+hashbrown     = { version = "0.17", default-features = false, features = ["inline-more"], optional = true }
+# Runtime-agnostic notification primitive: the queue, the adaptive limiter, and
+# the bulkhead wait on an `Event` rather than a tokio-specific `Notify`, so the
+# same code runs on any executor. 5.4.2 is the floor for RUSTSEC-2026-0221
+# (throttle-net never used the affected `listener!`/`with_tag` path).
+event-listener = { version = "5.4.2", default-features = false, optional = true }
+# Runtime-agnostic future combinators (`future::or`, `yield_now`) for racing a
+# wake-up against a timeout, without a runtime-specific `select!`.
 futures-lite   = { version = "2", default-features = false, optional = true }
 # Tokio timer backend for the waiting `acquire` surface (only the timer is used).
 tokio   = { version = "1", optional = true, default-features = false, features = ["time"] }
 # smol timer backend (`smol::Timer`) for the waiting `acquire` surface.
 smol    = { version = "2", optional = true }
-metrics = { version = "0.23", optional = true }
-tracing = { version = "0.1", optional = true }
+# Metrics facade. 0.24 is the current major: one global recorder exists per
+# major version, so the facade must match the application's.
+metrics = { version = "0.24", optional = true }
+# Structured events for acquisitions and state transitions.
+tracing = { version = "0.1", optional = true, default-features = false, features = ["std"] }
+# The `tower` integration: only the two trait crates, not tower itself.
+tower-layer   = { version = "0.3", optional = true }
+tower-service = { version = "0.3", optional = true }
 
 
 # DEV DEPENDENCIES
@@ -153,9 +175,10 @@ tracing = { version = "0.1", optional = true }
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest  = "1"
 tokio     = { version = "1", features = ["full", "test-util"] }
-# Comparative baseline for the benchmarks only (not a runtime dependency). Pinned
-# to a release whose MSRV is at or below this crate's 1.85.
-governor  = "0.6"
+# Comparative baseline for the benchmarks only (not a runtime dependency).
+governor  = "0.10"
+# `ServiceExt` for exercising the tower adapters in tests.
+tower     = { version = "0.5", default-features = false, features = ["util"] }
 
 # `loom` is a regular dependency (not dev) because the library's `sync` module
 # imports it under `--cfg throttle_loom`; the cfg is only ever set for the model
