@@ -68,7 +68,8 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.features }}
+          # Cache keys may not contain commas; the job index is unique per row.
+          key: features-${{ strategy.job-index }}
       - name: Clippy
         run: cargo clippy --all-targets ${{ matrix.features }} -- -D warnings
       - name: Test

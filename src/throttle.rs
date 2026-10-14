@@ -854,6 +854,11 @@ impl Default for ThrottleBuilder<SystemClock> {
 impl<C: Clock> ThrottleBuilder<C> {
     /// Refills `amount` tokens every `period`. Unless [`burst`](Self::burst) is
     /// set, the capacity is also `amount`.
+    ///
+    /// Rates above about 4.3 × 10^9 tokens per second (only reachable with a
+    /// sub-second period) are effectively unlimited, and better-bucket counts
+    /// them in multi-token units: a grant is rounded up to a whole unit, and a
+    /// bucket may hand out up to one unit more than its exact bound.
     pub fn rate(mut self, amount: u32, period: Duration) -> Self {
         self.amount = amount;
         self.period = period;

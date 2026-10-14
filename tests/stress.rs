@@ -52,8 +52,11 @@ where
             })
         })
         .collect();
-    let _leader = barrier.wait();
+    // Read the start *before* releasing the workers: once the barrier opens
+    // they may grant before this thread is scheduled again, and a start taken
+    // after them would understate the elapsed time (and so the bound).
     let start = Instant::now();
+    let _leader = barrier.wait();
     thread::sleep(RUN);
     stop.store(true, Ordering::Relaxed);
     for handle in handles {

@@ -42,6 +42,17 @@ fn accrued(amount: u32, period_ms: u32, micros: u128) -> u128 {
     (u128::from(amount) * micros).div_ceil(u128::from(period_ms) * 1_000)
 }
 
+/// The bound's tolerance in tokens. better-bucket's clock may run up to one
+/// unit ahead of exact; a unit is at most one token below ~4.3 × 10^9 tokens
+/// per second, and above that rate it counts in power-of-two multi-token units
+/// (the clock stays at or below 4.3 units per nanosecond), where a full bucket
+/// may also round up by part of a unit. Two units plus one covers both.
+fn tolerance(amount: u32, period_ms: u32) -> u128 {
+    let tokens_per_ns_x10 = (u128::from(amount) * 10).div_ceil(u128::from(period_ms) * 1_000_000);
+    let unit = tokens_per_ns_x10.div_ceil(43).max(1).next_power_of_two();
+    2 * unit + 1
+}
+
 fuzz_target!(|input: Input| {
     let amount = input.amount.max(1);
     let period_ms = input.period_millis.max(1);
@@ -56,6 +67,7 @@ fuzz_target!(|input: Input| {
         return;
     };
 
+    let slack = tolerance(amount, period_ms);
     let mut now_us = 0u128;
     let mut taken = 0u128;
     let mut last = None;
@@ -65,7 +77,9 @@ fuzz_target!(|input: Input| {
                 if cost > 0 && throttle.try_acquire_with_cost(cost) {
                     taken += u128::from(cost);
                     last = Some(cost);
-                    assert!(taken <= u128::from(capacity) + accrued(amount, period_ms, now_us) + 1);
+                    assert!(
+                        taken <= u128::from(capacity) + accrued(amount, period_ms, now_us) + slack
+                    );
                 }
             }
             Op::Reserve(cost, max_ms) => {
@@ -77,7 +91,10 @@ fuzz_target!(|input: Input| {
                         last = Some(cost);
                         let usable = now_us + wait.as_micros();
                         assert!(
-                            taken <= u128::from(capacity) + accrued(amount, period_ms, usable) + 1
+                            taken
+                                <= u128::from(capacity)
+                                    + accrued(amount, period_ms, usable)
+                                    + slack
                         );
                     }
                 }
