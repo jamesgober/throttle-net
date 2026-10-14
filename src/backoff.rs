@@ -325,6 +325,16 @@ impl Backoff {
     }
 }
 
+impl IntoIterator for &Backoff {
+    type Item = Duration;
+    type IntoIter = BackoffIter;
+
+    /// Starts a delay sequence, as [`Backoff::iter`].
+    fn into_iter(self) -> BackoffIter {
+        self.iter()
+    }
+}
+
 impl Default for Backoff {
     /// Exponential from 100ms, doubling, capped at 30s, with decorrelated jitter
     /// — a sane production default that resists thundering herds.
@@ -405,14 +415,24 @@ impl BackoffIter {
                 // in `no_std` (where `f64::powi` is unavailable). The exponent is
                 // clamped so the loop is bounded and the value cannot run away; the
                 // result is clamped to the cap by the caller anyway.
-                let mut scaled = base as f64;
-                for _ in 0..attempt.min(64) {
-                    scaled *= self.policy.factor;
-                }
-                if scaled.is_finite() && scaled >= 0.0 && scaled < (u64::MAX as f64) {
-                    scaled as u64
-                } else {
-                    u64::MAX
+                // Float precision is immaterial for a delay (a nanosecond in 2^53),
+                // and the result is converted back only when it is finite,
+                // non-negative, and below u64::MAX, so the cast is exact in range.
+                #[allow(
+                    clippy::cast_precision_loss,
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss
+                )]
+                {
+                    let mut scaled = base as f64;
+                    for _ in 0..attempt.min(64) {
+                        scaled *= self.policy.factor;
+                    }
+                    if scaled.is_finite() && scaled >= 0.0 && scaled < (u64::MAX as f64) {
+                        scaled as u64
+                    } else {
+                        u64::MAX
+                    }
                 }
             }
         }
@@ -489,12 +509,22 @@ impl Rng {
 /// Derives a seed from a monotonically-increasing counter, mixed with the wall
 /// clock under `std`, so distinct `BackoffIter`s start from different states.
 /// `no_std` builds have no clock, so the seed is counter-only — still distinct per
-/// iterator within a run, though it repeats across process restarts.
+/// iterator within a run, though it repeats across process restarts (pass
+/// per-device entropy with [`Backoff::with_seed`]).
+///
+/// The counter is a pointer-sized atomic, so it exists on 32-bit embedded
+/// targets without 64-bit atomics; on a target with no atomic read-modify-write
+/// at all, it is absent and only the clock and the policy seed vary the start.
 fn entropy_seed() -> u64 {
-    use core::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+    #[cfg(target_has_atomic = "ptr")]
+    let counter = {
+        use core::sync::atomic::{AtomicUsize, Ordering};
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        // usize is at most 64 bits on every supported target.
+        COUNTER.fetch_add(1, Ordering::Relaxed) as u64
+    };
+    #[cfg(not(target_has_atomic = "ptr"))]
+    let counter = 0u64;
     #[cfg(feature = "std")]
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -570,13 +600,13 @@ mod tests {
 
     #[test]
     fn test_equal_jitter_keeps_a_floor() {
-        let backoff = Backoff::constant(Duration::from_millis(1000)).with_jitter(Jitter::Equal);
+        let backoff = Backoff::constant(Duration::from_secs(1)).with_jitter(Jitter::Equal);
         let mut it = backoff.iter_seeded(42);
         for _ in 0..20 {
             let d = it.next_delay();
             // Equal jitter: at least half the base, at most the base.
             assert!(d >= Duration::from_millis(500), "{d:?} below the floor");
-            assert!(d <= Duration::from_millis(1000), "{d:?} above the cap");
+            assert!(d <= Duration::from_secs(1), "{d:?} above the cap");
         }
     }
 
