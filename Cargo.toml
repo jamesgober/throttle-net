@@ -204,11 +204,19 @@ required-features = ["circuit-breaker", "tokio"]
 
 [[example]]
 name              = "adaptive_concurrency"
-required-features = ["adaptive"]
+required-features = ["adaptive", "tokio"]
 
 [[example]]
 name              = "per_tenant_quotas"
 required-features = ["tokio"]
+
+[[example]]
+name              = "provider_sync"
+required-features = ["provider-llm", "tokio"]
+
+[[example]]
+name              = "resilience_stack"
+required-features = ["circuit-breaker", "tokio"]
 
 
 # BENCHMARKS

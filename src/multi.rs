@@ -292,6 +292,54 @@ impl MultiLimiter {
         refund_all(self.pairs(costs).filter(|(_, cost)| *cost > 0));
     }
 
+    /// Settles a call that was admitted on an **estimate**: for each dimension,
+    /// gives back what the call did not use, or charges the overspend.
+    ///
+    /// LLM calls are the motivating case: the output token count is unknown
+    /// until the response arrives, so admit the call on an estimate (or the
+    /// `max_tokens` ceiling), then settle with the usage the provider reports.
+    /// An underspend is [refunded](Limiter::refund). An overspend has already
+    /// happened at the provider, so it is charged even if it does not fit: on a
+    /// token-bucket dimension it becomes debt (a reservation that later calls
+    /// wait behind); a dimension without reservations is drained of what it
+    /// has. Names that match no dimension are ignored.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use throttle_net::{ManualClock, MultiLimiter, Throttle};
+    ///
+    /// let clock = Arc::new(ManualClock::new());
+    /// let limiter = MultiLimiter::builder()
+    ///     .dimension("output_tokens", Throttle::per_minute(1_000).with_clock(clock.clone()))
+    ///     .build();
+    ///
+    /// // Admit on the 500-token ceiling; the response used only 120.
+    /// let estimate = [("output_tokens", 500)];
+    /// assert!(limiter.try_acquire_costs(&estimate));
+    /// limiter.settle_costs(&estimate, &[("output_tokens", 120)]);
+    /// assert_eq!(limiter.available("output_tokens"), Some(880));
+    ///
+    /// // Another call overspent its estimate: the excess is owed.
+    /// assert!(limiter.try_acquire_costs(&[("output_tokens", 800)]));
+    /// limiter.settle_costs(&[("output_tokens", 800)], &[("output_tokens", 1_000)]);
+    /// assert_eq!(limiter.available("output_tokens"), Some(0));
+    /// assert!(!limiter.try_acquire_costs(&[("output_tokens", 1)]), "in debt");
+    /// ```
+    pub fn settle_costs(&self, estimated: &[(&str, u32)], actual: &[(&str, u32)]) {
+        for dimension in self.table.dimensions.iter() {
+            let reserved = self.table.cost_for(&dimension.name, estimated);
+            let used = self.table.cost_for(&dimension.name, actual);
+            let limiter = dimension.limiter.as_ref();
+            if used < reserved {
+                limiter.refund(reserved - used);
+            } else if used > reserved {
+                charge(limiter, used - reserved);
+            }
+        }
+    }
+
     /// Returns the units available in `dimension` (or the dimension an alias
     /// charges) right now, or `None` if there is no such name.
     #[must_use]
@@ -443,6 +491,28 @@ impl MultiLimiter {
         };
         obs::waited(KIND, &self.label, &timer, 1, obs::Waited::of(&result));
         result
+    }
+}
+
+/// Charges `units` that were already spent, whether or not they fit: as debt
+/// (capacity-sized reservations with no wait limit) where the limiter
+/// supports it, otherwise by draining what is available.
+fn charge(limiter: &dyn Limiter, units: u32) {
+    let capacity = limiter.capacity();
+    if capacity == 0 {
+        return;
+    }
+    let mut left = units;
+    while left > 0 {
+        let chunk = left.min(capacity);
+        if limiter.reserve(chunk, Duration::MAX).is_none() {
+            let available = limiter.available();
+            if available > 0 {
+                let _drained = limiter.acquire_cost(available.min(left));
+            }
+            return;
+        }
+        left -= chunk;
     }
 }
 
@@ -775,6 +845,48 @@ mod tests {
             .build();
         assert!(dup.try_acquire_costs(&[("a", 1)]));
         assert!(!dup.try_acquire_costs(&[("a", 1)]), "the 1/s twin binds");
+    }
+
+    #[test]
+    fn test_settle_refunds_underspend_and_charges_overspend() {
+        use crate::sliding::SlidingWindowLog;
+
+        let clock = Arc::new(ManualClock::new());
+        let limiter = MultiLimiter::builder()
+            .dimension(
+                "tokens",
+                Throttle::per_second(100).with_clock(clock.clone()),
+            )
+            .dimension(
+                "window",
+                SlidingWindowLog::per_second(100).with_clock(clock.clone()),
+            )
+            .build();
+        let estimate = [("tokens", 50), ("window", 50)];
+        assert!(limiter.try_acquire_costs(&estimate));
+        // Overspend far beyond capacity: three capacity-sized chunks of debt on
+        // the bucket; the sliding log (no reservations) is drained.
+        limiter.settle_costs(&estimate, &[("tokens", 300), ("window", 300)]);
+        assert_eq!(limiter.available("tokens"), Some(0));
+        assert_eq!(limiter.available("window"), Some(0));
+        clock.advance(Duration::from_secs(2));
+        assert_eq!(
+            limiter.available("tokens"),
+            Some(0),
+            "debt still being repaid"
+        );
+        clock.advance(Duration::from_secs(1));
+        assert!(limiter.try_acquire_costs(&[("tokens", 50)]));
+        // Underspend refunds; unknown names and equal costs do nothing.
+        limiter.settle_costs(&[("tokens", 50), ("missing", 9)], &[("tokens", 10)]);
+        assert_eq!(limiter.available("tokens"), Some(90));
+        limiter.settle_costs(&[("tokens", 5)], &[("tokens", 5)]);
+        assert_eq!(limiter.available("tokens"), Some(90));
+        // A dimension that grants nothing is skipped rather than looped on.
+        let closed = MultiLimiter::builder()
+            .dimension("x", Throttle::per_second(0))
+            .build();
+        closed.settle_costs(&[], &[("x", 10)]);
     }
 
     #[test]
