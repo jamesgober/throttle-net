@@ -459,7 +459,6 @@ Initial scaffold and repository bootstrap. No throttle-net logic yet &mdash; thi
 - `REPS.md` compliance baseline at the repository root.
 - `.github/workflows/ci.yml` &mdash; Linux/macOS/Windows CI matrix on stable and MSRV, plus loom and audit/deny jobs.
 - `deny.toml`, `clippy.toml`, `rustfmt.toml`, `.gitattributes`, `.gitignore`.
-- `.dev/` AI-editor briefing (`PROMPT.md`, `ROADMAP.md`) &mdash; gitignored.
 
 [Unreleased]: https://github.com/jamesgober/throttle-net/compare/v2.1.0...HEAD
 [2.1.0]: https://github.com/jamesgober/throttle-net/compare/v2.0.0...v2.1.0
