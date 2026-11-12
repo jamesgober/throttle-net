@@ -458,9 +458,12 @@ where
         let in_flight = self.in_flight.load(Ordering::Acquire);
         let is_failure = matches!(outcome, Outcome::Failure);
         // A failure admitted before the latest decrease belongs to a congestion
-        // event that has already been answered: release the slot only.
+        // event that has already been answered: release the slot only. One
+        // admitted in the current epoch may decrease the limit only by
+        // claiming the epoch (see `adjust_limit`), so of several failures that
+        // settle at once, only one decreases.
         if !(is_failure && epoch < self.epoch()) {
-            self.adjust_limit(in_flight, outcome, is_failure);
+            self.adjust_limit(in_flight, outcome, is_failure.then_some(epoch));
         }
         let _released = crate::sync::saturating_sub(&self.in_flight, 1);
         // A slot freed: wake one *additional* waiter. `notify(1)` is not
@@ -472,7 +475,15 @@ where
 
     /// Moves the limit by the strategy with a CAS loop, so concurrent outcomes
     /// never overwrite each other (TN-006).
-    fn adjust_limit(&self, in_flight: u32, outcome: Outcome, is_failure: bool) {
+    ///
+    /// `failure_epoch` is set for a failure: the epoch it was admitted in. A
+    /// decrease for it first moves the epoch from that value to the next with
+    /// a compare-exchange; a failure that loses that race belongs to an event
+    /// another failure has already answered, and changes nothing. The check
+    /// and the claim are one atomic step, so concurrent failures of one event
+    /// decrease the limit once.
+    fn adjust_limit(&self, in_flight: u32, outcome: Outcome, failure_epoch: Option<u64>) {
+        let mut claimed = false;
         let mut current = self.limit.load(Ordering::Acquire);
         loop {
             let new = self
@@ -482,6 +493,16 @@ where
             if new == current {
                 return;
             }
+            if let Some(epoch) = failure_epoch.filter(|_| new < current && !claimed) {
+                if self
+                    .decrease_epoch
+                    .compare_exchange(epoch, epoch + 1, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
+                    return;
+                }
+                claimed = true;
+            }
             match self.limit.compare_exchange_weak(
                 current,
                 new,
@@ -489,9 +510,6 @@ where
                 Ordering::Acquire,
             ) {
                 Ok(_) => {
-                    if is_failure && new < current {
-                        let _bumped = self.decrease_epoch.fetch_add(1, Ordering::AcqRel);
-                    }
                     obs::adaptive_limit(&self.label, current, new);
                     if new > current {
                         // More slots: wake as many waiters as were added.

@@ -836,3 +836,214 @@ async fn r07_breaker_call_timeout_bounds_admission() {
         .await;
     assert!(later.is_ok());
 }
+
+// ---------------------------------------------------------------------------
+// Review of 2.0.0 (findings F-1 to F-4). Each test failed on 2.0.0.
+// ---------------------------------------------------------------------------
+
+// F-1: when a pause ended, every reservation that matured during it was
+// released at once (50 in 10 ms against a burst of 10). At most one burst may
+// go when a pause ends; the rest follow at the rate, in order.
+#[cfg(feature = "tokio")]
+#[tokio::test(start_paused = true)]
+async fn rv_f1_pause_end_releases_at_most_one_burst() {
+    use throttle_net::{Throttle, TokioClock};
+
+    let throttle = Arc::new(Throttle::per_second(10).with_clock(TokioClock::new()));
+    assert!(throttle.try_acquire_with_cost(10)); // drained
+    let start = tokio::time::Instant::now();
+    let mut waiters = Vec::new();
+    for _ in 0..50 {
+        let t = Arc::clone(&throttle);
+        waiters.push(tokio::spawn(async move {
+            t.acquire().await.unwrap();
+            tokio::time::Instant::now()
+        }));
+    }
+    tokio::task::yield_now().await; // fifty reserve the next 5 s, 100 ms apart
+    throttle.pause_for(Duration::from_secs(5)); // a 429 with Retry-After: 5
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let mut direct = 0;
+    while throttle.try_acquire() {
+        direct += 1;
+    }
+    let mut times = Vec::new();
+    for w in waiters {
+        times.push(w.await.unwrap() - start);
+    }
+    times.sort();
+    let at_end = times
+        .iter()
+        .filter(|at| **at <= Duration::from_millis(5_010))
+        .count();
+    assert!(
+        at_end + direct <= 10,
+        "released when the pause ended: {at_end} waiters + {direct} direct, burst 10"
+    );
+    // The rest went at the rate: within any second, at most the burst plus
+    // a second of refill (the token bucket bound).
+    for (i, at) in times.iter().enumerate() {
+        let in_second = times[i..]
+            .iter()
+            .take_while(|later| **later < *at + Duration::from_secs(1))
+            .count();
+        assert!(in_second <= 21, "{in_second} released within 1 s of {at:?}");
+    }
+    // Everything still went, and not much later than the rate allows.
+    assert!(*times.last().unwrap() <= Duration::from_secs(10));
+}
+
+// F-2: a composite took a sliding log's unit and then slept out a pause on
+// another constituent, so the grant aged out before the request went, and a
+// cancel then refunded a newer grant. Composites now give a sliding grant back
+// while paused and take it again when the request can go.
+#[cfg(feature = "tokio")]
+#[tokio::test(start_paused = true)]
+async fn rv_f2_composite_does_not_hold_a_sliding_grant_through_a_pause() {
+    use throttle_net::{Hybrid, Limiter, SlidingWindowLog, Throttle, TokioClock};
+
+    let throttle = Arc::new(Throttle::per_second(10).with_clock(TokioClock::new()));
+    assert!(throttle.try_acquire_with_cost(10));
+    let sliding = Arc::new(
+        SlidingWindowLog::new(1, Duration::from_millis(100)).with_clock(TokioClock::new()),
+    );
+    let hybrid = Arc::new(
+        Hybrid::builder()
+            .shared(throttle.clone() as Arc<dyn Limiter>)
+            .shared(sliding.clone() as Arc<dyn Limiter>)
+            .build(),
+    );
+    let waiter = {
+        let hybrid = Arc::clone(&hybrid);
+        tokio::spawn(async move {
+            hybrid.acquire().await.unwrap();
+            tokio::time::Instant::now()
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    throttle.pause_for(Duration::from_secs(10)); // ends at about 10.05 s
+    tokio::time::sleep(Duration::from_millis(9_950)).await; // about 10.0 s
+    assert!(sliding.try_acquire(), "a direct caller sends at 10.0 s");
+    let direct_at = tokio::time::Instant::now();
+    let waiter_at = waiter.await.unwrap();
+    assert!(
+        waiter_at - direct_at >= Duration::from_millis(100),
+        "two sends inside one 100 ms window of limit 1: {:?} apart",
+        waiter_at - direct_at
+    );
+}
+
+#[cfg(feature = "tokio")]
+#[tokio::test(start_paused = true)]
+async fn rv_f2_cancelled_composite_does_not_refund_a_newer_sliding_grant() {
+    use throttle_net::{Hybrid, Limiter, SlidingWindowLog, Throttle, TokioClock};
+
+    let throttle = Arc::new(Throttle::per_second(10).with_clock(TokioClock::new()));
+    assert!(throttle.try_acquire_with_cost(10));
+    let sliding = Arc::new(
+        SlidingWindowLog::new(1, Duration::from_millis(100)).with_clock(TokioClock::new()),
+    );
+    let hybrid = Arc::new(
+        Hybrid::builder()
+            .shared(throttle.clone() as Arc<dyn Limiter>)
+            .shared(sliding.clone() as Arc<dyn Limiter>)
+            .build(),
+    );
+    let waiter = {
+        let hybrid = Arc::clone(&hybrid);
+        tokio::spawn(async move { hybrid.acquire().await })
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    throttle.pause_for(Duration::from_secs(10));
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(
+        sliding.try_acquire(),
+        "another caller takes the window's unit"
+    );
+    assert!(!sliding.try_acquire(), "the window is full");
+    waiter.abort();
+    let _ = waiter.await;
+    assert!(
+        !sliding.try_acquire(),
+        "cancelling the waiter freed a unit that belongs to a later grant"
+    );
+}
+
+// F-3: failures of one congestion event that settled at the same moment on
+// different threads each cut the limit. One event, one decrease.
+#[cfg(feature = "adaptive")]
+#[test]
+fn rv_f3_concurrent_correlated_failures_decrease_once() {
+    use std::sync::Barrier;
+    use throttle_net::{AdaptiveLimiter, Aimd};
+
+    for trial in 0..200 {
+        let limiter = Arc::new(
+            AdaptiveLimiter::builder()
+                .floor(1)
+                .ceiling(1024)
+                .initial(1024)
+                .build(Aimd::new(1, 0.5)),
+        );
+        let n = 16;
+        let permits: Vec<_> = (0..n)
+            .map(|_| limiter.try_acquire_owned().unwrap())
+            .collect();
+        let barrier = Arc::new(Barrier::new(n));
+        let handles: Vec<_> = permits
+            .into_iter()
+            .map(|permit| {
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    permit.failure();
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        assert_eq!(
+            limiter.current_limit(),
+            512,
+            "trial {trial}: more than one decrease for one event"
+        );
+    }
+}
+
+// F-4: one settle with a bogus usage count locked a dimension for months, and
+// `charge` walked the debt one capacity at a time.
+#[test]
+fn rv_f4_settle_caps_the_overspend_and_charge_is_one_step() {
+    use throttle_net::{Decision, Limiter, ManualClock, MultiLimiter, Throttle};
+
+    let clock = Arc::new(ManualClock::new());
+    let limiter = MultiLimiter::builder()
+        .dimension(
+            "tokens",
+            Throttle::per_minute(30_000).with_clock(clock.clone()),
+        )
+        .build();
+    assert!(limiter.try_acquire_costs(&[("tokens", 500)]));
+    limiter.settle_costs(&[("tokens", 500)], &[("tokens", u32::MAX)]);
+    match limiter.dimension("tokens").unwrap().peek(1) {
+        Decision::Retry { after } => {
+            assert!(
+                after <= Duration::from_secs(120),
+                "locked out for {after:?}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+
+    // A burst-1 throttle charged `u32::MAX` units: one step, not billions.
+    let smooth = Throttle::smooth(10, Duration::from_secs(1)).with_clock(clock.clone());
+    let start = std::time::Instant::now();
+    assert_eq!(Limiter::charge(&smooth, u32::MAX), 0);
+    assert!(
+        start.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        start.elapsed()
+    );
+    assert!(!smooth.try_acquire());
+}

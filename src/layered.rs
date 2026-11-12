@@ -345,6 +345,7 @@ where
             |progress, budget| step_all(items(), budget, progress),
             |progress| release_all(items(), progress),
             || paused_all(items()),
+            crate::wait::Across::Release,
             timeout,
         )
         .await
@@ -540,7 +541,10 @@ mod tests {
 
     #[test]
     fn test_no_token_spent_in_one_scope_when_another_blocks() {
-        let global: Arc<dyn Limiter> = Arc::new(Throttle::per_second(100));
+        // A manual clock: on the OS clock a pause of 10 ms under load would
+        // refill a token and fail the exact count.
+        let clock = Arc::new(clock_lib::ManualClock::new());
+        let global: Arc<dyn Limiter> = Arc::new(Throttle::per_second(100).with_clock(clock));
         let layered = Layered::<&str>::builder()
             .shared_global(global.clone())
             .per_key(PerKey::per_second(1))
@@ -635,7 +639,11 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn test_acquire_waits_times_out_and_cancels_cleanly() {
         use crate::error::ThrottleError;
-        let global: Arc<dyn Limiter> = Arc::new(Throttle::per_second(100));
+        // A manual clock that never moves: the waits below run on tokio's
+        // paused time, and the exact count must not depend on the host's
+        // load (on the OS clock a 10 ms stall refilled a token).
+        let clock = Arc::new(clock_lib::ManualClock::new());
+        let global: Arc<dyn Limiter> = Arc::new(Throttle::per_second(100).with_clock(clock));
         let layered = Layered::<&str>::builder()
             .shared_global(global.clone())
             .per_key(PerKey::per_duration(1, Duration::from_secs(10)))

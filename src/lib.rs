@@ -88,14 +88,22 @@
 //!   charges each constituent when its request is (within a few milliseconds)
 //!   ready to go, except the bottleneck it queues on — exactly as a waiter on
 //!   that limiter alone would. This is checked by real-clock multi-threaded
-//!   stress tests here and loom models in better-bucket.
+//!   stress tests here and loom models in better-bucket. When a pause ends, a
+//!   throttle releases at most one burst, waiters included, and waiters that
+//!   reserved before it keep their order and spacing. A composite gives back
+//!   what it holds while a constituent is paused, so a sliding log's grant is
+//!   never held through a pause. (One case is bounded rather than excluded:
+//!   after four bottleneck switches, a composite waiter may hold a sliding
+//!   log's grant while it waits for the rest, for at most its own budget.)
 //! - **Bounded memory.** Per-key state, queue bookkeeping, and sliding logs are
 //!   all bounded, with O(1) or O(log n) work per operation. Bounding per-key
 //!   state never resets a limited key's allowance; see [`Eviction`] for what a
 //!   key flood can and cannot do.
 //! - **Untrusted server input is capped.** A `Retry-After` or reset from a
 //!   response pauses a limiter for at most five minutes by default, and
-//!   [`Retry`] waits at most five minutes for a `Retry-After`.
+//!   [`Retry`] waits at most five minutes for a `Retry-After`. A usage count
+//!   passed to [`MultiLimiter::settle_costs`] charges at most one capacity of
+//!   overspend per dimension.
 //! - **No panics** on any input: hostile headers, extreme durations, rates, and
 //!   costs are all handled with checked or saturating arithmetic.
 //!

@@ -9,7 +9,7 @@
 #╚═══════════════════════════════╝
 [package]
 name    = "throttle-net"
-version = "2.0.0"
+version = "2.1.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -139,7 +139,7 @@ tower = ["runtime", "dep:tower-layer", "dep:tower-service"]
 # time) backs the per-key store. 1.1 is the floor: 1.0 over-granted under
 # thread contention (a stale clock reading refilled the bucket) and clamped
 # capacities above ~4.29 M tokens.
-better-bucket = { version = "1.1", default-features = false, optional = true }
+better-bucket = { version = "1.2", default-features = false, optional = true }
 # Monotonic, mockable time: the clock every limiter reads, injected so tests can
 # substitute a `ManualClock`. 1.1 is the floor for `From<Instant> for Monotonic`
 # (behind `TokioClock`) and the `ManualClock::advance` overflow fix.

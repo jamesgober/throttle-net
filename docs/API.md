@@ -59,7 +59,7 @@ Every waiting acquire runs on one engine:
 - **Reservations.** Token-bucket limiters *reserve* the units at once and sleep exactly until they have accrued. Later callers queue behind earlier reservations, so a large request is never starved by a stream of small ones. Limiters without native reservations (the sliding log, your own [`Limiter`](#limiter)) sleep for their reported wait and try again.
 - **Composites queue on their bottleneck.** A `Hybrid`, `MultiLimiter`, or `Layered` waiter peeks every constituent, reserves on the one with the longest wait, and takes the others only when that reservation matures. If another constituent then needs a longer wait, the matured units are given back and the waiter moves to it &mdash; unless that wait is a few milliseconds, or the bottleneck has already moved four times, in which case it reserves the rest too. So a constituent shared with other callers (a `Layered` global scope, a `HybridBuilder::shared` limiter) is never charged long before the request can go, and one caller's backlog on its own slow scope cannot starve everyone else. (The four-switch fallback, which guarantees progress when two contended constituents keep overtaking each other, lets that one waiter hold at most its own cost in the matured constituent while it waits for the rest.) Arrival-order fairness is per limiter: a composite waiter competing with direct waiters that saturate *every* constituent progresses through that fallback and can wait long &mdash; measured over 20 s, 22 composite waiters on two saturated 50/s buckets got 44 grants (worst wait 9.2 s) while direct cost-3 waiters took 1,989 tokens.
 - **Timeouts.** `acquire_timeout` / `acquire_with_cost_timeout` (and `acquire_owned_timeout`, `call_timeout`) take a deadline that bounds the *whole* wait, whatever the constituents answer. A token bucket returns [`ThrottleError::DeadlineExceeded`](#throttleerror) *immediately*, reserving nothing, when the wait is known up front to exceed the timeout. (A bulkhead's timeout reports `BulkheadFull`.)
-- **Pauses.** A waiter sleeps out a limiter's pause &mdash; also when the pause is set after it reserved: it keeps the reservation and goes when the pause ends (failing with `DeadlineExceeded` at once if the pause outlasts its deadline). `resume()` wakes paused waiters immediately. The resume signal is process-wide, so any `resume()` also makes a waiter that is between its check and its sleep look once more (harmless; avoid calling `resume` in a hot loop).
+- **Pauses.** A waiter sleeps out a limiter's pause &mdash; also when the pause is set after it reserved: it keeps the reservation and goes when it is due (failing with `DeadlineExceeded` at once if the pause outlasts its deadline). A throttle releases at most one burst when a pause ends: a pause longer than the time to fill the bucket moves the schedule, and every kept reservation, later by the difference *(2.1)*. A composite or sliding-log waiter gives back what it holds while paused and steps again afterwards *(2.1)*. `resume()` wakes paused waiters immediately. The resume signal is process-wide, so any `resume()` also makes a waiter that is between its check and its sleep look once more (harmless; avoid calling `resume` in a hot loop).
 - **Cancel safety.** Dropping a waiting future (a losing `select!` branch, an outer `tokio::time::timeout`) returns whatever it held &mdash; a reservation, a composite's bottleneck units, a circuit breaker's half-open trial slot (also when the breaker is a composite's constituent) &mdash; and holds no bulkhead or adaptive slot.
 
 ```rust
@@ -169,7 +169,8 @@ throttle.acquire_with_cost(25).await?;
 | `reserve(cost, max_wait)` | Take now, ahead of accrual; `Some(wait)` before use, or `None` taking nothing. |
 | `refund(cost)` | Give back units that were never used (also pays down a reservation). |
 | `drain_to(remaining)` | Take tokens until at most `remaining` are left; never adds. |
-| `pause_for(d)` / `resume()` / `paused_for()` | Grant nothing for `d` (tokens keep accruing); lift early; time left. |
+| `pause_for(d)` / `resume()` / `paused_for()` | Grant nothing for `d` (tokens keep accruing, to the capacity); lift early; time left. |
+| `postponed()` | *(2.1)* Total time pauses have moved the schedule later (a pause's excess over the bucket's fill time). A caller holding a `reserve` adds its growth to the wait. |
 
 ```rust
 use std::sync::Arc;
@@ -264,6 +265,7 @@ pub trait Limiter: Send + Sync {
     fn pause_for(&self, duration: Duration);                              // default: drain what is available
     fn paused_for(&self) -> Duration;                                     // default: ZERO
     fn resume(&self) {}                                                   // default: nothing
+    fn postponed(&self) -> Duration;                                      // (2.1) default: ZERO
     fn charge(&self, cost: u32) -> u32;                                   // units already spent; returns the uncharged rest
 }
 ```
@@ -323,7 +325,8 @@ Builder: `dimension(name, limiter)`, `shared(name, arc)`, `alias(alias, target)`
 | `try_acquire_costs(&[(name, cost)])` | All-or-nothing. Repeated names and aliases are **summed** into their dimension. |
 | `peek_costs(costs)` | Non-consuming. |
 | `acquire_costs(costs)` / `acquire_costs_timeout(costs, t)` _(runtime)_ | Waiting, cancel-safe. |
-| `settle_costs(estimated, actual)` | Refund an underspend, charge an overspend as debt (LLM output tokens), even while paused. |
+| `settle_costs(estimated, actual)` | Refund an underspend, charge an overspend as debt (LLM output tokens), even while paused. The overspend charged per dimension is capped at its capacity *(2.1)*. |
+| `settle_costs_uncapped(estimated, actual)` | *(2.1)* `settle_costs` without the cap, for usage you trust. |
 | `refund_costs(costs)` | Give back a call that was charged but never sent. |
 | `drain_to(name, remaining)` / `pause_for(d)` / `resume()` / `paused_for()` | Reconcile with a downstream. |
 | `available(name)` / `dimension(name)` / `dimensions()` | Inspection (aliases resolve to their dimension). |
@@ -440,7 +443,7 @@ assert!(layered.try_acquire(&"b", &"/x"));
 
 At most `limit` units in any trailing `window`, exactly (no boundary burst). Time is tracked to the nanosecond, so sub-millisecond windows are exact; a zero window is a per-instant limit.
 
-`new(limit, window)`, `per_second(rate)`, `per_minute(rate)`, `with_clock`, `with_name`; `try_acquire`, `try_acquire_with_cost`, `peek`, `available`, `capacity`, `window`, `refund` (removes the oldest units, never more permissive than the exact refund), `pause_for`, `resume` (wakes paused waiters), `paused_for`; _(runtime)_ `acquire`, `acquire_with_cost`, `acquire_with_cost_timeout`. It does not reserve, so under sustained contention a large cost can wait behind smaller ones; in a composite it is charged when the request goes, not while it waits on a slower constituent.
+`new(limit, window)`, `per_second(rate)`, `per_minute(rate)`, `with_clock`, `with_name`; `try_acquire`, `try_acquire_with_cost`, `peek`, `available`, `capacity`, `window`, `refund` (removes the oldest units in the window, never more permissive than the exact refund while the refunded grant is still in the window; a later refund is taken from a newer grant), `pause_for`, `resume` (wakes paused waiters), `paused_for`; _(runtime)_ `acquire`, `acquire_with_cost`, `acquire_with_cost_timeout`. It does not reserve, so under sustained contention a large cost can wait behind smaller ones; in a composite it is charged when the request goes, not while it waits on a slower constituent.
 
 ```rust
 use std::sync::Arc;

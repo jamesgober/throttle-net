@@ -1,6 +1,8 @@
 //! The core throttle: one token bucket with a waiting, cost-aware acquire.
 
 use std::borrow::Cow;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use better_bucket::{Bucket, BucketConfig, Decision as BucketDecision};
 use clock_lib::{Clock, Monotonic, SystemClock};
@@ -61,6 +63,16 @@ pub struct Throttle<C: Clock = SystemClock> {
     /// The origin of [`hold`](Self::hold)'s nanosecond timeline.
     epoch: Monotonic,
     hold: Hold,
+    /// The start of the pause not yet applied to the bucket's schedule: its
+    /// clock reading and its nanoseconds since `epoch`. Settled once, when the
+    /// pause is seen to have ended or is lifted.
+    pause_start: Mutex<Option<(Monotonic, u64)>>,
+    /// Set while `pause_start` holds a pause: the one load the acquire path
+    /// pays to know whether a pause that ended still needs settling.
+    unsettled: AtomicBool,
+    /// Total nanoseconds pauses have moved the schedule later. Only grows. A
+    /// waiter holding a reservation compares it before and after its wait.
+    postponed_ns: AtomicU64,
     label: Label,
 }
 
@@ -184,6 +196,9 @@ impl<C: Clock> Throttle<C> {
             bucket,
             epoch,
             hold: Hold::new(),
+            pause_start: Mutex::new(None),
+            unsettled: AtomicBool::new(false),
+            postponed_ns: AtomicU64::new(0),
             label,
         }
     }
@@ -434,6 +449,7 @@ impl<C: Clock> Throttle<C> {
     /// ```
     pub fn drain_to(&self, remaining: u32) -> u32 {
         let now = self.now();
+        let _held = self.held(now);
         let available = self.bucket.available_at(now);
         if available <= remaining {
             return 0;
@@ -446,6 +462,14 @@ impl<C: Clock> Throttle<C> {
     /// whatever has accrued. A shorter pause never shortens a longer one already
     /// in place; [`resume`](Self::resume) lifts it early. `Duration::MAX`
     /// pauses until resumed.
+    ///
+    /// When the pause ends, at most a full burst (the capacity) is released
+    /// at once, counting waiters as well as new callers. Waiters that
+    /// reserved before the pause keep their order and spacing: a pause longer
+    /// than the time to fill the bucket from empty moves every outstanding
+    /// reservation later by the difference, so the ones that would have come
+    /// due during the pause go at the configured rate after it instead of
+    /// all together.
     ///
     /// Use it when a downstream says its budget is exhausted until a reset, or
     /// answers `429` with a `Retry-After`.
@@ -468,8 +492,23 @@ impl<C: Clock> Throttle<C> {
     /// assert!(throttle.try_acquire());
     /// ```
     pub fn pause_for(&self, duration: Duration) {
+        if duration.is_zero() {
+            return;
+        }
         let now = self.now();
-        self.hold.extend(nanos_between(self.epoch, now), duration);
+        let now_ns = nanos_between(self.epoch, now);
+        let mut start = self.pause_lock();
+        let until = self.hold.until_ns();
+        if until != 0 && until <= now_ns {
+            // The previous pause is over: apply it before starting this one.
+            self.settle(&mut start, until);
+            self.hold.reset_ended(until);
+        }
+        if start.is_none() {
+            *start = Some((now, now_ns));
+            self.unsettled.store(true, Ordering::SeqCst);
+        }
+        self.hold.extend(now_ns, duration);
     }
 
     /// Lifts any pause immediately, waking waiters that were sleeping it out.
@@ -487,7 +526,88 @@ impl<C: Clock> Throttle<C> {
     /// assert!(throttle.try_acquire());
     /// ```
     pub fn resume(&self) {
+        let now_ns = nanos_between(self.epoch, self.now());
+        let mut start = self.pause_lock();
+        let until = self.hold.until_ns();
+        let end = if until == 0 {
+            now_ns
+        } else {
+            until.min(now_ns)
+        };
+        // Settled before the waiters are woken, so they see the new schedule.
+        self.settle(&mut start, end);
         self.hold.clear();
+    }
+
+    /// Total time pauses have moved this throttle's schedule later.
+    ///
+    /// A pause longer than the time to fill the bucket from empty moves every
+    /// outstanding reservation later by the difference (see
+    /// [`pause_for`](Self::pause_for)). The total only grows; a caller holding
+    /// a reservation from [`reserve`](Self::reserve) adds the growth over its
+    /// wait to that wait. The waiting `acquire` methods do this themselves.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use std::time::Duration;
+    /// use throttle_net::{ManualClock, Throttle};
+    ///
+    /// let clock = Arc::new(ManualClock::new());
+    /// let throttle = Throttle::per_second(10).with_clock(clock.clone());
+    /// assert_eq!(throttle.postponed(), Duration::ZERO);
+    /// // A 5 s pause on a bucket that fills in 1 s: the schedule moves 4 s.
+    /// throttle.pause_for(Duration::from_secs(5));
+    /// clock.advance(Duration::from_secs(5));
+    /// assert_eq!(throttle.postponed(), Duration::from_secs(4));
+    /// ```
+    #[must_use]
+    pub fn postponed(&self) -> Duration {
+        let _held = self.held(self.now());
+        Duration::from_nanos(self.postponed_ns.load(Ordering::SeqCst))
+    }
+
+    /// The pause-start lock; its state stays consistent under a panic, so a
+    /// poisoned lock is still used.
+    fn pause_lock(&self) -> MutexGuard<'_, Option<(Monotonic, u64)>> {
+        self.pause_start
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Applies the pause in `start`, which ended at `end_ns`, to the bucket's
+    /// schedule, once. A pause up to the time the bucket takes to fill from
+    /// empty changes nothing: the bucket accrues to at most its capacity
+    /// meanwhile, and matured reservations plus new grants stay within one
+    /// burst. A longer pause moves the schedule later by the excess, so the
+    /// release when it ends is still at most one burst.
+    fn settle(&self, start: &mut Option<(Monotonic, u64)>, end_ns: u64) {
+        let Some((at, at_ns)) = start.take() else {
+            return;
+        };
+        self.unsettled.store(false, Ordering::SeqCst);
+        let length = Duration::from_nanos(end_ns.saturating_sub(at_ns));
+        let by = length.saturating_sub(self.fill_time());
+        if by.is_zero() {
+            return;
+        }
+        self.bucket.postpone_at(by, at);
+        let by_ns = u64::try_from(by.as_nanos()).unwrap_or(u64::MAX);
+        let _total = self.postponed_ns.fetch_add(by_ns, Ordering::SeqCst);
+    }
+
+    /// The time the bucket takes to fill from empty, rounded down (so the
+    /// postponement, and the burst a pause can release, err on the strict
+    /// side). `MAX` for a throttle that never refills.
+    fn fill_time(&self) -> Duration {
+        let config = self.bucket.config();
+        if config.refill_amount() == 0 {
+            return Duration::MAX;
+        }
+        let nanos = config.refill_period().as_nanos() * u128::from(config.capacity())
+            / u128::from(config.refill_amount());
+        u64::try_from(nanos).map_or(Duration::MAX, Duration::from_nanos)
     }
 
     /// How much longer the throttle stays paused (`Duration::ZERO` when it is
@@ -504,13 +624,29 @@ impl<C: Clock> Throttle<C> {
     }
 
     /// The remaining pause at `now`, skipping the arithmetic when no pause was
-    /// ever set.
+    /// ever set. A pause seen to have ended is settled into the schedule
+    /// here, before the caller reads the bucket.
     #[inline]
     fn held(&self, now: Monotonic) -> Duration {
-        if self.hold.is_set() {
-            self.hold.remaining(nanos_between(self.epoch, now))
-        } else {
-            Duration::ZERO
+        if !self.hold.is_set() {
+            return Duration::ZERO;
+        }
+        let now_ns = nanos_between(self.epoch, now);
+        let left = self.hold.remaining(now_ns);
+        if left.is_zero() && self.unsettled.load(Ordering::SeqCst) {
+            self.settle_ended(now_ns);
+        }
+        left
+    }
+
+    /// Settles a pause that has ended by `now_ns`, if it is still unsettled.
+    #[cold]
+    fn settle_ended(&self, now_ns: u64) {
+        let mut start = self.pause_lock();
+        let until = self.hold.until_ns();
+        if until != 0 && until <= now_ns {
+            self.settle(&mut start, until);
+            self.hold.reset_ended(until);
         }
     }
 
@@ -700,6 +836,7 @@ impl<C: Clock> Throttle<C> {
             |budget| self.step(cost, budget),
             || self.bucket.refund(cost),
             || self.paused_for(),
+            crate::wait::Across::Keep(&|| self.postponed()),
             timeout,
         )
         .await
@@ -756,23 +893,20 @@ impl<C: Clock> Limiter for Throttle<C> {
         Throttle::resume(self);
     }
 
+    fn postponed(&self) -> Duration {
+        Throttle::postponed(self)
+    }
+
     /// Records the units as debt, even while paused: they were spent
-    /// downstream, so later callers wait behind them. Only a closed throttle
-    /// (capacity `0`) leaves units uncharged.
+    /// downstream, so later callers wait behind them. One step whatever the
+    /// cost. Only a closed throttle (capacity `0`) leaves units uncharged.
     fn charge(&self, cost: u32) -> u32 {
-        let capacity = self.capacity();
-        if capacity == 0 {
+        if self.capacity() == 0 {
             return cost;
         }
         let now = self.now();
-        let mut left = cost;
-        while left > 0 {
-            let chunk = left.min(capacity);
-            if self.bucket.reserve_at(chunk, Duration::MAX, now).is_none() {
-                return left;
-            }
-            left -= chunk;
-        }
+        let _held = self.held(now);
+        self.bucket.charge_at(cost, now);
         0
     }
 }
@@ -1228,6 +1362,70 @@ mod tests {
         assert!(throttle.try_acquire());
         // Tokens kept accruing (to capacity) during the pause.
         assert_eq!(throttle.available(), 9);
+    }
+
+    #[test]
+    fn test_pause_moves_reservations_by_its_excess_over_the_fill_time() {
+        // 10/s, burst 10: the bucket fills from empty in 1 s.
+        let (clock, throttle) = manual(10);
+        assert!(throttle.try_acquire_with_cost(10));
+        // Twenty reservations: due 100 ms apart over the next 2 s.
+        for i in 1..=20 {
+            assert_eq!(
+                throttle.reserve(1, Duration::MAX),
+                Some(Duration::from_millis(100 * i))
+            );
+        }
+        // A 5 s pause moves the schedule 4 s, so 10 of the 20 (one burst)
+        // are due when it ends and the rest follow at the rate.
+        throttle.pause_for(Duration::from_secs(5));
+        clock.advance(Duration::from_secs(5));
+        assert_eq!(throttle.postponed(), Duration::from_secs(4));
+        assert_eq!(throttle.available(), 0);
+        assert_eq!(
+            throttle.peek(1),
+            Decision::Retry {
+                after: Duration::from_millis(1_100)
+            }
+        );
+        // A pause no longer than the fill time moves nothing.
+        throttle.pause_for(Duration::from_millis(500));
+        clock.advance(Duration::from_millis(500));
+        assert_eq!(throttle.postponed(), Duration::from_secs(4));
+        // Resuming early settles only the time actually paused.
+        throttle.pause_for(Duration::MAX);
+        clock.advance(Duration::from_secs(3));
+        throttle.resume();
+        assert_eq!(throttle.postponed(), Duration::from_secs(6));
+        // An idle throttle is full after a long pause, as before.
+        let (clock, idle) = manual(10);
+        idle.pause_for(Duration::from_secs(60));
+        clock.advance(Duration::from_secs(60));
+        assert_eq!(idle.available(), 10);
+        // A drained one is full again too: it accrued to capacity.
+        let (clock, drained) = manual(10);
+        assert!(drained.try_acquire_with_cost(10));
+        drained.pause_for(Duration::from_secs(60));
+        clock.advance(Duration::from_secs(60));
+        assert_eq!(drained.available(), 10);
+    }
+
+    #[test]
+    fn test_charge_is_one_step_for_any_debt() {
+        let (clock, throttle) = manual(10);
+        let limiter: &dyn Limiter = &throttle;
+        assert_eq!(limiter.charge(u32::MAX), 0);
+        assert_eq!(throttle.available(), 0);
+        clock.advance(Duration::from_secs(1));
+        assert_eq!(throttle.available(), 0);
+        let smooth = Throttle::smooth(10, Duration::from_secs(1)).with_clock(clock.clone());
+        let start = std::time::Instant::now();
+        assert_eq!(Limiter::charge(&smooth, u32::MAX), 0);
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            start.elapsed()
+        );
     }
 
     #[test]

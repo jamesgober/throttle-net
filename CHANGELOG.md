@@ -9,13 +9,63 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+---
+
+## [2.1.0] - 2026-11-12
+
+Fixes from an independent review of 2.0.0. Requires better-bucket 1.2. See
+[`docs/release/v2.1.0.md`](./docs/release/v2.1.0.md).
+
 ### Added
+
+- `Limiter::postponed` (default `ZERO`) and `Throttle::postponed`: the total
+  time pauses have moved a limiter's schedule later.
+- `MultiLimiter::settle_costs_uncapped`, for usage counts you trust.
 
 ### Changed
 
+- `MultiLimiter::settle_costs` charges at most one capacity of overspend per
+  dimension for one call.
+- A composite (`Hybrid`, `Layered`, `MultiLimiter`, the tower layer) and a
+  `SlidingWindowLog` waiter give back what they hold while paused and step
+  again when the pause ends, instead of holding it through the pause.
+
 ### Fixed
 
+- **A pause released every matured reservation at once.** Reservations kept
+  maturing on their original schedule during a pause, so when it ended every
+  waiter they covered went in the same instant, together with the refill:
+  50 requests within 10 ms of a 5 s pause on a 10/s throttle with a burst of
+  10. A pause longer than the time to fill the bucket now moves the schedule
+  later by the difference, and each waiter moves its own due time with it, so
+  at most one burst goes when the pause ends and the rest follow at the rate,
+  in order. An idle or drained throttle is still full after a long pause.
+- **A sliding grant could age out while a composite held it.** A composite
+  that took a `SlidingWindowLog`'s unit and then slept out a pause on another
+  constituent sent the request after the grant had left the window, so it went
+  uncounted, and a cancel then refunded a newer grant. Composites now give the
+  grant back while paused and take it again when the request can go. The
+  `refund` docs now say that a refund is exact only while the grant is in the
+  window.
+- **Concurrent correlated failures cut the adaptive limit more than once.**
+  The epoch check ran outside the limit's CAS loop, so failures of one event
+  that settled on different threads at the same moment each halved the limit
+  (40 of 300 trials, one to the floor). A decrease now claims the epoch with a
+  compare-exchange first, so one event decreases the limit once.
+- **`charge` walked a debt one capacity at a time.** `Throttle::charge` and the
+  per-key store's debt restore now charge in one step through better-bucket's
+  `charge_at` (a burst-1 throttle charged `u32::MAX` took minutes).
+- Two unit tests asserted exact token counts on the OS clock and failed under
+  load; they use a manual clock now.
+
 ### Security
+
+- **One bogus usage report locked a dimension for months.** `settle_costs`
+  charged any reported overspend as debt with no ceiling, and the docs steer
+  callers to pass the usage a provider reports. It now charges at most the
+  dimension's capacity per call (one refill), as `Retry-After` values are
+  already capped at five minutes. `settle_costs_uncapped` keeps the old
+  behaviour for trusted counts.
 
 ---
 
@@ -411,7 +461,8 @@ Initial scaffold and repository bootstrap. No throttle-net logic yet &mdash; thi
 - `deny.toml`, `clippy.toml`, `rustfmt.toml`, `.gitattributes`, `.gitignore`.
 - `.dev/` AI-editor briefing (`PROMPT.md`, `ROADMAP.md`) &mdash; gitignored.
 
-[Unreleased]: https://github.com/jamesgober/throttle-net/compare/v2.0.0...HEAD
+[Unreleased]: https://github.com/jamesgober/throttle-net/compare/v2.1.0...HEAD
+[2.1.0]: https://github.com/jamesgober/throttle-net/compare/v2.0.0...v2.1.0
 [2.0.0]: https://github.com/jamesgober/throttle-net/compare/v1.0.0...v2.0.0
 [1.0.0]: https://github.com/jamesgober/throttle-net/compare/v0.9.0...v1.0.0
 [0.9.0]: https://github.com/jamesgober/throttle-net/compare/v0.8.0...v0.9.0

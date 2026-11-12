@@ -314,6 +314,7 @@ async fn wait(
         |progress, budget| step_all(item(), budget, progress),
         |progress| release_all(item(), progress),
         || paused_all(item()),
+        crate::wait::Across::Release,
         timeout,
     )
     .await
