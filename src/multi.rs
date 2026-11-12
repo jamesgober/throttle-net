@@ -305,6 +305,13 @@ impl MultiLimiter {
     /// wait behind); a dimension without reservations is drained of what it
     /// has. Names that match no dimension are ignored.
     ///
+    /// The reported usage is a number from a response body, so the overspend
+    /// charged for one call is capped at the dimension's capacity (one full
+    /// burst): a bogus or hostile report of billions of tokens costs at most
+    /// one refill, not months of lockout. Use
+    /// [`settle_costs_uncapped`](Self::settle_costs_uncapped) for usage you
+    /// trust.
+    ///
     /// # Examples
     ///
     /// ```
@@ -329,6 +336,36 @@ impl MultiLimiter {
     /// assert!(!limiter.try_acquire_costs(&[("output_tokens", 1)]), "in debt");
     /// ```
     pub fn settle_costs(&self, estimated: &[(&str, u32)], actual: &[(&str, u32)]) {
+        self.settle(estimated, actual, true);
+    }
+
+    /// [`settle_costs`](Self::settle_costs) without the cap on the overspend:
+    /// the whole excess is charged as debt. Only for usage you trust, since
+    /// one report of a huge number locks the dimension until it refills.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use std::time::Duration;
+    /// use throttle_net::{Decision, Limiter, ManualClock, MultiLimiter, Throttle};
+    ///
+    /// let clock = Arc::new(ManualClock::new());
+    /// let limiter = MultiLimiter::builder()
+    ///     .dimension("tokens", Throttle::per_second(100).with_clock(clock.clone()))
+    ///     .build();
+    /// assert!(limiter.try_acquire_costs(&[("tokens", 100)]));
+    /// // 300 over the estimate: three refills of debt.
+    /// limiter.settle_costs_uncapped(&[("tokens", 100)], &[("tokens", 400)]);
+    /// let wait = limiter.dimension("tokens").map(|d| d.peek(1));
+    /// assert_eq!(wait, Some(Decision::Retry { after: Duration::from_millis(3_010) }));
+    /// ```
+    pub fn settle_costs_uncapped(&self, estimated: &[(&str, u32)], actual: &[(&str, u32)]) {
+        self.settle(estimated, actual, false);
+    }
+
+    /// The settle core; `capped` limits each overspend to one capacity.
+    fn settle(&self, estimated: &[(&str, u32)], actual: &[(&str, u32)], capped: bool) {
         for dimension in &*self.table.dimensions {
             let reserved = self.table.cost_for(&dimension.name, estimated);
             let used = self.table.cost_for(&dimension.name, actual);
@@ -336,7 +373,13 @@ impl MultiLimiter {
             match used.cmp(&reserved) {
                 core::cmp::Ordering::Less => limiter.refund(reserved - used),
                 core::cmp::Ordering::Greater => {
-                    let _uncharged = limiter.charge(used - reserved);
+                    let over = used - reserved;
+                    let over = if capped {
+                        over.min(limiter.capacity())
+                    } else {
+                        over
+                    };
+                    let _uncharged = limiter.charge(over);
                 }
                 core::cmp::Ordering::Equal => {}
             }
@@ -508,6 +551,7 @@ impl MultiLimiter {
                 |progress, budget| step_all(self.pairs(costs), budget, progress),
                 |progress| release_all(self.pairs(costs), progress),
                 || paused_all(self.pairs(costs)),
+                crate::wait::Across::Release,
                 timeout,
             )
             .await
@@ -881,9 +925,9 @@ mod tests {
             .build();
         let estimate = [("tokens", 50), ("window", 50)];
         assert!(limiter.try_acquire_costs(&estimate));
-        // Overspend far beyond capacity: three capacity-sized chunks of debt on
-        // the bucket; the sliding log (no reservations) is drained.
-        limiter.settle_costs(&estimate, &[("tokens", 300), ("window", 300)]);
+        // Overspend far beyond capacity, uncapped: 250 tokens of debt on the
+        // bucket; the sliding log (no reservations) is drained.
+        limiter.settle_costs_uncapped(&estimate, &[("tokens", 300), ("window", 300)]);
         assert_eq!(limiter.available("tokens"), Some(0));
         assert_eq!(limiter.available("window"), Some(0));
         clock.advance(Duration::from_secs(2));

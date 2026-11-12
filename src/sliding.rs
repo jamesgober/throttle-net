@@ -388,9 +388,16 @@ where
     /// Gives back `cost` units granted for work that never used them.
     ///
     /// The log does not know which grant a refund belongs to, so it removes the
-    /// units from the **oldest** grants in the window. Those expire no later than
-    /// the refunded grant would have, so the limiter is never more permissive
-    /// than if the right grant had been removed — it may briefly be stricter.
+    /// units from the **oldest** grants in the window. While the refunded grant
+    /// is still in the window, those expire no later than it would have, so the
+    /// limiter is never more permissive than if the right grant had been
+    /// removed; it may briefly be stricter.
+    ///
+    /// Refund a grant only while it is still in the window (within one window
+    /// of taking it). A refund for a grant that has already aged out is taken
+    /// from a newer grant and lets more than `limit` through in one window.
+    /// The crate's own composites refund a sliding log at once, never after
+    /// holding its grant through a wait.
     ///
     /// # Examples
     ///
@@ -570,6 +577,7 @@ where
             },
             || self.refund(cost),
             || self.paused_for(),
+            crate::wait::Across::Release,
             timeout,
         )
         .await

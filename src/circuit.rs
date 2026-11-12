@@ -804,6 +804,7 @@ where
             },
             || self.inner.refund(1),
             || self.inner.paused_for(),
+            crate::wait::Across::Keep(&|| self.inner.postponed()),
             timeout,
         )
         .await

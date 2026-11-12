@@ -635,6 +635,7 @@ where
             |budget| self.step(key, cost, budget),
             || self.refund(key, cost),
             || Duration::ZERO,
+            crate::wait::Across::Keep(&|| Duration::ZERO),
             timeout,
         )
         .await

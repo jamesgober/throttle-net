@@ -161,6 +161,24 @@ pub trait Limiter: Send + Sync {
     /// The default does nothing.
     fn resume(&self) {}
 
+    /// Total time pauses have moved this limiter's schedule later, for
+    /// waiters that hold a reservation across a pause: the growth over a
+    /// wait is added to it. Only grows. The default is `ZERO`, for limiters
+    /// whose pauses only gate grants; [`Throttle`](crate::Throttle) reports
+    /// its postponement.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use throttle_net::{Limiter, SlidingWindowLog};
+    ///
+    /// assert_eq!(SlidingWindowLog::per_second(5).postponed(), Duration::ZERO);
+    /// ```
+    fn postponed(&self) -> Duration {
+        Duration::ZERO
+    }
+
     /// Charges `cost` units that were **already spent** downstream, whether or
     /// not they fit — the overrun of a call admitted on an estimate. Returns
     /// how many units could not be charged (`0` when all were).
@@ -233,6 +251,10 @@ impl<L: Limiter + ?Sized> Limiter for &L {
         (**self).resume();
     }
     #[inline]
+    fn postponed(&self) -> Duration {
+        (**self).postponed()
+    }
+    #[inline]
     fn charge(&self, cost: u32) -> u32 {
         (**self).charge(cost)
     }
@@ -278,6 +300,10 @@ impl<L: Limiter + ?Sized> Limiter for std::boxed::Box<L> {
         (**self).resume();
     }
     #[inline]
+    fn postponed(&self) -> Duration {
+        (**self).postponed()
+    }
+    #[inline]
     fn charge(&self, cost: u32) -> u32 {
         (**self).charge(cost)
     }
@@ -321,6 +347,10 @@ impl<L: Limiter + ?Sized> Limiter for std::sync::Arc<L> {
     #[inline]
     fn resume(&self) {
         (**self).resume();
+    }
+    #[inline]
+    fn postponed(&self) -> Duration {
+        (**self).postponed()
     }
     #[inline]
     fn charge(&self, cost: u32) -> u32 {
@@ -542,6 +572,10 @@ pub(crate) struct Progress {
     /// When the held bottleneck reservation matures (runtime time): a waiter
     /// woken early (by a `resume` elsewhere) must not take the rest before.
     due: Option<crate::rt::Instant>,
+    /// The held bottleneck's [`Limiter::postponed`] when it was reserved, or
+    /// when `due` last absorbed its growth: a pause that moves the
+    /// bottleneck's schedule moves `due` with it.
+    seen: Duration,
     /// How many times a matured bottleneck reservation was given back because
     /// another constituent turned out to need a longer wait.
     switches: u8,
@@ -554,6 +588,7 @@ impl Progress {
         Self {
             held: Held::Nothing,
             due: None,
+            seen: Duration::ZERO,
             switches: 0,
         }
     }
@@ -598,6 +633,18 @@ where
 {
     use crate::wait::Step;
     if let Held::One(bottleneck) = progress.held {
+        if let Some((limiter, _)) = items.clone().nth(bottleneck) {
+            // Settles a pause that has ended (it reads the clock), then
+            // reports any postponement since the reservation.
+            let _paused = limiter.paused_for();
+            let total = limiter.postponed();
+            if total > progress.seen {
+                progress.due = progress
+                    .due
+                    .and_then(|at| at.checked_add(total - progress.seen));
+                progress.seen = total;
+            }
+        }
         if let Some(due) = progress.due {
             let left = due.saturating_duration_since(crate::rt::Instant::now());
             if !left.is_zero() {
@@ -667,15 +714,16 @@ where
         return Step::Retry(wait);
     }
     match items.clone().nth(index) {
-        Some((limiter, cost)) => match limiter.reserve(cost, budget) {
-            Some(wait) => {
+        Some((limiter, cost)) => match (limiter.postponed(), limiter.reserve(cost, budget)) {
+            (seen, Some(wait)) => {
                 progress.held = Held::One(index);
+                progress.seen = seen;
                 progress.due = crate::rt::Instant::now().checked_add(wait);
                 Step::Holding(wait)
             }
             // The constituent cannot queue (no native reservations, or it is
             // paused): sleep until it can grant and look again.
-            None => Step::Retry(wait),
+            (_, None) => Step::Retry(wait),
         },
         None => Step::Retry(wait),
     }

@@ -67,9 +67,9 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "better-bucket"
-version = "1.1.0"
+version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "794a3dfbee01c6b0bd36eb0bd01b05e152dfe8a3c9496f70c8aa33facb102d80"
+checksum = "4f023c6bc8c4ca666d5143eeb97ff7b7485c1efa02e8adafee16024d9fc33545"
 dependencies = [
  "clock-lib",
  "error-forge",
@@ -1140,7 +1140,7 @@ dependencies = [
 
 [[package]]
 name = "throttle-net"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "ahash",
  "async-io",

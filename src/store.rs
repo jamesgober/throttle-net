@@ -336,12 +336,11 @@ fn restore_debt(bucket: &BucketCore, config: BucketConfig, now: Duration, settle
     if available > keep {
         let _taken = bucket.acquire_up_to_at(available - keep, now);
     }
+    // Debt beyond empty, in one step per `u32::MAX` units (at most a few).
     let mut debt = missing.saturating_sub(u128::from(capacity));
     while debt > 0 && capacity > 0 {
-        let chunk = u32::try_from(debt.min(u128::from(capacity))).unwrap_or(capacity);
-        if bucket.reserve_at(chunk, Duration::MAX, now).is_none() {
-            break;
-        }
+        let chunk = u32::try_from(debt).unwrap_or(u32::MAX);
+        bucket.charge_at(chunk, now);
         debt -= u128::from(chunk);
     }
 }

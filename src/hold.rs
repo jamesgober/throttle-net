@@ -54,6 +54,20 @@ impl Hold {
         let _previous = self.until_ns.fetch_max(until, Ordering::Relaxed);
     }
 
+    /// The end of the hold in nanoseconds since the epoch, `0` when not held.
+    #[inline]
+    pub(crate) fn until_ns(&self) -> u64 {
+        self.until_ns.load(Ordering::SeqCst)
+    }
+
+    /// Unsets a hold that ended at `until_ns`, without waking anyone (nobody
+    /// sleeps on a hold that is over). A hold extended meanwhile is kept.
+    pub(crate) fn reset_ended(&self, until_ns: u64) {
+        let _kept = self
+            .until_ns
+            .compare_exchange(until_ns, 0, Ordering::SeqCst, Ordering::SeqCst);
+    }
+
     /// Lifts the hold immediately, waking any waiter sleeping it out.
     pub(crate) fn clear(&self) {
         #[cfg(feature = "runtime")]

@@ -42,6 +42,23 @@ pub(crate) enum Step {
     Never,
 }
 
+/// What a granted waiter does when it still has to wait after its grant: a
+/// pause set on the limiter meanwhile, or a pause that moved the schedule.
+#[derive(Clone, Copy)]
+pub(crate) enum Across<'a> {
+    /// Keep the reservation through the wait. The closure reports the
+    /// limiter's total postponement ([`Limiter::postponed`]); its growth over
+    /// the wait is added to the wait, so a reservation that a pause moved
+    /// later is used when it is due, not when the pause ends.
+    ///
+    /// [`Limiter::postponed`]: crate::Limiter::postponed
+    Keep(&'a (dyn Fn() -> Duration + Sync)),
+    /// Give everything back while paused and step again afterwards: for a
+    /// composite or a sliding log, whose grants are not reservations and would
+    /// age out of their window while held.
+    Release,
+}
+
 /// Why a waiting request failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Refusal {
@@ -89,6 +106,7 @@ pub(crate) async fn wait_for<S, R, P>(
     mut step: S,
     mut release: R,
     paused: P,
+    across: Across<'_>,
     timeout: Option<Duration>,
 ) -> Result<(), Refusal>
 where
@@ -101,6 +119,7 @@ where
         |(), budget| step(budget),
         |()| release(),
         paused,
+        across,
         timeout,
     )
     .await
@@ -114,6 +133,7 @@ pub(crate) async fn wait_with<T, S, R, P>(
     mut step: S,
     release: R,
     paused: P,
+    across: Across<'_>,
     timeout: Option<Duration>,
 ) -> Result<(), Refusal>
 where
@@ -128,27 +148,61 @@ where
         armed: false,
     };
     let mut zero_waits = 0u32;
-    loop {
+    'step: loop {
         let epoch = crate::rt::resume_epoch();
+        // Read before the step reserves, so any postponement after it counts.
+        let mut seen = match across {
+            Across::Keep(postponed) => postponed(),
+            Across::Release => Duration::ZERO,
+        };
         let budget = deadline.remaining();
         let after = match step(&mut held.state, budget) {
             Step::Granted(wait) => {
                 held.armed = true;
+                let mut due = crate::rt::Instant::now().checked_add(wait);
                 if !wait.is_zero() {
                     crate::rt::sleep(wait).await;
                 }
-                // A pause set while the reservation matured holds it too.
+                // A pause set while the reservation matured holds it too, and
+                // a pause that moved the schedule moves the reservation with it
+                // (a reservation kept through it is used when it is due, so
+                // waiters keep their spacing instead of all going when the
+                // pause ends).
                 loop {
                     let epoch = crate::rt::resume_epoch();
                     let pause = paused();
-                    if pause.is_zero() {
+                    match across {
+                        Across::Keep(postponed) => {
+                            let total = postponed();
+                            if total > seen {
+                                due = due.and_then(|at| at.checked_add(total - seen));
+                                seen = total;
+                            }
+                        }
+                        Across::Release if !pause.is_zero() => {
+                            // Not a reservation: holding it through the pause
+                            // would let it age out before the request goes.
+                            held.fire();
+                            continue 'step;
+                        }
+                        Across::Release => {}
+                    }
+                    let left = due.map_or(Duration::ZERO, |at| {
+                        at.saturating_duration_since(crate::rt::Instant::now())
+                    });
+                    if pause.is_zero() && left.is_zero() {
                         break;
                     }
-                    if pause > deadline.remaining() {
+                    let nap = if pause.is_zero() { left } else { pause };
+                    if nap > deadline.remaining() {
                         held.fire();
                         return Err(Refusal::TimedOut);
                     }
-                    crate::rt::sleep_unless_resumed(pause, epoch).await;
+                    if pause.is_zero() {
+                        crate::rt::sleep(nap).await;
+                    } else {
+                        crate::rt::sleep_unless_resumed(nap, epoch).await;
+                    }
                 }
                 held.armed = false;
                 return Ok(());
@@ -231,7 +285,29 @@ impl<T, R: FnMut(&mut T)> Drop for Release<T, R> {
 
 #[cfg(all(test, feature = "tokio"))]
 mod tests {
-    use super::{Refusal, Step, wait_for};
+    use super::{Across, Refusal, Step};
+
+    /// The engine as a lone limiter with no postponement uses it.
+    async fn wait_for<S, R, P>(
+        step: S,
+        release: R,
+        paused: P,
+        timeout: Option<Duration>,
+    ) -> Result<(), Refusal>
+    where
+        S: FnMut(Duration) -> Step,
+        R: FnMut(),
+        P: Fn() -> Duration,
+    {
+        super::wait_for(
+            step,
+            release,
+            paused,
+            Across::Keep(&|| Duration::ZERO),
+            timeout,
+        )
+        .await
+    }
     use core::time::Duration;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};

@@ -243,6 +243,7 @@ impl Hybrid {
             |progress, budget| step_all(self.pairs(cost), budget, progress),
             |progress| release_all(self.pairs(cost), progress),
             || paused_all(self.pairs(cost)),
+            crate::wait::Across::Release,
             timeout,
         )
         .await
